@@ -7129,6 +7129,328 @@ if [ -n "${ANIM_PID:-}" ]; then
   ANIM_PID=""
 fi
 
+# ============ the guardian (Cerberus): the box's own caretaker ============
+# A dedicated user runs Hermes with the Cerberus profile and the local
+# brain (llama-server + the tier model). Nothing here is root, nothing
+# phones home, and the panel's assistant talks to Cerberus over the
+# internal docker subnet. Every piece is idempotent: re-runs reuse what
+# is already in place.
+
+GUARDIAN_USER="guardian"
+GUARDIAN_PORT=8642
+BRAIN_PORT=8686
+GATEWAY_SVC="hermes-gateway-redoubt"
+HERMES_INSTALL_URL="https://hermes-agent.nousresearch.com/install.sh"
+HERMES_INSTALL_SHA="abf338605dae6dd2"
+GUARDIAN_PROFILE_URL="${REDOUBT_GUARDIAN_PROFILE_URL:-https://install.tryredoubt.com/install/guardian-profile.tar.gz}"
+GUARDIAN_PROFILE_SHA="246fbc95b66cefb2"
+BRAIN_IMAGE="ghcr.io/ggml-org/llama.cpp:server@sha256:c77881bba21e863bc56391995511f361040952f7ed6033cf1589da7f77a04eff"
+BRAIN_MODEL_URL="${REDOUBT_BRAIN_MODEL_URL:-https://huggingface.co/unsloth/Qwen3.5-4B-GGUF/resolve/main/Qwen3.5-4B-Q4_K_M.gguf}"
+BRAIN_MODEL_SHA="00fe7986ff5f6b463e622b97d2ad18b5e7ccb1be6cd4c8e39e1c1de84a4421e5"
+BRAIN_MODEL_FILE="qwen35-4b-q4km.gguf"
+PANEL_DB_HOST="/var/lib/docker/volumes/redoubt_homarr-data/_data/db/db.sqlite"
+
+# one place maps a tier to its parameters: the heuristics and the lab
+# override both land here, never in separate if-chains. The 9B and the
+# GPU image land in a later release; today every tier runs the verified
+# 4B, full only widens the context budget.
+set_tier_params() {
+  case "$1" in
+    full)
+      BRAIN_MODEL_FILE="qwen35-4b-q4km.gguf"; BRAIN_CTX=131072 ;;
+    standard)
+      BRAIN_MODEL_FILE="qwen35-4b-q4km.gguf"; BRAIN_CTX=131072 ;;
+    tiny)
+      BRAIN_MODEL_FILE="qwen35-4b-q4km.gguf"; BRAIN_CTX=65536 ;;
+  esac
+}
+
+# what this machine can carry. full = discrete GPU with 6GB+ VRAM,
+# standard = 10GB+ RAM and no GPU, tiny = the honest floor (AVX2
+# required). REDOUBT_TIER forces a tier for lab runs.
+detect_tier() {
+  local ram_gb vram gpu_line avx2
+
+  if [ -n "${REDOUBT_TIER:-}" ]; then
+    TIER="$REDOUBT_TIER"
+    set_tier_params "$TIER"
+    TIER_NOTE="forced by REDOUBT_TIER (lab only)"
+    return
+  fi
+
+  ram_gb=$(awk '/MemTotal/ {printf "%d", $2/1048576}' /proc/meminfo)
+
+  gpu_line=""
+  vram=""
+  if command -v lspci >/dev/null 2>&1; then
+    gpu_line=$(lspci -nn 2>/dev/null | grep -iE "vga compatible|3d controller|display controller" | grep -viE "virtio|qxl|vmware|bochs|cirrus|red hat" | head -1)
+  fi
+  if [ -n "$gpu_line" ]; then
+    if command -v nvidia-smi >/dev/null 2>&1; then
+      vram=$(nvidia-smi --query-gpu=memory.total --format=csv,noheader,nounits 2>/dev/null | head -1 | tr -d " ")
+    elif command -v rocm-smi >/dev/null 2>&1; then
+      vram=$(rocm-smi --showmeminfo vram 2>/dev/null | grep -oE "[0-9]+" | head -1)
+    fi
+  fi
+
+  avx2=0
+  grep -q avx2 /proc/cpuinfo 2>/dev/null && avx2=1
+
+  if [ -n "$vram" ] && [ "$vram" -ge 6144 ]; then
+    TIER="full"
+    TIER_NOTE="gpu with $vram MiB vram"
+  elif [ "$ram_gb" -lt 10 ]; then
+    TIER="tiny"
+    TIER_NOTE="low ram, 64K context"
+  else
+    TIER="standard"
+    TIER_NOTE=""
+  fi
+
+  if [ "$avx2" -ne 1 ]; then
+    TIER="tiny"
+    TIER_NOTE="${TIER_NOTE:+$TIER_NOTE, }no avx2, reduced"
+  fi
+
+  set_tier_params "$TIER"
+}
+
+install_guardian_user() {
+  if ! id "$GUARDIAN_USER" >/dev/null 2>&1; then
+    useradd -r -m -s /bin/bash "$GUARDIAN_USER"
+    echo "guardian: user $GUARDIAN_USER created"
+  fi
+  usermod -aG docker "$GUARDIAN_USER" 2>/dev/null || true
+}
+
+install_guardian_hermes() {
+  local inst="/home/$GUARDIAN_USER/hermes-install.sh"
+  echo "guardian: downloading hermes (this takes a minute) ..."
+  # -# keeps the transfer visible: a silent multi-minute fetch on a slow
+  # link looks frozen, and owners kill frozen things
+  su - "$GUARDIAN_USER" -c "curl -fL --progress-bar '$HERMES_INSTALL_URL' -o '$inst'"
+  local got
+  got=$(sha256sum "$inst" | cut -d' ' -f1)
+  if [ "$got" != "$HERMES_INSTALL_SHA" ]; then
+    rm -f "$inst"
+    echo "guardian: hermes installer sha mismatch ($got) - refusing to run it"
+    return 1
+  fi
+  # the installer runs as the guardian user: the whole hermes tree lands
+  # under /home/guardian/.local, nowhere near root
+  su - "$GUARDIAN_USER" -c "bash '$inst' && rm -f '$inst'"
+  local ver
+  ver=$(su - "$GUARDIAN_USER" -c "~/.local/bin/hermes --version" 2>/dev/null \
+        | grep -oE "[0-9]+\.[0-9]+\.[0-9]+" | head -1)
+  [ -n "$ver" ] && echo "guardian: hermes $ver installed" \
+                || echo "guardian: WARNING could not read hermes version"
+}
+
+install_guardian_profile() {
+  local pf="/home/$GUARDIAN_USER/guardian-profile.tar.gz"
+  su - "$GUARDIAN_USER" -c "curl -fsSL '$GUARDIAN_PROFILE_URL' -o '$pf'"
+  local got
+  got=$(sha256sum "$pf" | cut -d' ' -f1)
+  if [ "$got" != "$GUARDIAN_PROFILE_SHA" ]; then
+    rm -f "$pf"
+    echo "guardian: profile sha mismatch ($got) - refusing to import it"
+    return 1
+  fi
+  su - "$GUARDIAN_USER" -c "~/.local/bin/hermes profile import '$pf'"
+  rm -f "$pf"
+  echo "guardian: Cerberus profile imported"
+}
+
+guardian_key() {
+  local env="/home/$GUARDIAN_USER/.hermes/profiles/redoubt/.env"
+  mkdir -p "$(dirname "$env")"
+  if ! grep -q "^API_SERVER_KEY=" "$env" 2>/dev/null; then
+    local key
+    key=$(openssl rand -hex 32)
+    printf 'API_SERVER_KEY=%s\nAPI_SERVER_MODEL_NAME=Cerberus\n' "$key" >> "$env"
+    chown "$GUARDIAN_USER:$GUARDIAN_USER" "$env"
+    chmod 600 "$env"
+    echo "guardian: api key generated"
+  fi
+}
+
+guardian_brain() {
+  local mdir="/var/lib/redoubt/brain/models"
+  local mf="$mdir/$BRAIN_MODEL_FILE"
+  mkdir -p "$mdir"
+  if [ ! -f "$mf" ]; then
+    echo "guardian: downloading the brain model ($BRAIN_MODEL_FILE) ..."
+    curl -fL --retry 3 -o "$mf" "$BRAIN_MODEL_URL" || return 1
+    local got
+    got=$(sha256sum "$mf" | cut -d' ' -f1)
+    if [ "$got" != "$BRAIN_MODEL_SHA" ]; then
+      rm -f "$mf"
+      echo "guardian: model sha mismatch ($got) - refusing to run it"
+      return 1
+    fi
+  fi
+  local cores
+  cores=$(nproc)
+  cat > /opt/redoubt/brain-compose.yml <<BRAIN
+name: redoubt
+services:
+  brain:
+    image: $BRAIN_IMAGE
+    container_name: redoubt-brain-1
+    restart: always
+    command:
+      - -m
+      - /models/$BRAIN_MODEL_FILE
+      - --host
+      - 0.0.0.0
+      - --port
+      - "$BRAIN_PORT"
+      - -c
+      - "${BRAIN_CTX:-65536}"
+      - -ctk
+      - q4_0
+      - -t
+      - "$cores"
+      - --chat-template-kwargs
+      - '{"enable_thinking": false}'
+    volumes:
+      - $mdir:/models:ro
+    healthcheck:
+      test: ["CMD-SHELL", "bash -c 'echo > /dev/tcp/127.0.0.1/$BRAIN_PORT'"]
+      interval: 10s
+      timeout: 5s
+      retries: 30
+      start_period: 120s
+    networks:
+      - default
+networks:
+  default:
+    external: true
+    name: redoubt_default
+BRAIN
+  docker compose -f /opt/redoubt/brain-compose.yml up -d
+  echo "guardian: brain up (ctx ${BRAIN_CTX:-65536}, $cores cores, tier $TIER)"
+}
+
+guardian_gateway() {
+  su - "$GUARDIAN_USER" -c \
+    "~/.local/bin/hermes -p redoubt gateway install --force" >/dev/null 2>&1
+  loginctl enable-linger "$GUARDIAN_USER" 2>/dev/null || true
+  su - "$GUARDIAN_USER" -c \
+    "systemctl --user enable $GATEWAY_SVC 2>/dev/null; systemctl --user restart $GATEWAY_SVC" \
+    >/dev/null 2>&1
+  echo "guardian: gateway service up"
+}
+
+guardian_ufw() {
+  # the guardian is native on the host; container traffic to it crosses
+  # the docker gateway and DOES hit ufw, so open the port for the subnet
+  if command -v ufw >/dev/null 2>&1; then
+    ufw allow from 172.28.0.0/16 to any port "$GUARDIAN_PORT" proto tcp >/dev/null 2>&1 || true
+    echo "guardian: ufw rule for the panel subnet"
+  fi
+}
+
+guardian_wire_assistant() {
+  # the panel needs a few seconds of first boot before its DB exists
+  local i
+  for i in $(seq 1 30); do
+    [ -f "$PANEL_DB_HOST" ] && break
+    sleep 5
+  done
+  [ -f "$PANEL_DB_HOST" ] || { echo "guardian: panel DB not found - wiring skipped"; return 1; }
+
+  local key cipher back
+  key=$(grep "^API_SERVER_KEY=" "/home/$GUARDIAN_USER/.hermes/profiles/redoubt/.env" | cut -d= -f2)
+  # encrypt inside the panel container with its own SECRET_ENCRYPTION_KEY
+  # (node lives there; the host has no guarantee of a crypto lib)
+  cipher=$(docker exec redoubt-homarr-1 node -e '
+    const c = require("crypto");
+    const k = Buffer.from(process.env.SECRET_ENCRYPTION_KEY, "hex");
+    const iv = c.randomBytes(16);
+    const ci = c.createCipheriv("aes-256-cbc", k, iv);
+    const out = Buffer.concat([ci.update(process.argv[1], "utf8"), ci.final()]);
+    console.log(out.toString("hex") + "." + iv.toString("hex"));
+  ' "$key" 2>/dev/null)
+  [ -n "$cipher" ] || { echo "guardian: could not encrypt the api key"; return 1; }
+
+  # roundtrip before the UPDATE: decrypt what we would store and compare
+  back=$(docker exec redoubt-homarr-1 node -e '
+    const c = require("crypto");
+    const k = Buffer.from(process.env.SECRET_ENCRYPTION_KEY, "hex");
+    const [data, iv] = process.argv[1].split(".");
+    const d = c.createDecipheriv("aes-256-cbc", k, Buffer.from(iv, "hex"));
+    const out = Buffer.concat([d.update(Buffer.from(data, "hex")), d.final()]);
+    console.log(out.toString("utf8"));
+  ' "$cipher" 2>/dev/null)
+  [ "$back" = "$key" ] || { echo "guardian: encrypt roundtrip failed"; return 1; }
+
+  python3 - "$PANEL_DB_HOST" "$cipher" <<'WIRE'
+import sqlite3, sys
+db, cipher = sys.argv[1], sys.argv[2]
+c = sqlite3.connect(db)
+c.execute("""UPDATE assistant_configuration SET
+             provider='custom',
+             base_url='http://172.28.0.1:8642/v1',
+             model_discovery_path='/models',
+             model_id='Cerberus',
+             encrypted_api_key=?,
+             encrypted_headers=NULL,
+             enabled=1
+             WHERE id='default'""", (cipher,))
+c.commit()
+row = c.execute("SELECT provider, model_id, enabled FROM assistant_configuration WHERE id='default'").fetchone()
+print('guardian: assistant wired', row)
+WIRE
+}
+
+guardian_warmup() {
+  local key i
+  key=$(grep "^API_SERVER_KEY=" "/home/$GUARDIAN_USER/.hermes/profiles/redoubt/.env" | cut -d= -f2)
+  for i in $(seq 1 60); do
+    curl -fsS -m 3 http://127.0.0.1:8642/health >/dev/null 2>&1 && break
+    sleep 5
+  done
+  curl -s -m 900 http://127.0.0.1:8642/v1/chat/completions \
+    -H "Content-Type: application/json" \
+    -H "Authorization: Bearer $key" \
+    -d '{"model":"Cerberus","messages":[{"role":"user","content":"Stand by."}],"max_tokens":32}' \
+    >/dev/null 2>&1
+  echo "guardian: warm-up request done (the system prompt is cached now)"
+}
+
+guardian_verify() {
+  local key resp
+  key=$(grep "^API_SERVER_KEY=" "/home/$GUARDIAN_USER/.hermes/profiles/redoubt/.env" | cut -d= -f2)
+  resp=$(curl -s -m 900 http://127.0.0.1:8642/v1/chat/completions \
+    -H "Content-Type: application/json" \
+    -H "Authorization: Bearer $key" \
+    -d '{"model":"Cerberus","messages":[{"role":"user","content":"Are the gates closed?"}],"max_tokens":64}')
+  if printf '%s' "$resp" | grep -q '"content"'; then
+    echo "guardian: VERIFIED - Cerberus answered (tier $TIER)"
+    return 0
+  fi
+  echo "guardian: verification FAILED - the guardian did not answer"
+  return 1
+}
+
+guardian() {
+  detect_tier
+  install_guardian_user || return 1
+  install_guardian_hermes || return 1
+  install_guardian_profile || return 1
+  guardian_key
+  guardian_brain || return 1
+  guardian_gateway
+  guardian_ufw
+  guardian_wire_assistant
+  guardian_warmup
+  guardian_verify || echo "guardian: WARNING the end-to-end check failed"
+}
+
+guardian
+
+
 # ============ the reveal: one clean screen, not a wall ==================
 {
   GUM_BIN=/opt/redoubt/bin/gum
