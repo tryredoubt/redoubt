@@ -1,0 +1,8 @@
+build/
+*.exe
+*.py
+*.bak*
+*.sig
+*.key
+*.pem
+.cache/

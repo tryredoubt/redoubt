@@ -1,0 +1,13 @@
+# Line endings stay LF everywhere; the forges render the diffs with
+# these attributes instead of guessing.
+* text=auto eol=lf
+
+# The kit is bash. Linguist calls the family Shell, so the pin keeps
+# the language bar and the highlighting honest on both forges.
+kit/redoubt.sh linguist-language=Shell
+
+# Docs stay text; the icon binaries never get diffed as text.
+*.md text eol=lf
+*.svg text eol=lf
+*.png binary
+*.ico binary
