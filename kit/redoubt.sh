@@ -2757,7 +2757,11 @@ pull_stack() {
       done
       LAST_N=$N
     fi
-    if [ "$T" -gt 0 ] && [ "${RERUN:-0}" != "1" ]; then
+    # the bar must run whenever real layers are pending: a rerun after a
+    # broken pass still downloads the missing images, and a silent bar
+    # there reads as a frozen install. A fully cached rerun just blinks
+    # the bar to done, which is honest and costs nothing.
+    if [ "$T" -gt 0 ]; then
       [ "$D" -gt "$T" ] && D=$T
       # the label names what is actually downloading right now: the
       # workers mark starts and finishes in an append-only file, and
@@ -7141,9 +7145,9 @@ GUARDIAN_PORT=8642
 BRAIN_PORT=8686
 GATEWAY_SVC="hermes-gateway-redoubt"
 HERMES_INSTALL_URL="https://hermes-agent.nousresearch.com/install.sh"
-HERMES_INSTALL_SHA="abf338605dae6dd2"
+HERMES_INSTALL_SHA="abf338605dae6dd28d101673ac6aed7995c955745db46d47676bc591a7957209"
 GUARDIAN_PROFILE_URL="${REDOUBT_GUARDIAN_PROFILE_URL:-https://install.tryredoubt.com/install/guardian-profile.tar.gz}"
-GUARDIAN_PROFILE_SHA="246fbc95b66cefb2"
+GUARDIAN_PROFILE_SHA="246fbc95b66cefb26b06e9cca7cda4780bfff921ec3d0be2844a872718c54370"
 BRAIN_IMAGE="ghcr.io/ggml-org/llama.cpp:server@sha256:c77881bba21e863bc56391995511f361040952f7ed6033cf1589da7f77a04eff"
 BRAIN_MODEL_URL="${REDOUBT_BRAIN_MODEL_URL:-https://huggingface.co/unsloth/Qwen3.5-4B-GGUF/resolve/main/Qwen3.5-4B-Q4_K_M.gguf}"
 BRAIN_MODEL_SHA="00fe7986ff5f6b463e622b97d2ad18b5e7ccb1be6cd4c8e39e1c1de84a4421e5"
