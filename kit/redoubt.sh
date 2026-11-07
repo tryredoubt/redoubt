@@ -182,6 +182,8 @@ tui_setup
 
 # TUI or plain: noise goes to the log, milestones come through fd 3.
 exec >> "$LOG" 2>&1
+# the log carries credentials (owner pass, recovery phrase): root only
+chmod 600 "$LOG" 2>/dev/null || true
 
 echo "[redoubt-kit] $(date -u +%FT%TZ) boot"
 [ "$(id -u)" -ne 0 ] && { echo "FAIL: root required" >&3; exit 1; }
@@ -1162,6 +1164,8 @@ dbg "mesh id: $MESH_ID"
 # handshake; the phone works from any network with the user's own setup
 # key) or selfhost (the kit runs the coordinator here, LAN-first). The
 # paid tunnel is exe-only; the Linux kit never dials the meet point.
+MESH_MODE_CHANGED=0
+FW_MODE_PREV="${MESH_MODE:-}"
 MESH_MODE="${MESH_MODE:-selfhost}"
 # redoubt mesh-local passes REDOUBT_MESH_MODE: honor it over any
 # saved value
@@ -1174,6 +1178,12 @@ fi
 [ "$MESH_MODE" = "both" ] && MESH_MODE="cloud"
 if [ -n "${NETBIRD_SETUP_KEY:-}" ]; then
   MESH_MODE="cloud"
+fi
+# a mode switch is a fresh door decision: the firewall block below
+# re-models the rules to the new mode (NAS model on selfhost, classic
+# doors on cloud) instead of carrying the old story over
+if [ -n "$FW_MODE_PREV" ] && [ "$FW_MODE_PREV" != "$MESH_MODE" ]; then
+  MESH_MODE_CHANGED=1
 fi
 # fd 3 is the real terminal, captured before the TUI routing: fds 0-2
 # are the curl pipe and the log at this point, so only fd 3 can tell
@@ -3914,6 +3924,134 @@ else
   echo "credentials kept from your first install (vault: Documents/My Redoubt/Access.txt, read anytime with: redoubt creds)"
 fi
 
+# == 7z) the owner vault rides an encrypted store ==
+# Documents/My Redoubt is a gocryptfs mount. The same masterkey has two
+# wraps: the daily key derives from this machine's id (nothing secret on
+# disk, the store only opens on this box) and the owner's recovery phrase
+# (shown once below) opens it anywhere. The cipher directory sits next to
+# the mountpoint; the daily conf lives in /etc/redoubt, the recovery
+# phrase never touches the disk.
+VAULT_BIN=/usr/local/bin/gocryptfs
+VAULT_SHA="37ab7ee7e3f27cf96ba414a02d61e7810c730a4f95d0c7ee050bf3dbd048bacc"
+vault_derive() {
+  # the uid comes from the owner home itself, never from a saved name:
+  # an env can hold a literal like "owner" with no account behind it,
+  # and a key derived from a phantom user locks the store for good
+  printf 'redoubt-vault:%s:%s' "$(cat /etc/machine-id 2>/dev/null)" "$(stat -c %u "${OWNER_HOME:-$HOME}" 2>/dev/null || echo 0)" | sha256sum | cut -d' ' -f1
+}
+vault_mount() {
+  # the daily wrap: only this box can derive the key
+  VAULT_KEY="$(vault_derive)"
+  VAULT_PRE=""
+  if ! mountpoint -q "$MYREDOUBT" 2>/dev/null; then
+    # an older plain folder (dotfiles included) would block the mount:
+    # park it, mount the store, then fold it back in
+    if [ "$(ls -A "$MYREDOUBT" 2>/dev/null | wc -l)" -gt 0 ]; then
+      VAULT_PRE=$(mktemp -d /tmp/redoubt-vault.XXXXXX) || return 1
+      find "$MYREDOUBT" -mindepth 1 -maxdepth 1 -exec mv {} "$VAULT_PRE"/ \; 2>/dev/null
+    fi
+    if ! gocryptfs -quiet -config "$VAULT_CONF" -passfile <(printf '%s\n' "$VAULT_KEY") "$VAULT_CIPHER" "$MYREDOUBT" 2>/dev/null; then
+      # never lose the plain files: put them back and stay plain
+      [ -n "$VAULT_PRE" ] && { find "$VAULT_PRE" -mindepth 1 -maxdepth 1 -exec mv {} "$MYREDOUBT"/ \; 2>/dev/null; rm -rf "$VAULT_PRE"; }
+      dbg "WARNING: vault mount failed - the owner folder stays encrypted"
+      return 1
+    fi
+    [ -n "$VAULT_PRE" ] && { find "$VAULT_PRE" -mindepth 1 -maxdepth 1 -exec mv {} "$MYREDOUBT"/ \; 2>/dev/null; rm -rf "$VAULT_PRE"; }
+  fi
+  return 0
+}
+vault_crypt() {
+  [ -n "$MYREDOUBT" ] || return 0
+  # the ciphertext hides as a dotfile next to the vault: the file
+  # manager only shows the real folder, the raw store stays out of
+  # sight (it is unreadable noise to anyone but the mount anyway)
+  VAULT_CIPHER="$(dirname "$MYREDOUBT")/.My Redoubt.cipher"
+  # the daily conf lives under the owner's home, never in /etc/redoubt:
+  # that dir is 700 root and the owner's login mount could not read it
+  VAULT_CONF="$OWNER_HOME/.local/share/redoubt/vault.gocryptfs.conf"
+
+  # the binary: official static release, the unpacked binary checksum is
+  # pinned here so a tampered tarball dies before anything runs
+  if [ ! -x "$VAULT_BIN" ]; then
+    VAULT_TMP=$(mktemp -d /tmp/redoubt-vault.XXXXXX) || return 1
+    curl -fsSL --retry 3 -o "$VAULT_TMP/g.tar.gz" "https://github.com/rfjakob/gocryptfs/releases/download/v2.6.1/gocryptfs_v2.6.1_linux-static_amd64.tar.gz" 2>/dev/null \
+      || { dbg "WARNING: could not download gocryptfs - the owner folder stays plain"; rm -rf "$VAULT_TMP"; return 1; }
+    tar -xzf "$VAULT_TMP/g.tar.gz" -C "$VAULT_TMP" 2>/dev/null
+    [ "$(sha256sum "$VAULT_TMP/gocryptfs" 2>/dev/null | cut -d' ' -f1)" = "$VAULT_SHA" ] \
+      || { dbg "WARNING: gocryptfs checksum mismatch - the owner folder stays plain"; rm -rf "$VAULT_TMP"; return 1; }
+    install -m 755 "$VAULT_TMP/gocryptfs" "$VAULT_BIN" 2>/dev/null
+    rm -rf "$VAULT_TMP"
+  fi
+  [ -x "$VAULT_BIN" ] || return 1
+
+  # the desktop launcher helper: mounts the vault (only this box can
+  # derive the key) and opens it; "mount" alone feeds the login
+  # autostart. A real script instead of a sh -c chain because the
+  # desktop Exec parser mangles nested quotes.
+  cat > /usr/local/bin/redoubt-vault-open <<'VAULTOPEN'
+#!/bin/sh
+MODE="${1:-open}"
+V="$HOME/Documents/My Redoubt"
+C="$HOME/Documents/.My Redoubt.cipher"
+if ! mountpoint -q "$V" 2>/dev/null && [ -d "$C" ] && [ -x /usr/local/bin/gocryptfs ]; then
+  (printf 'redoubt-vault:%s:%s' "$(cat /etc/machine-id 2>/dev/null)" "$(id -u)" | sha256sum | cut -d' ' -f1 | gocryptfs -quiet -config "$HOME/.local/share/redoubt/vault.gocryptfs.conf" -passfile /dev/stdin "$C" "$V" 2>/dev/null) || true
+fi
+[ "$MODE" = "mount" ] || xdg-open "$V" 2>/dev/null || true
+VAULTOPEN
+  chmod 755 /usr/local/bin/redoubt-vault-open
+
+  if [ -f "$VAULT_CONF" ] && [ -d "$VAULT_CIPHER" ]; then
+    # re-runs: mount the store and keep writing into it
+    vault_mount || return 0
+    return 0
+  fi
+
+  mkdir -p "$VAULT_CIPHER" "$MYREDOUBT"
+  VAULT_KEY="$(vault_derive)"
+  gocryptfs -init -quiet -passfile <(printf '%s\n' "$VAULT_KEY") "$VAULT_CIPHER" 2>/dev/null \
+    || { dbg "WARNING: vault init failed - the owner folder stays plain"; return 1; }
+  mkdir -p "$(dirname "$VAULT_CONF")"
+  cp "$VAULT_CIPHER/gocryptfs.conf" "$VAULT_CONF"
+  chmod 600 "$VAULT_CONF"
+  # the recovery phrase: random, shown to the owner once, never on disk
+  VAULT_RECOVERY=$(tr -dc 'a-z0-9' < /dev/urandom | head -c 32)
+  gocryptfs -passwd -quiet -passfile <(printf '%s\n' "$VAULT_KEY") "$VAULT_CIPHER" <<< "$VAULT_RECOVERY" 2>/dev/null \
+    || dbg "WARNING: vault rewrap with the recovery phrase failed"
+  vault_mount || { dbg "WARNING: the welcome files will stay plain this pass - re-run to fold them into the store"; return 0; }
+  # the owner owns the store and its keys: the daily mount runs as them
+  _VAULT_UID=$(stat -c %u "${OWNER_HOME:-$HOME}" 2>/dev/null || echo 0)
+  [ "$_VAULT_UID" != "0" ] && chown -R "$_VAULT_UID" "$VAULT_CIPHER" "$VAULT_CONF" "$MYREDOUBT" 2>/dev/null || true
+  # the graphical autostart: the vault mounts when the desktop session
+  # starts, so the folder opens like any other from the file manager
+  # even on desktops that never read .profile
+  if [ -n "$OWNER_HOME" ]; then
+    mkdir -p "$OWNER_HOME/.config/autostart"
+    cat > "$OWNER_HOME/.config/autostart/redoubt-vault.desktop" <<'VAULTAUTO'
+[Desktop Entry]
+Type=Application
+Name=Redoubt Vault
+Exec=/usr/local/bin/redoubt-vault-open mount
+Hidden=false
+NoDisplay=true
+X-GNOME-Autostart-enabled=true
+VAULTAUTO
+    chown "$OWNER_USER" "$OWNER_HOME/.config/autostart/redoubt-vault.desktop" 2>/dev/null || true
+  fi
+  # the login hook: the owner's shell mounts the vault on entry, so the
+  # folder opens like any other from the file manager
+  if [ -n "$OWNER_HOME" ] && [ -f "$OWNER_HOME/.profile" ] && ! grep -q 'redoubt-vault-mount' "$OWNER_HOME/.profile" 2>/dev/null; then
+    cat >> "$OWNER_HOME/.profile" <<'VAULTHOOK'
+
+# redoubt-vault-mount: the owner vault mounts on login (only this box
+# can open it: the key derives from the machine id)
+if [ -d "$HOME/Documents/.My Redoubt.cipher" ] && ! mountpoint -q "$HOME/Documents/My Redoubt" 2>/dev/null && [ -x /usr/local/bin/gocryptfs ]; then
+  (printf 'redoubt-vault:%s:%s' "$(cat /etc/machine-id 2>/dev/null)" "$(id -u)" | sha256sum | cut -d' ' -f1 | gocryptfs -quiet -config "$HOME/.local/share/redoubt/vault.gocryptfs.conf" -passfile /dev/stdin "$HOME/Documents/.My Redoubt.cipher" "$HOME/Documents/My Redoubt" 2>/dev/null) || true
+fi
+VAULTHOOK
+  fi
+  return 0
+}
+
 # 8) Welcome: the folder, the guide, the QR codes and the panel seed,
 #    generated for this
 #     machine: one QR per app listing and one per service address (LAN IP
@@ -3969,6 +4107,9 @@ for _i in $(seq 1 60); do
   sleep 10
 done
 if docker compose -f "$STACKDIR/docker-compose.yml" exec -T homarr sh -c 'test -f /appdata/db/db.sqlite' >/dev/null 2>&1; then
+  # the vault path resolves for real in section 8; the seed asks first
+  # on headless passes, so pin a default here or set -u trips
+  [ -z "${MYREDOUBT:-}" ] && MYREDOUBT="${OWNER_HOME:-/home/owner}/Documents/My Redoubt"
   # the vault (Access.txt) is the truth the owner types. A re-run can
   # hold a divergent pass in the env (the panel user then drifts from
   # the vault), so the seed always hashes the vault pass
@@ -4026,10 +4167,12 @@ if docker compose -f "$STACKDIR/docker-compose.yml" exec -T homarr sh -c 'test -
   // (and a cloud board with no reachable console simply shows the
   // tile without a status dot)
   if (process.env.SEED_CONSOLE) {
-    // the icon rides the jsdelivr mirror the kit keeps on the box:
-    // homarr's own icon catalog predates netbird and 404s /icons/netbird
+    // the icon rides the panel's own edge, same origin as the board:
+    // a jsdelivr url would hand the browser the cdn host's cert and
+    // drop a ghost on lan machines without the local CA installed.
+    // homarr's own catalog predates netbird, so the kit ships the svg.
     APPS.push({ id: "redoubt-app-console", name: "Console",
-      icon: "https://cdn.jsdelivr.net/gh/homarr-labs/dashboard-icons@main/svg/netbird.svg",
+      icon: "/icons/netbird.svg",
       href: process.env.SEED_CONSOLE,
       ping: process.env.SEED_CONSOLE_PING || null });
   }
@@ -4310,6 +4453,11 @@ if [ "${REDOUBT_WELCOME:-1}" = "1" ]; then
     "1c50ba60d73660dce3eb97f1f99815df44033b01f44349aee2f282611565caa2" \
     "/var/lib/redoubt/caddy-local/cdn/gh/homarr-labs/dashboard-icons" \
     "600"
+  # the console tile icon lives on the panel's own edge (same origin as
+  # the board): lift it from the fetched catalog into the local share,
+  # so a browser without the local CA still renders it (a jsdelivr url
+  # would hand it the cdn host's cert and drop a ghost on the lan)
+  cp "/var/lib/redoubt/caddy-local/cdn/gh/homarr-labs/dashboard-icons/svg/netbird.svg" "/var/lib/redoubt/caddy-local/icons/netbird.svg" 2>/dev/null || true
   fetch_icon_set "png" \
     "https://install.tryredoubt.com/install/icons-png.tar.gz" \
     "62fe3de3c0063620439024de5eab6b3e3351a21e248cf780e49c21dd42252b18" \
@@ -4856,6 +5004,11 @@ SCANNOTE
   [ -z "$OWNER_HOME" ] && OWNER_HOME=$(getent passwd | awk -F: '$3>=1000 && $3<65534 {print $6; exit}' 2>/dev/null)
   if [ -n "$OWNER_HOME" ] && [ -d "$OWNER_HOME" ]; then
     MYREDOUBT="$OWNER_HOME/Documents/My Redoubt"
+    vault_crypt
+    if [ -n "${VAULT_RECOVERY:-}" ]; then
+      printf '\n  vault recovery phrase (print it and keep it safe - it opens your vault on any machine):\n  %s\n\n' "$VAULT_RECOVERY" >&3 2>/dev/null || true
+      dbg "vault recovery phrase: $VAULT_RECOVERY (print it, do not store it anywhere else)"
+    fi
     mkdir -p "$MYREDOUBT/Only for Thinkers"
     # A .directory file is the XFCE/Thunar-native way to pin the folder
     # icon (gvfs metadata is Nautilus-flavoured and gets written under
@@ -4887,12 +5040,12 @@ SCANNOTE
       # entirely (seen on Rocky: the shortcut never appeared).
       # Hand it to the owner before the shortcut lands inside.
       chown "$(stat -c '%u:%g' "$OWNER_HOME")" "$DESKTOP_DIR" 2>/dev/null || true
-      cat > "$DESKTOP_DIR/My Redoubt.desktop" <<DESKSHRT
+      cat > "$DESKTOP_DIR/My Redoubt.desktop" <<'DESKSHRT'
 [Desktop Entry]
 Type=Application
 Name=My Redoubt
 Comment=Your private cloud folder
-Exec=xdg-open "$MYREDOUBT"
+Exec=/usr/local/bin/redoubt-vault-open
 Icon=/var/lib/redoubt/caddy-local/logo.png
 Terminal=false
 DESKSHRT
@@ -5250,15 +5403,12 @@ LAN_LINE_FILES="<p>Server (home wifi): <code>https://$LAN_HOST:$PORT_EDGE2</code
 LAN_LINE_SEARCH="<p>Server (home wifi): <code>https://$LAN_HOST:$PORT_EDGE3</code></p>"
 PANEL_LINK="https://$APPS_HOST:$PORT_EDGE4"
 
-cp /var/lib/redoubt/caddy-local/favicon.ico "$MYREDOUBT/favicon.ico" 2>/dev/null || true
-
 cat > "$MYREDOUBT/Start Here.html" <<WELCOMEHTML
 <!DOCTYPE html>
 <html lang="en">
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
-<link rel="icon" href="favicon.ico" type="image/x-icon">
 <title>Welcome to your Redoubt</title>
 <link rel="icon" href="data:image/png;base64,$LOGO_B64">
 <style>
@@ -6481,9 +6631,10 @@ services:
       retries: 30
       start_period: 120s
     ports:
-      # bind on the host too: the panel and the warm-up probe reach the
-      # brain at 127.0.0.1, not through the docker network
-      - "${BRAIN_PORT}:${BRAIN_PORT}"
+      # loopback only: the panel and the warm-up probe reach the brain
+      # at 127.0.0.1, not through the docker network, and the model
+      # server ships no auth, so it must never listen on the wifi
+      - "127.0.0.1:${BRAIN_PORT}:${BRAIN_PORT}"
     networks:
       - default
 networks:
@@ -6916,6 +7067,16 @@ if [ -t 3 ]; then
       on-nodoors) FW_ON=y; FW_STATE=on-nodoors ;;
       *) FW_ON=y; FW_STATE=on-nodoors ;;
     esac
+    # a mode switch re-models the doors even when the story was saved:
+    # selfhost closes the apps to the mesh interface (the NAS model),
+    # cloud reopens its classic doors. Closed decisions stay closed:
+    # a switch never opens more than the owner had already opened.
+    if [ "${MESH_MODE_CHANGED:-0}" = "1" ]; then
+      case "$MESH_MODE" in
+        selfhost) [ "$FW_STATE" = "on" ] && FW_STATE=on-nas ;;
+        cloud) [ "$FW_STATE" = "on-nas" ] && FW_STATE=on ;;
+      esac
+    fi
   fi
   if [ "$FW_KIND" = "none" ]; then
     if [ "${FW_QUIET:-0}" != "1" ]; then
@@ -7013,7 +7174,9 @@ if [ -t 3 ]; then
     if [ -z "${FW_STATE:-}" ]; then
       FW_STATE="on"
     fi
-    if fw_state_ok "$FW_STATE"; then
+    # a mode switch never trusts the old door layout: it re-applies
+    # the new model even when the check would pass on leftovers
+    if [ "${MESH_MODE_CHANGED:-0}" != "1" ] && fw_state_ok "$FW_STATE"; then
       FW_DONE=1
       # a dead firewall must never read as open
       if [ "$FW_KIND" = "ufw" ] && ! ufw_rules_live; then
@@ -7160,7 +7323,49 @@ if [ -t 3 ]; then
   ANIM_PID=$!
 else
   if [ "$FW_ACTIVE" = "1" ]; then
-    dbg "$FW_KIND is active and this run has no terminal to ask. Firewall untouched: run again from a terminal to open the mesh doors." >> "$LOG"
+    if [ "${MESH_MODE_CHANGED:-0}" = "1" ]; then
+      # nobody is at the terminal and the mesh mode changed: bring the
+      # firewall to the model of the new mode on its own. The NAS model
+      # on selfhost (apps on the mesh interface only), the classic doors
+      # on cloud. A closed decision (nodoors/off) stays closed: a mode
+      # switch never opens more than the owner had already opened.
+      FW_DECISION_OLD="${FW_DECISION:-}"
+      case "$MESH_MODE" in
+        selfhost)
+          if [ "$FW_DECISION" = "on" ]; then
+            fw_apply_state on-nas
+            fw_state_ok on-nas && FW_DECISION=on-nas
+          fi
+          ;;
+        cloud)
+          if [ "$FW_DECISION" = "on-nas" ]; then
+            if [ "$FW_KIND" = "ufw" ]; then
+              for FW_P in $FW_U_CLOUD_TCP; do
+                ufw allow "$FW_P/tcp" >/dev/null 2>&1 || true
+              done
+              ufw allow 8390/udp >/dev/null 2>&1 || true
+            else
+              firewall-cmd --permanent --add-service=ssh >/dev/null 2>&1 || true
+              for FW_P in $FW_F_CLOUD_PORTS; do
+                firewall-cmd --permanent --add-port="$FW_P" >/dev/null 2>&1 || true
+              done
+              firewall-cmd --reload >/dev/null 2>&1 || true
+            fi
+            FW_DECISION=on
+          fi
+          ;;
+      esac
+      if [ "$FW_DECISION" != "$FW_DECISION_OLD" ]; then
+        if grep -qs '^FW_DECISION=' /etc/redoubt/redoubt.env 2>/dev/null; then
+          sed -i "s|^FW_DECISION=.*|FW_DECISION=$FW_DECISION|" /etc/redoubt/redoubt.env
+        else
+          echo "FW_DECISION=$FW_DECISION" >> /etc/redoubt/redoubt.env
+        fi
+      fi
+      dbg "mesh mode changed ($FW_MODE_PREV -> $MESH_MODE): firewall moved to the $FW_DECISION model" >> "$LOG"
+    else
+      dbg "$FW_KIND is active and this run has no terminal to ask. Firewall untouched: run again from a terminal to open the mesh doors." >> "$LOG"
+    fi
   fi
 fi
 
@@ -7524,7 +7729,19 @@ if [ "$(id -u)" -ne 0 ]; then
   fi
 fi
 case "${1:-}" in
+  vault-open)
+    # the vault mounts on demand (the login hook calls this too)
+    if [ -d "$HOME/Documents/.My Redoubt.cipher" ] && ! mountpoint -q "$HOME/Documents/My Redoubt" 2>/dev/null && [ -x /usr/local/bin/gocryptfs ]; then
+      (printf 'redoubt-vault:%s:%s' "$(cat /etc/machine-id 2>/dev/null)" "$(id -u)" | sha256sum | cut -d' ' -f1 | gocryptfs -quiet -config "$HOME/.local/share/redoubt/vault.gocryptfs.conf" -passfile /dev/stdin "$HOME/Documents/.My Redoubt.cipher" "$HOME/Documents/My Redoubt" 2>/dev/null) && echo "vault opened" || echo "vault mount failed"
+    else
+      echo "no encrypted vault on this box"
+    fi
+    ;;
   creds)
+    # the vault mounts on demand when the owner asks from a terminal
+    if [ -d "$HOME/Documents/.My Redoubt.cipher" ] && ! mountpoint -q "$HOME/Documents/My Redoubt" 2>/dev/null && [ -x /usr/local/bin/gocryptfs ]; then
+      (printf 'redoubt-vault:%s:%s' "$(cat /etc/machine-id 2>/dev/null)" "$(id -u)" | sha256sum | cut -d' ' -f1 | gocryptfs -quiet -config "$HOME/.local/share/redoubt/vault.gocryptfs.conf" -passfile /dev/stdin "$HOME/Documents/.My Redoubt.cipher" "$HOME/Documents/My Redoubt" 2>/dev/null) || true
+    fi
     if [ -r /etc/redoubt/credentials.txt ]; then
       cat /etc/redoubt/credentials.txt
     else
@@ -7780,6 +7997,14 @@ fi
     print_rule
   fi
 } >&3
+
+# the owner vault unmounts here: the pass wrote as root, and a FUSE
+# mount only opens for the user who made it. The login hook mounts it
+# as the owner, so the folder opens from the file manager.
+if mountpoint -q "${MYREDOUBT:-/nonexistent}" 2>/dev/null; then
+  fusermount -u "$MYREDOUBT" 2>/dev/null || true
+  dbg "OK: the owner vault unmounted after the pass (the login hook reopens it as the owner)"
+fi
 
 exit $RC
 
