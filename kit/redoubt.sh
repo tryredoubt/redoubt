@@ -523,8 +523,12 @@ dot_frame() {  # wall-clock frame, ~30fps
 # is plain ascii. The desktop path never reaches this function.
 draw_line_vga() {  # $1 = bar width, $2 = fill cells, $3 = pct, $4 = label
   local W=$1 F=$2 PCT=$3 LABEL=$4 f sp REST BODY
-  f=$(dot_frame)
-  case $(( f % 4 )) in 0) sp='-' ;; 1) sp='\\' ;; 2) sp='|' ;; 3) sp='/' ;; esac
+  if [ "${CLEAN_BAR:-0}" = "1" ]; then
+    sp=''
+  else
+    f=$(dot_frame)
+    case $(( f % 4 )) in 0) sp='-' ;; 1) sp='\\' ;; 2) sp='|' ;; 3) sp='/' ;; esac
+  fi
   # the check glyph is UTF-8 only: hand the VGA console the plain "+"
   LABEL=${LABEL//✓/+}
   LABEL_MAX=$(( ${COLUMNS:-80} - W - 16 ))
@@ -569,8 +573,12 @@ draw_line() {  # Paints the current state. Only the animator loop calls this.
     # render as broken pieces on modern terminals), one
     # overwritten line with the spinner, the % and the label
     if [ -t 3 ]; then
-      f=$(dot_frame)
-      sp="$(dot_f "$f")"
+      if [ "${CLEAN_BAR:-0}" = "1" ]; then
+        sp=""
+      else
+        f=$(dot_frame)
+        sp="$(dot_f "$f")"
+      fi
       LABEL_MAX=$(( ${COLUMNS:-80} - 16 ))
       [ "$LABEL_MAX" -lt 8 ] && LABEL_MAX=8
       if [ ${#BAR_LABEL} -gt "$LABEL_MAX" ]; then
@@ -591,8 +599,14 @@ draw_line() {  # Paints the current state. Only the animator loop calls this.
     # One braille dot on the wall clock: a calm signal, no extra
     # animated noise. The animator repaints ~30 times a second, so the
     # dot spins on its own rhythm instead of waiting for bar updates.
-    f=$(dot_frame)
-    sp="$(dot_f "$f")"
+    # CLEAN_BAR lands the final line without the dot: the finished
+    # guardian and done lines read cleaner that way.
+    if [ "${CLEAN_BAR:-0}" = "1" ]; then
+      sp=""
+    else
+      f=$(dot_frame)
+      sp="$(dot_f "$f")"
+    fi
     # The label gets its own budget (2 + bar + % + separators + dots).
     # Over budget it would wrap the line and break the \r redraw.
     LABEL_MAX=$(( ${COLUMNS:-80} - W - 16 ))
@@ -1467,24 +1481,34 @@ nb_token_flow() {
 # key gets silently ignored while the old config lives. Clear it before
 # any enrollment attempt so the new credential actually lands.
 nb_reset_stale_identity() {
-  if nb_cloud_linked && ! nb_cloud_live; then
-    for _NB in $(command -v netbird 2>/dev/null) /usr/local/bin/netbird /usr/bin/netbird /usr/sbin/netbird; do
-      [ -x "$_NB" ] || continue
-      "$_NB" down >/dev/null 2>&1 || true
-      break
-    done
-    # NetBird 0.79+ keeps the identity PER PROFILE (/var/lib/netbird/
-    # <profile>/config.json), not at the top level: a partial rm leaves
-    # the old enrollment alive and the new key gets ignored. Clear the
-    # whole state dir (the daemon recreates it on the next up) plus the
-    # older layout path.
-    rm -rf /var/lib/netbird/* /etc/netbird/config.json 2>/dev/null || true
-    # the down above leaves the daemon parked: restart it so the join
-    # right after this never fights a dead daemon (the join reads that
-    # as a key rejection otherwise; seen on Rocky)
-    systemctl restart netbird >/dev/null 2>&1 || true
-    echo "mesh: stale cloud identity cleared - enrolling fresh" >> "$LOG"
-  fi
+  # Any enrollment attempt starts from a clean slate: a stored config
+  # from another mode (a lab run, a selfhost profile) keeps the daemon
+  # pointed at a dead management, the new up never persists over it,
+  # and the very next daemon restart drops the session. The callers
+  # only run this right before a join, so wipe unconditionally.
+  for _NB in $(command -v netbird 2>/dev/null) /usr/local/bin/netbird /usr/bin/netbird /usr/sbin/netbird; do
+    [ -x "$_NB" ] || continue
+    "$_NB" down >/dev/null 2>&1 || true
+    break
+  done
+  # NetBird 0.79+ keeps the identity PER PROFILE (/var/lib/netbird/
+  # <profile>/config.json), not at the top level: a partial rm leaves
+  # the old enrollment alive and the new key gets ignored. Clear the
+  # whole state dir (the daemon recreates it on the next up) plus the
+  # older layout path.
+  rm -rf /var/lib/netbird/* /etc/netbird/config.json 2>/dev/null || true
+  # the down above leaves the daemon parked: restart it so the join
+  # right after this never fights a dead daemon (the join reads that
+  # as a key rejection otherwise; seen on Rocky)
+  systemctl restart netbird >/dev/null 2>&1 || true
+  # the join right after needs the daemon awake: wait for it to answer
+  # (an up against a waking daemon dies with a reset connection and
+  # the key rejection branch asks for a fresh credential forever)
+  for _i in $(seq 1 30); do
+    "$_NB" status >/dev/null 2>&1 && break
+    sleep 1
+  done
+  echo "mesh: previous identity cleared - enrolling fresh" >> "$LOG"
 }
 
 # After a successful cloud join, arm the mesh nameserver: the pi-hole's
@@ -1503,6 +1527,12 @@ arm_mesh_nameserver() {
     for _NB in $(command -v netbird 2>/dev/null) /usr/local/bin/netbird /usr/bin/netbird /usr/sbin/netbird; do
       [ -x "$_NB" ] || continue
       _NB_MESH_IP="$("$_NB" status 2>/dev/null | sed -n 's/^NetBird IP: //p' | head -1)"
+      # a half-joined agent reports "N/A" (or junk) in the IP slot:
+      # that is not an address. Only a shaped IPv4 counts.
+      case "$_NB_MESH_IP" in
+        [0-9]*.[0-9]*.[0-9]*.[0-9]*) : ;;
+        *) _NB_MESH_IP="" ;;
+      esac
       break
     done
     [ -n "$_NB_MESH_IP" ] && break
@@ -1510,12 +1540,22 @@ arm_mesh_nameserver() {
   done
   if [ -z "$_NB_MESH_IP" ]; then
     dbg "no mesh address yet - nameserver skipped (next pass arms it)"
+    touch /etc/redoubt/mesh-ns-pending 2>/dev/null || true
     return 0
   fi
   # the status line carries the CIDR prefix (100.125.57.157/16): the
   # nameserver API wants the bare address and rejects the prefix as
   # "invalid ns servers format" (seen twice on Rocky)
   _NB_MESH_IP="${_NB_MESH_IP%%/*}"
+  # final shape check: garbage must never reach the API as an address
+  case "$_NB_MESH_IP" in
+    [0-9]*.[0-9]*.[0-9]*.[0-9]*) : ;;
+    *)
+      dbg "nameserver skipped - the mesh address is not an ip (got: $_NB_MESH_IP)"
+      touch /etc/redoubt/mesh-ns-pending 2>/dev/null || true
+      return 0
+      ;;
+  esac
   # idempotent: a nameserver on the same address is already armed
   _NB_EXIST=$(curl -fsS --max-time 20 -H "@$_NB_TOKFILE" "$_NB_API/api/dns/nameservers" 2>/dev/null | grep -c "\"ip\":\"$_NB_MESH_IP\"") || true
   if [ -n "$_NB_EXIST" ] && [ "$_NB_EXIST" -gt 0 ]; then
@@ -2428,6 +2468,10 @@ https://$LAN_IP:8446, https://127.0.0.1:8446 {
 		root * /data
 		file_server
 	}
+	handle /console-ping {
+		rewrite * /
+		reverse_proxy https://app.netbird.io
+	}
 	handle /gh/* {
 		@simpleicons path_regexp simpleicons ^/gh/simple-icons/simple-icons@[^/]+/icons/(.+)$
 		handle @simpleicons {
@@ -2456,6 +2500,16 @@ https://$LAN_IP:8446, https://127.0.0.1:8446 {
 	}
 	handle {
 		reverse_proxy homarr:7575
+	}
+}
+
+# the panel's ping checks run server-side inside the homarr container:
+# a same-origin path never resolves there, so this tiny http listener
+# gives the stack a route the container itself can reach
+http://:9090 {
+	handle /console-ping {
+		rewrite * /
+		reverse_proxy https://app.netbird.io
 	}
 }
 CADDY
@@ -3268,11 +3322,14 @@ NBDESKTOP
       # a selfhost/both pass must bring it back to the local
       # coordinator, or the host silently keeps its cloud link while
       # the local mesh runs without it
-      if nb_cloud_linked; then
-        "$NBEXE" down >/dev/null 2>&1 || true
-        sleep 2
-        UP=$("$NBEXE" status 2>/dev/null | tr 'A-Z' 'a-z')
-      fi
+      # a cloud (or lab) config would keep the daemon on the wrong
+      # management and the local up below never persists: clear it
+      nb_reset_stale_identity
+      for _i in $(seq 1 30); do
+        "$NBEXE" status >/dev/null 2>&1 && break
+        sleep 1
+      done
+      UP=$("$NBEXE" status 2>/dev/null | tr 'A-Z' 'a-z')
       case "$UP" in
         *connected*) ;;
         *)
@@ -3882,9 +3939,20 @@ fi
   # to the mesh, so the tiles carry the mesh name; cloud rides the
   # mesh from any network with the same remote name
   SEED_HOST="redoubt.remote"
-  # the mesh console tile is selfhost-only: cloud keeps the four tiles
-  SEED_CONSOLE=""
-  [ "$MESH_MODE" = "selfhost" ] && SEED_CONSOLE="https://$SEED_HOST:$PORT_DASH"
+  # the mesh console tile lands on every board: selfhost points at the
+  # local dashboard, cloud at the NetBird web console (the account's
+  # own dashboard, no local port). The owner reaches the mesh from the
+  # panel either way.
+  # homarr pings run inside the homarr container: the console ping rides
+  # a tiny internal listener on the edge-local caddy that reverse-proxies
+  # the NetBird web console, so the dot means "the console is reachable
+  # from this box" without any browser or CORS in the middle
+  SEED_CONSOLE="https://app.netbird.io"
+  SEED_CONSOLE_PING="http://redoubt-edge-local-1:9090/console-ping"
+  if [ "$MESH_MODE" = "selfhost" ]; then
+    SEED_CONSOLE="https://$SEED_HOST:$PORT_DASH"
+    SEED_CONSOLE_PING="http://dashboard:80"
+  fi
   [ "$MESH_MODE" != "selfhost" ] && [ ! -f /etc/redoubt/cloud-pat.txt ] && SEED_HOST="${NETBIRD_IP:-$LAN_IP}"
 
   # the away side of the split-DNS: a mesh zone makes redoubt.lan
@@ -3909,7 +3977,7 @@ if docker compose -f "$STACKDIR/docker-compose.yml" exec -T homarr sh -c 'test -
   [ -n "$_VAULT_PASS" ] && _SEED_PASS="$_VAULT_PASS"
   SEED_OUT=$(docker compose -f "$STACKDIR/docker-compose.yml" exec -T \
     -e SEED_USER="$OWNER_USER" -e SEED_EMAIL="$IMMICH_EMAIL" -e SEED_PASS="$_SEED_PASS" -e SEED_SECTIONS="$SEED_SECTIONS" \
-    -e SEED_PHOTOS="https://${SEED_HOST}:$PORT_EDGE1" -e SEED_FILES="https://${SEED_HOST}:$PORT_EDGE2" -e SEED_SEARCH="https://${SEED_HOST}:$PORT_EDGE3" -e SEED_PIHOLE="https://${SEED_HOST}:$PORT_EDGE5/admin" -e SEED_WHEREAMI="/whereami" -e SEED_CONSOLE="$SEED_CONSOLE" \
+    -e SEED_PHOTOS="https://${SEED_HOST}:$PORT_EDGE1" -e SEED_FILES="https://${SEED_HOST}:$PORT_EDGE2" -e SEED_SEARCH="https://${SEED_HOST}:$PORT_EDGE3" -e SEED_PIHOLE="https://${SEED_HOST}:$PORT_EDGE5/admin" -e SEED_WHEREAMI="/whereami" -e SEED_CONSOLE="$SEED_CONSOLE" -e SEED_CONSOLE_PING="$SEED_CONSOLE_PING" \
     homarr sh -c 'cat > /appdata/seed.js; node /appdata/seed.js; rc=$?; rm -f /appdata/seed.js; exit $rc' <<'SEEDJS'
 // Redoubt panel seed: writes the admin, the app tiles and the finished
 // onboarding state, mirroring the wizard's own database writes. Runs
@@ -3935,6 +4003,14 @@ if docker compose -f "$STACKDIR/docker-compose.yml" exec -T homarr sh -c 'test -
   var USERNAME = process.env.SEED_USER || "owner";
   var EMAIL = process.env.SEED_EMAIL || "owner@redoubt.local";
   var PASSWORD = process.env.SEED_PASS || "";
+  // the panel branding is the product's own: the default homarr
+  // logo paths read as ghost icons on the login screen
+  // the edge-local routes, not the public site: the panel is the
+  // owner's own box, the logo must load without internet and without
+  // the public anti-bot wall. The kit ships both files through its
+  // local caddy edge (see the icon-set fetch above).
+  var LOGO = process.env.SEED_LOGO || "/logo.png";
+  var FAVICON = process.env.SEED_FAVICON || "/favicon.ico";
   var APPS = [
     { id: "redoubt-app-photos", name: "Photos", icon: "/icons/immich.svg",
       href: process.env.SEED_PHOTOS, ping: "http://immich-server:2283" },
@@ -3945,14 +4021,17 @@ if docker compose -f "$STACKDIR/docker-compose.yml" exec -T homarr sh -c 'test -
     { id: "redoubt-app-pihole", name: "Pi-hole", icon: "/icons/pihole.svg",
       href: process.env.SEED_PIHOLE, ping: "http://pihole:80" }
   ];
-  // the mesh console tile only lands on selfhost boards: cloud has no
-  // local dashboard, so its panel keeps the four app tiles
+  // the mesh console tile lands on every board: selfhost pings the
+  // local dashboard container, cloud pings the NetBird web console
+  // (and a cloud board with no reachable console simply shows the
+  // tile without a status dot)
   if (process.env.SEED_CONSOLE) {
     // the icon rides the jsdelivr mirror the kit keeps on the box:
     // homarr's own icon catalog predates netbird and 404s /icons/netbird
-    APPS.push({ id: "redoubt-app-console", name: "Mesh console",
+    APPS.push({ id: "redoubt-app-console", name: "Console",
       icon: "https://cdn.jsdelivr.net/gh/homarr-labs/dashboard-icons@main/svg/netbird.svg",
-      href: process.env.SEED_CONSOLE, ping: "http://dashboard:80" });
+      href: process.env.SEED_CONSOLE,
+      ping: process.env.SEED_CONSOLE_PING || null });
   }
 
   var uuid = function () {
@@ -3995,7 +4074,7 @@ if docker compose -f "$STACKDIR/docker-compose.yml" exec -T homarr sh -c 'test -
     db.prepare("UPDATE board SET name = ?, creator_id = ?, primary_color = ?, secondary_color = ?, custom_css = ?, logo_image_url = ?, favicon_image_url = ?, meta_title = ? WHERE id = ?")
       .run("Redoubt", uid, "#6ee7b7", "#0f766e",
         "html, body { background: #000000 !important; } :root[data-mantine-color-scheme=\"dark\"], :root[data-mantine-color-scheme=\"light\"], [data-mantine-color-scheme=\"light\"] { --mantine-color-body: #000000 !important; --mantine-color-text: #e8ece9 !important; --mantine-color-dimmed: #8b949e !important; --mantine-color-placeholder: #6b6f75 !important; --mantine-color-anchor: #6ee7b7 !important; --mantine-color-default: #17181a !important; --mantine-color-default-border: #3d3a39 !important; --mantine-color-default-hover: #1f2023 !important; --mantine-color-default-color: #e8ece9 !important; --mantine-color-input: #17181a !important; --mantine-color-input-border: #3d3a39 !important; --mantine-color-gray-light: rgba(110,231,183,0.12) !important; --mantine-color-gray-light-hover: rgba(110,231,183,0.20) !important; --mantine-color-gray-light-color: #6ee7b7 !important; --mantine-color-gray-outline: #6ee7b7 !important; --mantine-color-gray-outline-hover: rgba(110,231,183,0.08) !important; --mantine-color-gray-filled: rgba(110,231,183,0.14) !important; --mantine-color-gray-filled-hover: rgba(110,231,183,0.24) !important; --mantine-color-gray-color: #6ee7b7 !important; --mantine-color-dark-0: #c9c9c9 !important; --mantine-color-dark-1: #b8b8b8 !important; --mantine-color-dark-2: #8b949e !important; --mantine-color-dark-3: #6b6f75 !important; --mantine-color-dark-4: #3d3a39 !important; --mantine-color-dark-5: #2a2a2c !important; --mantine-color-dark-6: #17181a !important; --mantine-color-dark-7: #101012 !important; --mantine-color-dark-8: #0a0a0c !important; --mantine-color-dark-9: #000000 !important; } .mantine-Card-root, .mantine-Paper-root { background: #101012 !important; border: 1px solid #26262a; } .mantine-Card-root .mantine-Text-root:not(.app-title) { color: #6ee7b7; } .mantine-AppShell-main { background: transparent; } .mantine-UnstyledButton-root:hover { background: rgba(110,231,183,0.08); } ::-webkit-scrollbar { width: 10px; height: 10px; } ::-webkit-scrollbar-thumb { background: #26262a; border-radius: 6px; } ::-webkit-scrollbar-thumb:hover { background: #3d3a39; } ::-webkit-scrollbar-track { background: transparent; }",
-        "/logo.png", "/favicon.ico", "Redoubt", boardId);
+        LOGO, FAVICON, "Redoubt", boardId);
   } else {
     boardId = uuid();
     db.prepare("INSERT INTO board (id, name, is_public) VALUES (?, ?, 0)").run(boardId, "Redoubt");
@@ -4008,8 +4087,8 @@ if docker compose -f "$STACKDIR/docker-compose.yml" exec -T homarr sh -c 'test -
     json: {
       appName: "Redoubt",
       greeting: "",
-      logoImageUrl: "/logo.png",
-      faviconImageUrl: "/favicon.ico",
+      logoImageUrl: LOGO,
+      faviconImageUrl: FAVICON,
       primaryColor: "#6ee7b7",
       secondaryColor: "#0f766e",
       lockPrimaryColor: false,
@@ -4027,7 +4106,7 @@ if docker compose -f "$STACKDIR/docker-compose.yml" exec -T homarr sh -c 'test -
   // The seed pins it off on every pass.
   db.prepare("INSERT INTO serverSetting (setting_key, value) VALUES ('analytics', ?) ON CONFLICT(setting_key) DO UPDATE SET value = excluded.value")
     .run(JSON.stringify({ json: { enableGeneral: false } }));
-  db.prepare('UPDATE "user" SET image = ? WHERE id = ?').run("/logo.png", uid);
+  db.prepare('UPDATE "user" SET image = ? WHERE id = ?').run(LOGO, uid);
 
   var section = db.prepare("SELECT id FROM section WHERE board_id = ? AND kind = 'empty' LIMIT 1").get(boardId);
   if (!section) {
@@ -4112,7 +4191,11 @@ if docker compose -f "$STACKDIR/docker-compose.yml" exec -T homarr sh -c 'test -
     db.prepare("INSERT INTO app (id, name, icon_url, href, ping_url) VALUES (?, ?, ?, ?, ?) ON CONFLICT(id) DO UPDATE SET href = excluded.href, icon_url = excluded.icon_url, ping_url = excluded.ping_url")
       .run(app.id, app.name, app.icon, app.href, app.ping);
     var itemId = uuid();
-    var options = JSON.stringify({ json: { appId: app.id, openInNewTab: true, showTitle: true } });
+    // the tile's status dot only runs when the app carries a ping the
+    // panel can actually reach: a cloud console with no local target
+    // would ping the public site, hit CORS, and paint a red dot that
+    // means nothing. No ping, no dot, no false alarm.
+    var options = JSON.stringify({ json: { appId: app.id, openInNewTab: true, showTitle: true, pingEnabled: app.ping ? true : false } });
     db.prepare("INSERT INTO item (id, board_id, kind, options, advanced_options) VALUES (?, ?, 'app', ?, ?)")
       .run(itemId, boardId, options, '{"json": {}}');
     for (var l = 0; l < layouts.length; l++) {
@@ -5498,20 +5581,6 @@ WELCOMEHTML
   # the work is skipped but the bar still walks to 100, never stopping at 50.
   step "your own certificate authority"
   step "your folder, ready"
-  draw_bar 100 "✓ your cloud, done"
-  # Stop the painter and land the newline, so the finished line stays put.
-  if [ -n "$ANIM_PID" ]; then
-    kill -9 "$ANIM_PID" 2>/dev/null
-    ANIM_PID=""
-  fi
-  # One last paint (the animator may have died mid-frame), then the newline.
-  draw_line
-  echo "" >&3
-  rm -f "$BAR_STATE" 2>/dev/null || true
-
-  # hand the console back to the system's usual loglevel
-  [ -n "$QUIET_PK" ] && sysctl -w kernel.printk="$QUIET_PK" >/dev/null 2>&1
-
   # The vault (Access.txt) is the one truth the customer types. A
   # re-run can hold a divergent pass in the env (apps then sign up with
   # the wrong key), so realign every app pass before any sign-up.
@@ -6185,6 +6254,457 @@ UNIT
 else
   dbg "WARN: nftables unavailable, skipping the DNS leak firewall"
 fi
+
+# ============ the guardian (Cerberus): the box's own caretaker ============
+# A dedicated user runs Hermes with the Cerberus profile and the local
+# brain (llama-server + the tier model). Nothing here is root, nothing
+# phones home, and the panel's assistant talks to Cerberus over the
+# internal docker subnet. Every piece is idempotent: re-runs reuse what
+# is already in place.
+
+GUARDIAN_USER="guardian"
+GUARDIAN_PORT=8642
+BRAIN_PORT=8686
+GATEWAY_SVC="hermes-gateway-cerberus"
+HERMES_INSTALL_URL="https://hermes-agent.nousresearch.com/install.sh"
+HERMES_INSTALL_SHA="abf338605dae6dd28d101673ac6aed7995c955745db46d47676bc591a7957209"
+GUARDIAN_PROFILE_URL="${REDOUBT_GUARDIAN_PROFILE_URL:-https://install.tryredoubt.com/install/guardian-profile.tar.gz}"
+GUARDIAN_PROFILE_SHA="246fbc95b66cefb26b06e9cca7cda4780bfff921ec3d0be2844a872718c54370"
+BRAIN_IMAGE="ghcr.io/ggml-org/llama.cpp:server@sha256:c77881bba21e863bc56391995511f361040952f7ed6033cf1589da7f77a04eff"
+BRAIN_MODEL_URL="${REDOUBT_BRAIN_MODEL_URL:-https://huggingface.co/unsloth/Qwen3.5-4B-GGUF/resolve/main/Qwen3.5-4B-Q4_K_M.gguf}"
+BRAIN_MODEL_SHA="00fe7986ff5f6b463e62455821146049db6f9313603938a70800d1fb69ef11a4"
+BRAIN_MODEL_FILE="qwen35-4b-q4km.gguf"
+PANEL_DB_HOST="/var/lib/docker/volumes/redoubt_homarr-data/_data/db/db.sqlite"
+
+# one place maps a tier to its parameters: the heuristics and the lab
+# override both land here, never in separate if-chains. The 9B and the
+# GPU image land in a later release; today every tier runs the verified
+# 4B, full only widens the context budget.
+set_tier_params() {
+  case "$1" in
+    full)
+      BRAIN_MODEL_FILE="qwen35-4b-q4km.gguf"; BRAIN_CTX=131072 ;;
+    standard)
+      BRAIN_MODEL_FILE="qwen35-4b-q4km.gguf"; BRAIN_CTX=131072 ;;
+    tiny)
+      BRAIN_MODEL_FILE="qwen35-4b-q4km.gguf"; BRAIN_CTX=65536 ;;
+  esac
+}
+
+# what this machine can carry. full = discrete GPU with 6GB+ VRAM,
+# standard = 10GB+ RAM and no GPU, tiny = the honest floor (AVX2
+# required). REDOUBT_TIER forces a tier for lab runs.
+detect_tier() {
+  local ram_gb vram gpu_line avx2
+
+  if [ -n "${REDOUBT_TIER:-}" ]; then
+    TIER="$REDOUBT_TIER"
+    set_tier_params "$TIER"
+    TIER_NOTE="forced by REDOUBT_TIER (lab only)"
+    return
+  fi
+
+  ram_gb=$(awk '/MemTotal/ {printf "%d", $2/1048576}' /proc/meminfo)
+
+  gpu_line=""
+  vram=""
+  if command -v lspci >/dev/null 2>&1; then
+    gpu_line=$(lspci -nn 2>/dev/null | grep -iE "vga compatible|3d controller|display controller" | grep -viE "virtio|qxl|vmware|bochs|cirrus|red hat" | head -1)
+  fi
+  if [ -n "$gpu_line" ]; then
+    if command -v nvidia-smi >/dev/null 2>&1; then
+      vram=$(nvidia-smi --query-gpu=memory.total --format=csv,noheader,nounits 2>/dev/null | head -1 | tr -d " ")
+    elif command -v rocm-smi >/dev/null 2>&1; then
+      vram=$(rocm-smi --showmeminfo vram 2>/dev/null | grep -oE "[0-9]+" | head -1)
+    fi
+  fi
+
+  avx2=0
+  grep -q avx2 /proc/cpuinfo 2>/dev/null && avx2=1
+
+  if [ -n "$vram" ] && [ "$vram" -ge 6144 ]; then
+    TIER="full"
+    TIER_NOTE="gpu with $vram MiB vram"
+  elif [ "$ram_gb" -lt 10 ]; then
+    TIER="tiny"
+    TIER_NOTE="low ram, 64K context"
+  else
+    TIER="standard"
+    TIER_NOTE=""
+  fi
+
+  if [ "$avx2" -ne 1 ]; then
+    TIER="tiny"
+    TIER_NOTE="${TIER_NOTE:+$TIER_NOTE, }no avx2, reduced"
+  fi
+
+  set_tier_params "$TIER"
+}
+
+install_guardian_user() {
+  if ! id "$GUARDIAN_USER" >/dev/null 2>&1; then
+    useradd -r -m -s /bin/bash "$GUARDIAN_USER"
+    gbar "guardian: user $GUARDIAN_USER created"
+  fi
+  usermod -aG docker "$GUARDIAN_USER" 2>/dev/null || true
+}
+
+install_guardian_hermes() {
+  local inst="/home/$GUARDIAN_USER/hermes-install.sh"
+  gbar "guardian: downloading hermes (this takes a minute) ..."
+  # -# keeps the transfer visible: a silent multi-minute fetch on a slow
+  # link looks frozen, and owners kill frozen things
+  su - "$GUARDIAN_USER" -c "curl -fL --progress-bar '$HERMES_INSTALL_URL' -o '$inst'"
+  local got
+  got=$(sha256sum "$inst" | cut -d' ' -f1)
+  if [ "$got" != "$HERMES_INSTALL_SHA" ]; then
+    rm -f "$inst"
+    gbar "guardian: hermes installer sha mismatch ($got) - refusing to run it"
+    return 1
+  fi
+  # the installer runs as the guardian user: the whole hermes tree lands
+  # under /home/guardian/.local, nowhere near root
+  su - "$GUARDIAN_USER" -c "bash '$inst' && rm -f '$inst'"
+  local ver
+  ver=$(su - "$GUARDIAN_USER" -c "~/.local/bin/hermes --version" 2>/dev/null \
+        | grep -oE "[0-9]+\.[0-9]+\.[0-9]+" | head -1)
+  [ -n "$ver" ] && gbar "guardian: hermes $ver installed" \
+                || gbar "guardian: WARNING could not read hermes version"
+}
+
+install_guardian_profile() {
+  # The profile is Cerberus on every face: console and panel. The
+  # published archive carries the internal name redoubt, so an import
+  # is always followed by the rename. Re-runs find the profile by name
+  # or migrate an older redoubt install.
+  if su - "$GUARDIAN_USER" -c "~/.local/bin/hermes profile list" 2>/dev/null | grep -q "cerberus"; then
+    gbar "guardian: Cerberus profile present"
+    return 0
+  fi
+  if su - "$GUARDIAN_USER" -c "~/.local/bin/hermes profile list" 2>/dev/null | grep -q "redoubt"; then
+    su - "$GUARDIAN_USER" -c "~/.local/bin/hermes profile rename redoubt Cerberus" >/dev/null 2>&1
+    gbar "guardian: Cerberus profile renamed"
+    return 0
+  fi
+  local pf="/home/$GUARDIAN_USER/guardian-profile.tar.gz"
+  su - "$GUARDIAN_USER" -c "curl -fsSL '$GUARDIAN_PROFILE_URL' -o '$pf'"
+  local got
+  got=$(sha256sum "$pf" | cut -d' ' -f1)
+  if [ "$got" != "$GUARDIAN_PROFILE_SHA" ]; then
+    rm -f "$pf"
+    gbar "guardian: profile sha mismatch ($got) - refusing to import it"
+    return 1
+  fi
+  su - "$GUARDIAN_USER" -c "~/.local/bin/hermes profile import '$pf'"
+  su - "$GUARDIAN_USER" -c "~/.local/bin/hermes profile rename redoubt Cerberus" >/dev/null 2>&1
+  rm -f "$pf"
+  gbar "guardian: Cerberus profile imported"
+}
+
+guardian_key() {
+  local env="/home/$GUARDIAN_USER/.hermes/profiles/cerberus/.env"
+  mkdir -p "$(dirname "$env")"
+  if ! grep -q "^API_SERVER_KEY=" "$env" 2>/dev/null; then
+    local key
+    key=$(openssl rand -hex 32)
+    printf 'API_SERVER_KEY=%s\nAPI_SERVER_MODEL_NAME=Cerberus\n' "$key" >> "$env"
+    chown "$GUARDIAN_USER:$GUARDIAN_USER" "$env"
+    chmod 600 "$env"
+    gbar "guardian: api key generated"
+  fi
+  # The panel lives in a container and reaches the gateway through the
+  # docker bridge (172.28.0.1), never through loopback: bind every
+  # interface. The bearer key is still required on every request, and
+  # guardian_ufw limits the reachable surface to the docker subnet.
+  grep -q "^API_SERVER_HOST=" "$env" 2>/dev/null \
+    || printf 'API_SERVER_HOST=0.0.0.0\n' >> "$env"
+  # Two concurrent runs is too tight for a house: a busy panel answers
+  # 409 to everything else (the kit warm-up included) and dead panel
+  # streams leave ghost runs. Raise the cap; the brain serializes with
+  # its single slot anyway, so this only widens the queue.
+  local cfg="/home/$GUARDIAN_USER/.hermes/profiles/cerberus/config.yaml"
+  sed -i 's/^    max_concurrent_runs: 2/    max_concurrent_runs: 8/' "$cfg" 2>/dev/null || true
+}
+
+guardian_brain() {
+  local mdir="/var/lib/redoubt/brain/models"
+  local mf="$mdir/$BRAIN_MODEL_FILE"
+  mkdir -p "$mdir"
+  if [ ! -f "$mf" ]; then
+    gbar "guardian: downloading the brain model ($BRAIN_MODEL_FILE) ..."
+    curl -fL --retry 3 -o "$mf" "$BRAIN_MODEL_URL" || return 1
+    local got
+    got=$(sha256sum "$mf" | cut -d' ' -f1)
+    if [ "$got" != "$BRAIN_MODEL_SHA" ]; then
+      rm -f "$mf"
+      gbar "guardian: model sha mismatch ($got) - refusing to run it"
+      return 1
+    fi
+  fi
+  local cores
+  cores=$(nproc)
+  cat > /opt/redoubt/brain-compose.yml <<BRAIN
+name: redoubt
+services:
+  brain:
+    image: $BRAIN_IMAGE
+    container_name: redoubt-brain-1
+    restart: always
+    command:
+      - -m
+      - /models/$BRAIN_MODEL_FILE
+      - --host
+      - 0.0.0.0
+      - --port
+      - "$BRAIN_PORT"
+      - -c
+      - "${BRAIN_CTX:-65536}"
+      - -ctk
+      - q4_0
+      # One slot only: every request reuses the cached system prompt.
+      # With the default slot pool each new request lands in a cold slot
+      # and pays the full 13k-token prompt again on CPU, which reads as
+      # minutes of silence and kills the panel's stream. A single slot
+      # pays that cost once (the warm-up below) and answers in seconds.
+      - --parallel
+      - "1"
+      - -t
+      - "$cores"
+      - --chat-template-kwargs
+      - '{"enable_thinking": false}'
+    volumes:
+      - $mdir:/models:ro
+    healthcheck:
+      test: ["CMD-SHELL", "bash -c 'echo > /dev/tcp/127.0.0.1/$BRAIN_PORT'"]
+      interval: 10s
+      timeout: 5s
+      retries: 30
+      start_period: 120s
+    ports:
+      # bind on the host too: the panel and the warm-up probe reach the
+      # brain at 127.0.0.1, not through the docker network
+      - "${BRAIN_PORT}:${BRAIN_PORT}"
+    networks:
+      - default
+networks:
+  default:
+    external: true
+    name: redoubt_default
+BRAIN
+  docker compose -f /opt/redoubt/brain-compose.yml up -d
+  # The guardian gateway is a systemd service on the HOST, not inside
+  # the docker network, so the profile's base_url (http://redoubt-brain)
+  # never resolves for it. Give the host the container name: the brain
+  # publishes its port here, so the name lands on 127.0.0.1.
+  grep -qs '^127\.0\.0\.1[[:space:]]redoubt-brain$' /etc/hosts \
+    || echo '127.0.0.1 redoubt-brain' >> /etc/hosts
+  gbar "guardian: brain up (ctx ${BRAIN_CTX:-65536}, $cores cores, tier $TIER)"
+}
+
+guardian_gateway() {
+  # The install asks start-now/start-on-login questions when it sees a
+  # tty on stdin, and the answers live on a pty the customer never
+  # reads (stdout is swallowed by the kit log). A closed stdin makes
+  # the installer headless: its defaults are exactly what we want,
+  # start the service now and enable it on boot.
+  su - "$GUARDIAN_USER" -c \
+    "~/.local/bin/hermes -p cerberus gateway install --force" \
+    </dev/null >/dev/null 2>&1
+  loginctl enable-linger "$GUARDIAN_USER" 2>/dev/null || true
+  su - "$GUARDIAN_USER" -c \
+    "systemctl --user enable $GATEWAY_SVC 2>/dev/null; systemctl --user restart $GATEWAY_SVC" \
+    >/dev/null 2>&1
+  gbar "guardian: gateway service up"
+}
+
+guardian_console() {
+  # 'hermes' on the PATH opens the guardian's console (cerberus profile)
+  # for any user of the house. The binary lives under guardian; the
+  # wrapper jumps with sudo, and the sudoers file grants NOPASSWD to
+  # the people who belong on this box.
+  cat > /usr/local/bin/hermes <<'CONSOLE'
+#!/bin/sh
+exec sudo -u guardian -H /home/guardian/.local/bin/hermes -p cerberus "$@"
+CONSOLE
+  chmod 755 /usr/local/bin/hermes
+  local su_file="/etc/sudoers.d/redoubt-hermes"
+  : > "$su_file"
+  local _cu
+  # the installer (sudo), the app owner, and every real login user of
+  # the box: the console is the one hermes they may open
+  for _cu in "${SUDO_USER:-}" "$OWNER_USER" \
+             $(getent passwd | awk -F: '$3>=1000 && $3<65534 && $7 ~ /\/(ba)?sh$/ {print $1}'); do
+    [ -n "$_cu" ] && [ "$_cu" != "root" ] \
+      && getent passwd "$_cu" >/dev/null 2>&1 \
+      && printf '%s ALL=(guardian) NOPASSWD: /home/guardian/.local/bin/hermes\n' "$_cu" >> "$su_file"
+  done
+  chmod 440 "$su_file"
+  # a malformed drop-in would break sudo for the whole box: verify it,
+  # and pull it back out if the check cannot run or fails
+  if command -v visudo >/dev/null 2>&1 && visudo -c >/dev/null 2>&1; then
+    gbar "guardian: hermes console ready (type: hermes)"
+  else
+    rm -f "$su_file"
+    gbar "guardian: hermes console wrapper installed (sudoers skipped)"
+  fi
+}
+
+guardian_ufw() {
+  # the guardian is native on the host; container traffic to it crosses
+  # the docker gateway and DOES hit ufw, so open the port for the subnet
+  if command -v ufw >/dev/null 2>&1; then
+    ufw allow from 172.28.0.0/16 to any port "$GUARDIAN_PORT" proto tcp >/dev/null 2>&1 || true
+    gbar "guardian: ufw rule for the panel subnet"
+  fi
+}
+
+guardian_wire_assistant() {
+  # the panel needs a few seconds of first boot before its DB exists
+  local i
+  for i in $(seq 1 30); do
+    [ -f "$PANEL_DB_HOST" ] && break
+    sleep 5
+  done
+  [ -f "$PANEL_DB_HOST" ] || { gbar "guardian: panel DB not found - wiring skipped"; return 1; }
+
+  local key cipher back
+  key=$(grep "^API_SERVER_KEY=" "/home/$GUARDIAN_USER/.hermes/profiles/cerberus/.env" | cut -d= -f2)
+  # encrypt inside the panel container with its own SECRET_ENCRYPTION_KEY
+  # (node lives there; the host has no guarantee of a crypto lib)
+  cipher=$(docker exec redoubt-homarr-1 node -e '
+    const c = require("crypto");
+    const k = Buffer.from(process.env.SECRET_ENCRYPTION_KEY, "hex");
+    const iv = c.randomBytes(16);
+    const ci = c.createCipheriv("aes-256-cbc", k, iv);
+    const out = Buffer.concat([ci.update(process.argv[1], "utf8"), ci.final()]);
+    console.log(out.toString("hex") + "." + iv.toString("hex"));
+  ' "$key" 2>/dev/null)
+  [ -n "$cipher" ] || { gbar "guardian: could not encrypt the api key"; return 1; }
+
+  # roundtrip before the UPDATE: decrypt what we would store and compare
+  back=$(docker exec redoubt-homarr-1 node -e '
+    const c = require("crypto");
+    const k = Buffer.from(process.env.SECRET_ENCRYPTION_KEY, "hex");
+    const [data, iv] = process.argv[1].split(".");
+    const d = c.createDecipheriv("aes-256-cbc", k, Buffer.from(iv, "hex"));
+    const out = Buffer.concat([d.update(Buffer.from(data, "hex")), d.final()]);
+    console.log(out.toString("utf8"));
+  ' "$cipher" 2>/dev/null)
+  [ "$back" = "$key" ] || { gbar "guardian: encrypt roundtrip failed"; return 1; }
+
+  python3 - "$PANEL_DB_HOST" "$cipher" <<'WIRE'
+import sqlite3, sys
+db, cipher = sys.argv[1], sys.argv[2]
+c = sqlite3.connect(db)
+c.execute("""UPDATE assistant_configuration SET
+             provider='custom',
+             base_url='http://172.28.0.1:8642/v1',
+             model_discovery_path='/models',
+             model_id='Cerberus',
+             encrypted_api_key=?,
+             encrypted_headers=NULL,
+             enabled=1
+             WHERE id='default'""", (cipher,))
+c.commit()
+row = c.execute("SELECT provider, model_id, enabled FROM assistant_configuration WHERE id='default'").fetchone()
+print('guardian: assistant wired', row)
+WIRE
+  gbar "guardian: panel assistant wired to Cerberus"
+}
+
+guardian_warmup() {
+  local key i code svc
+  key=$(grep "^API_SERVER_KEY=" "/home/$GUARDIAN_USER/.hermes/profiles/cerberus/.env" | cut -d= -f2)
+  # A panel stream opened while the pass runs can leave ghost runs in
+  # both queues for minutes (each one re-pays the whole 13k prompt).
+  # Clear both sides first so the warm-up pays the prompt exactly
+  # once, in peace. The panel chat in flight is dropped: the pass is a
+  # setup event and the bar says so.
+  gbar "guardian: clearing the panel queue for the warm-up"
+  docker restart redoubt-brain-1 >/dev/null 2>&1 || true
+  svc=$(systemctl --user -M "$GUARDIAN_USER"@ list-units --type=service --no-legend 2>/dev/null \
+    | awk '/hermes-gateway/ && /running/ {print $1; exit}')
+  [ -n "$svc" ] && systemctl --user -M "$GUARDIAN_USER"@ restart "$svc" >/dev/null 2>&1 || true
+  for i in $(seq 1 60); do
+    curl -fsS -m 3 http://127.0.0.1:8686/health >/dev/null 2>&1 && break
+    sleep 5
+  done
+  for i in $(seq 1 60); do
+    curl -fsS -m 3 http://127.0.0.1:8642/health >/dev/null 2>&1 && break
+    sleep 5
+  done
+  # The gateway is idempotent per request body: a repeated "Stand by."
+  # whose earlier attempt never settled gets a 409 forever. A per-pass
+  # nonce keeps every warm-up a fresh admission.
+  code=$(curl -s -o /dev/null -w '%{http_code}' -m 900 \
+    http://127.0.0.1:8642/v1/chat/completions \
+    -H "Content-Type: application/json" \
+    -H "Authorization: Bearer $key" \
+    -d "{\"model\":\"Cerberus\",\"messages\":[{\"role\":\"user\",\"content\":\"Stand by (pass $(date +%s)).\"}],\"max_tokens\":32}")
+  if [ "$code" = "200" ]; then
+    gbar "guardian: warm-up request done (the system prompt is cached now)"
+  else
+    gbar "guardian: warm-up busy (gateway answered $code) - verify will retry"
+  fi
+}
+
+guardian_verify() {
+  local key resp i
+  key=$(grep "^API_SERVER_KEY=" "/home/$GUARDIAN_USER/.hermes/profiles/cerberus/.env" | cut -d= -f2)
+  # same busy-retry as the warm-up: the owner may be chatting with the
+  # panel while the pass runs, and a 409 is a full gateway, not a dead
+  # brain. Give the queue a chance before calling it.
+  for i in $(seq 1 10); do
+    # same idempotency note as the warm-up: a per-pass nonce.
+    resp=$(curl -s -m 900 http://127.0.0.1:8642/v1/chat/completions \
+      -H "Content-Type: application/json" \
+      -H "Authorization: Bearer $key" \
+      -d "{\"model\":\"Cerberus\",\"messages\":[{\"role\":\"user\",\"content\":\"Are the gates closed (pass $(date +%s))?\"}],\"max_tokens\":64}")
+    if printf '%s' "$resp" | grep -q '"content"'; then
+      gbar "guardian: VERIFIED - Cerberus answered (tier $TIER)"
+      return 0
+    fi
+    case "$resp" in *'"error"'*409*|*'"error"'*429*|*'"error"'*503*) sleep 15 ;; *) break ;; esac
+  done
+  gbar "guardian: verification FAILED - the guardian did not answer"
+  return 1
+}
+
+gbar() {  # a guardian step: one line for the log, the same label on the bar
+  echo "$1"
+  draw_bar 100 "$1"
+}
+
+guardian() {
+  HOLD_BAR=0
+  detect_tier
+  install_guardian_user || return 1
+  install_guardian_hermes || return 1
+  install_guardian_profile || return 1
+  guardian_key
+  guardian_brain || return 1
+  guardian_gateway
+  guardian_console
+  guardian_ufw
+  guardian_wire_assistant
+  guardian_warmup
+  guardian_verify || gbar "guardian: WARNING the end-to-end check failed"
+}
+
+guardian
+
+# Land the guardian bar cleanly before the firewall questions: stop the
+# painter and give the line its newline, so the ask below starts on its
+# own row.
+if [ -n "$ANIM_PID" ]; then
+  kill -9 "$ANIM_PID" 2>/dev/null
+  ANIM_PID=""
+fi
+CLEAN_BAR=1
+draw_line
+CLEAN_BAR=0
+echo "" >&3
+
 
 # Host firewall: the cloud's ports face the owner's wifi, and wifi has
 # neighbors. The kit never silently touches a firewall: if the machine
@@ -7133,327 +7653,27 @@ if [ -n "${ANIM_PID:-}" ]; then
   ANIM_PID=""
 fi
 
-# ============ the guardian (Cerberus): the box's own caretaker ============
-# A dedicated user runs Hermes with the Cerberus profile and the local
-# brain (llama-server + the tier model). Nothing here is root, nothing
-# phones home, and the panel's assistant talks to Cerberus over the
-# internal docker subnet. Every piece is idempotent: re-runs reuse what
-# is already in place.
-
-GUARDIAN_USER="guardian"
-GUARDIAN_PORT=8642
-BRAIN_PORT=8686
-GATEWAY_SVC="hermes-gateway-redoubt"
-HERMES_INSTALL_URL="https://hermes-agent.nousresearch.com/install.sh"
-HERMES_INSTALL_SHA="abf338605dae6dd28d101673ac6aed7995c955745db46d47676bc591a7957209"
-GUARDIAN_PROFILE_URL="${REDOUBT_GUARDIAN_PROFILE_URL:-https://install.tryredoubt.com/install/guardian-profile.tar.gz}"
-GUARDIAN_PROFILE_SHA="246fbc95b66cefb26b06e9cca7cda4780bfff921ec3d0be2844a872718c54370"
-BRAIN_IMAGE="ghcr.io/ggml-org/llama.cpp:server@sha256:c77881bba21e863bc56391995511f361040952f7ed6033cf1589da7f77a04eff"
-BRAIN_MODEL_URL="${REDOUBT_BRAIN_MODEL_URL:-https://huggingface.co/unsloth/Qwen3.5-4B-GGUF/resolve/main/Qwen3.5-4B-Q4_K_M.gguf}"
-BRAIN_MODEL_SHA="00fe7986ff5f6b463e622b97d2ad18b5e7ccb1be6cd4c8e39e1c1de84a4421e5"
-BRAIN_MODEL_FILE="qwen35-4b-q4km.gguf"
-PANEL_DB_HOST="/var/lib/docker/volumes/redoubt_homarr-data/_data/db/db.sqlite"
-
-# one place maps a tier to its parameters: the heuristics and the lab
-# override both land here, never in separate if-chains. The 9B and the
-# GPU image land in a later release; today every tier runs the verified
-# 4B, full only widens the context budget.
-set_tier_params() {
-  case "$1" in
-    full)
-      BRAIN_MODEL_FILE="qwen35-4b-q4km.gguf"; BRAIN_CTX=131072 ;;
-    standard)
-      BRAIN_MODEL_FILE="qwen35-4b-q4km.gguf"; BRAIN_CTX=131072 ;;
-    tiny)
-      BRAIN_MODEL_FILE="qwen35-4b-q4km.gguf"; BRAIN_CTX=65536 ;;
-  esac
-}
-
-# what this machine can carry. full = discrete GPU with 6GB+ VRAM,
-# standard = 10GB+ RAM and no GPU, tiny = the honest floor (AVX2
-# required). REDOUBT_TIER forces a tier for lab runs.
-detect_tier() {
-  local ram_gb vram gpu_line avx2
-
-  if [ -n "${REDOUBT_TIER:-}" ]; then
-    TIER="$REDOUBT_TIER"
-    set_tier_params "$TIER"
-    TIER_NOTE="forced by REDOUBT_TIER (lab only)"
-    return
+  # Hold the painter before the final draw so the done line lands exactly
+  # once (a relaunched animator would race the draw_line below and print
+  # the finished line twice). Everything already ran: the guardian pulled
+  # its last downloads with its own bar labels, and the firewall asked
+  # its questions, so this line is the last word before the reveal.
+  HOLD_BAR=1
+  draw_bar 100 "✓ your cloud, done"
+  # Stop the painter and land the newline, so the finished line stays put.
+  if [ -n "$ANIM_PID" ]; then
+    kill -9 "$ANIM_PID" 2>/dev/null
+    ANIM_PID=""
   fi
+  # One last paint (the animator may have died mid-frame), then the
+  # newline. CLEAN_BAR drops the dot: the done line is the last word.
+  CLEAN_BAR=1
+  draw_line
+  echo "" >&3
+  rm -f "$BAR_STATE" 2>/dev/null || true
 
-  ram_gb=$(awk '/MemTotal/ {printf "%d", $2/1048576}' /proc/meminfo)
-
-  gpu_line=""
-  vram=""
-  if command -v lspci >/dev/null 2>&1; then
-    gpu_line=$(lspci -nn 2>/dev/null | grep -iE "vga compatible|3d controller|display controller" | grep -viE "virtio|qxl|vmware|bochs|cirrus|red hat" | head -1)
-  fi
-  if [ -n "$gpu_line" ]; then
-    if command -v nvidia-smi >/dev/null 2>&1; then
-      vram=$(nvidia-smi --query-gpu=memory.total --format=csv,noheader,nounits 2>/dev/null | head -1 | tr -d " ")
-    elif command -v rocm-smi >/dev/null 2>&1; then
-      vram=$(rocm-smi --showmeminfo vram 2>/dev/null | grep -oE "[0-9]+" | head -1)
-    fi
-  fi
-
-  avx2=0
-  grep -q avx2 /proc/cpuinfo 2>/dev/null && avx2=1
-
-  if [ -n "$vram" ] && [ "$vram" -ge 6144 ]; then
-    TIER="full"
-    TIER_NOTE="gpu with $vram MiB vram"
-  elif [ "$ram_gb" -lt 10 ]; then
-    TIER="tiny"
-    TIER_NOTE="low ram, 64K context"
-  else
-    TIER="standard"
-    TIER_NOTE=""
-  fi
-
-  if [ "$avx2" -ne 1 ]; then
-    TIER="tiny"
-    TIER_NOTE="${TIER_NOTE:+$TIER_NOTE, }no avx2, reduced"
-  fi
-
-  set_tier_params "$TIER"
-}
-
-install_guardian_user() {
-  if ! id "$GUARDIAN_USER" >/dev/null 2>&1; then
-    useradd -r -m -s /bin/bash "$GUARDIAN_USER"
-    echo "guardian: user $GUARDIAN_USER created"
-  fi
-  usermod -aG docker "$GUARDIAN_USER" 2>/dev/null || true
-}
-
-install_guardian_hermes() {
-  local inst="/home/$GUARDIAN_USER/hermes-install.sh"
-  echo "guardian: downloading hermes (this takes a minute) ..."
-  # -# keeps the transfer visible: a silent multi-minute fetch on a slow
-  # link looks frozen, and owners kill frozen things
-  su - "$GUARDIAN_USER" -c "curl -fL --progress-bar '$HERMES_INSTALL_URL' -o '$inst'"
-  local got
-  got=$(sha256sum "$inst" | cut -d' ' -f1)
-  if [ "$got" != "$HERMES_INSTALL_SHA" ]; then
-    rm -f "$inst"
-    echo "guardian: hermes installer sha mismatch ($got) - refusing to run it"
-    return 1
-  fi
-  # the installer runs as the guardian user: the whole hermes tree lands
-  # under /home/guardian/.local, nowhere near root
-  su - "$GUARDIAN_USER" -c "bash '$inst' && rm -f '$inst'"
-  local ver
-  ver=$(su - "$GUARDIAN_USER" -c "~/.local/bin/hermes --version" 2>/dev/null \
-        | grep -oE "[0-9]+\.[0-9]+\.[0-9]+" | head -1)
-  [ -n "$ver" ] && echo "guardian: hermes $ver installed" \
-                || echo "guardian: WARNING could not read hermes version"
-}
-
-install_guardian_profile() {
-  local pf="/home/$GUARDIAN_USER/guardian-profile.tar.gz"
-  su - "$GUARDIAN_USER" -c "curl -fsSL '$GUARDIAN_PROFILE_URL' -o '$pf'"
-  local got
-  got=$(sha256sum "$pf" | cut -d' ' -f1)
-  if [ "$got" != "$GUARDIAN_PROFILE_SHA" ]; then
-    rm -f "$pf"
-    echo "guardian: profile sha mismatch ($got) - refusing to import it"
-    return 1
-  fi
-  su - "$GUARDIAN_USER" -c "~/.local/bin/hermes profile import '$pf'"
-  rm -f "$pf"
-  echo "guardian: Cerberus profile imported"
-}
-
-guardian_key() {
-  local env="/home/$GUARDIAN_USER/.hermes/profiles/redoubt/.env"
-  mkdir -p "$(dirname "$env")"
-  if ! grep -q "^API_SERVER_KEY=" "$env" 2>/dev/null; then
-    local key
-    key=$(openssl rand -hex 32)
-    printf 'API_SERVER_KEY=%s\nAPI_SERVER_MODEL_NAME=Cerberus\n' "$key" >> "$env"
-    chown "$GUARDIAN_USER:$GUARDIAN_USER" "$env"
-    chmod 600 "$env"
-    echo "guardian: api key generated"
-  fi
-}
-
-guardian_brain() {
-  local mdir="/var/lib/redoubt/brain/models"
-  local mf="$mdir/$BRAIN_MODEL_FILE"
-  mkdir -p "$mdir"
-  if [ ! -f "$mf" ]; then
-    echo "guardian: downloading the brain model ($BRAIN_MODEL_FILE) ..."
-    curl -fL --retry 3 -o "$mf" "$BRAIN_MODEL_URL" || return 1
-    local got
-    got=$(sha256sum "$mf" | cut -d' ' -f1)
-    if [ "$got" != "$BRAIN_MODEL_SHA" ]; then
-      rm -f "$mf"
-      echo "guardian: model sha mismatch ($got) - refusing to run it"
-      return 1
-    fi
-  fi
-  local cores
-  cores=$(nproc)
-  cat > /opt/redoubt/brain-compose.yml <<BRAIN
-name: redoubt
-services:
-  brain:
-    image: $BRAIN_IMAGE
-    container_name: redoubt-brain-1
-    restart: always
-    command:
-      - -m
-      - /models/$BRAIN_MODEL_FILE
-      - --host
-      - 0.0.0.0
-      - --port
-      - "$BRAIN_PORT"
-      - -c
-      - "${BRAIN_CTX:-65536}"
-      - -ctk
-      - q4_0
-      - -t
-      - "$cores"
-      - --chat-template-kwargs
-      - '{"enable_thinking": false}'
-    volumes:
-      - $mdir:/models:ro
-    healthcheck:
-      test: ["CMD-SHELL", "bash -c 'echo > /dev/tcp/127.0.0.1/$BRAIN_PORT'"]
-      interval: 10s
-      timeout: 5s
-      retries: 30
-      start_period: 120s
-    networks:
-      - default
-networks:
-  default:
-    external: true
-    name: redoubt_default
-BRAIN
-  docker compose -f /opt/redoubt/brain-compose.yml up -d
-  echo "guardian: brain up (ctx ${BRAIN_CTX:-65536}, $cores cores, tier $TIER)"
-}
-
-guardian_gateway() {
-  su - "$GUARDIAN_USER" -c \
-    "~/.local/bin/hermes -p redoubt gateway install --force" >/dev/null 2>&1
-  loginctl enable-linger "$GUARDIAN_USER" 2>/dev/null || true
-  su - "$GUARDIAN_USER" -c \
-    "systemctl --user enable $GATEWAY_SVC 2>/dev/null; systemctl --user restart $GATEWAY_SVC" \
-    >/dev/null 2>&1
-  echo "guardian: gateway service up"
-}
-
-guardian_ufw() {
-  # the guardian is native on the host; container traffic to it crosses
-  # the docker gateway and DOES hit ufw, so open the port for the subnet
-  if command -v ufw >/dev/null 2>&1; then
-    ufw allow from 172.28.0.0/16 to any port "$GUARDIAN_PORT" proto tcp >/dev/null 2>&1 || true
-    echo "guardian: ufw rule for the panel subnet"
-  fi
-}
-
-guardian_wire_assistant() {
-  # the panel needs a few seconds of first boot before its DB exists
-  local i
-  for i in $(seq 1 30); do
-    [ -f "$PANEL_DB_HOST" ] && break
-    sleep 5
-  done
-  [ -f "$PANEL_DB_HOST" ] || { echo "guardian: panel DB not found - wiring skipped"; return 1; }
-
-  local key cipher back
-  key=$(grep "^API_SERVER_KEY=" "/home/$GUARDIAN_USER/.hermes/profiles/redoubt/.env" | cut -d= -f2)
-  # encrypt inside the panel container with its own SECRET_ENCRYPTION_KEY
-  # (node lives there; the host has no guarantee of a crypto lib)
-  cipher=$(docker exec redoubt-homarr-1 node -e '
-    const c = require("crypto");
-    const k = Buffer.from(process.env.SECRET_ENCRYPTION_KEY, "hex");
-    const iv = c.randomBytes(16);
-    const ci = c.createCipheriv("aes-256-cbc", k, iv);
-    const out = Buffer.concat([ci.update(process.argv[1], "utf8"), ci.final()]);
-    console.log(out.toString("hex") + "." + iv.toString("hex"));
-  ' "$key" 2>/dev/null)
-  [ -n "$cipher" ] || { echo "guardian: could not encrypt the api key"; return 1; }
-
-  # roundtrip before the UPDATE: decrypt what we would store and compare
-  back=$(docker exec redoubt-homarr-1 node -e '
-    const c = require("crypto");
-    const k = Buffer.from(process.env.SECRET_ENCRYPTION_KEY, "hex");
-    const [data, iv] = process.argv[1].split(".");
-    const d = c.createDecipheriv("aes-256-cbc", k, Buffer.from(iv, "hex"));
-    const out = Buffer.concat([d.update(Buffer.from(data, "hex")), d.final()]);
-    console.log(out.toString("utf8"));
-  ' "$cipher" 2>/dev/null)
-  [ "$back" = "$key" ] || { echo "guardian: encrypt roundtrip failed"; return 1; }
-
-  python3 - "$PANEL_DB_HOST" "$cipher" <<'WIRE'
-import sqlite3, sys
-db, cipher = sys.argv[1], sys.argv[2]
-c = sqlite3.connect(db)
-c.execute("""UPDATE assistant_configuration SET
-             provider='custom',
-             base_url='http://172.28.0.1:8642/v1',
-             model_discovery_path='/models',
-             model_id='Cerberus',
-             encrypted_api_key=?,
-             encrypted_headers=NULL,
-             enabled=1
-             WHERE id='default'""", (cipher,))
-c.commit()
-row = c.execute("SELECT provider, model_id, enabled FROM assistant_configuration WHERE id='default'").fetchone()
-print('guardian: assistant wired', row)
-WIRE
-}
-
-guardian_warmup() {
-  local key i
-  key=$(grep "^API_SERVER_KEY=" "/home/$GUARDIAN_USER/.hermes/profiles/redoubt/.env" | cut -d= -f2)
-  for i in $(seq 1 60); do
-    curl -fsS -m 3 http://127.0.0.1:8642/health >/dev/null 2>&1 && break
-    sleep 5
-  done
-  curl -s -m 900 http://127.0.0.1:8642/v1/chat/completions \
-    -H "Content-Type: application/json" \
-    -H "Authorization: Bearer $key" \
-    -d '{"model":"Cerberus","messages":[{"role":"user","content":"Stand by."}],"max_tokens":32}' \
-    >/dev/null 2>&1
-  echo "guardian: warm-up request done (the system prompt is cached now)"
-}
-
-guardian_verify() {
-  local key resp
-  key=$(grep "^API_SERVER_KEY=" "/home/$GUARDIAN_USER/.hermes/profiles/redoubt/.env" | cut -d= -f2)
-  resp=$(curl -s -m 900 http://127.0.0.1:8642/v1/chat/completions \
-    -H "Content-Type: application/json" \
-    -H "Authorization: Bearer $key" \
-    -d '{"model":"Cerberus","messages":[{"role":"user","content":"Are the gates closed?"}],"max_tokens":64}')
-  if printf '%s' "$resp" | grep -q '"content"'; then
-    echo "guardian: VERIFIED - Cerberus answered (tier $TIER)"
-    return 0
-  fi
-  echo "guardian: verification FAILED - the guardian did not answer"
-  return 1
-}
-
-guardian() {
-  detect_tier
-  install_guardian_user || return 1
-  install_guardian_hermes || return 1
-  install_guardian_profile || return 1
-  guardian_key
-  guardian_brain || return 1
-  guardian_gateway
-  guardian_ufw
-  guardian_wire_assistant
-  guardian_warmup
-  guardian_verify || echo "guardian: WARNING the end-to-end check failed"
-}
-
-guardian
-
+  # hand the console back to the system's usual loglevel
+  [ -n "$QUIET_PK" ] && sysctl -w kernel.printk="$QUIET_PK" >/dev/null 2>&1
 
 # ============ the reveal: one clean screen, not a wall ==================
 {
