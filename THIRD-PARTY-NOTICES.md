@@ -69,8 +69,11 @@ can read exactly what the kit installs.
 ## Icons
 
 The icons folder ships the panel's app icons. Their sources and
-licenses (Apache-2.0 and CC-BY-4.0, per project) are listed in
-icons/ATTRIBUTION.md, next to the files themselves.
+licenses (Apache-2.0, CC-BY-4.0 and GPL-3.0, per project) are
+listed in icons/ATTRIBUTION.md, next to the files themselves.
+The Papirus set (PapirusDevelopmentTeam/papirus_icons, GPL-3.0)
+rides as a channel tarball and is served to the panel tiles by
+the local edge under the same upstream path.
 
 ## License texts
 
