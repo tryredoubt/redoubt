@@ -19,64 +19,67 @@ can read exactly what the kit installs.
   https://github.com/immich-app/immich
 - SearXNG: GNU AGPL-3.0
   https://github.com/searxng/searxng
-- Homarr: Apache-2.0
+- Homarr (dashboard panel): Apache-2.0
   https://github.com/homarr-labs/homarr
-
-## Network and DNS
-
-- Pi-hole: EUPL-1.2
-  https://github.com/pi-hole/pi-hole
-- Unbound: BSD-3-Clause
-  https://github.com/NLnetLabs/unbound
-- Caddy: Apache-2.0
-  https://github.com/caddyserver/caddy
-- nginx (self-hosted mesh router): BSD-2-Clause
-  https://nginx.org
-
-## Containers and ops
-
-- Docker Engine: Apache-2.0
-  https://github.com/moby/moby
-- Dockge: MIT
+- Dockge (container dashboard): MIT
   https://github.com/louislam/dockge
-- Glances: LGPL-3.0
+- Pi-hole (ad and tracker blocking): EUPL-1.2
+  https://github.com/pi-hole/pi-hole
+- Hagezi DNS blocklists (the ad shield's lists): GPL-3.0
+  https://github.com/hagezi/dns-blocklists
+- Unbound (DNS resolver): BSD-3-Clause upstream, MIT container image
+  https://github.com/NLnetLabs/unbound
+  https://github.com/klutchell/unbound
+- Caddy (web server and certificates): Apache-2.0
+  https://github.com/caddyserver/caddy
+- Glances (system monitor): LGPL-3.0
   https://github.com/nicolargo/glances
-- PostgreSQL: PostgreSQL License
-  https://www.postgresql.org/about/licence/
-- Redis: RSALv2 or SSPLv1 (AGPL-3.0 is a third option from Redis 8)
-  https://redis.io/legal/licenses/
-- BusyBox: GPL-2.0
-  https://busybox.net
+- Redis (cache and queues): BSD-3-Clause
+  https://github.com/redis/redis
+- PostgreSQL (database): PostgreSQL License
+  https://github.com/postgres/postgres
 
-## Vault and crypto
+## Encrypted vault
 
-- gocryptfs: MIT
-  https://github.com/rfjakob/gocryptfs
-- fscrypt: Apache-2.0
+- fscrypt (the ext4/f2fs kernel motor): Apache-2.0
   https://github.com/google/fscrypt
-- OpenSSL: Apache-2.0
-  https://github.com/openssl/openssl
+- gocryptfs (the btrfs/xfs fuse motor): MIT
+  https://github.com/rfjakob/gocryptfs
 
-## Terminal and QR
+## Brain
 
-- gum: MIT
-  https://github.com/charmbracelet/gum
-- libqrencode: LGPL-2.1
-  https://github.com/fukuchi/libqrencode
-
-## Local brain (the panel assistant)
-
-- llama.cpp: MIT
+- llama.cpp (the local model engine): MIT
   https://github.com/ggml-org/llama.cpp
-- Qwen model: Apache-2.0
+- Qwen (the model weights): Apache-2.0
   https://github.com/QwenLM/Qwen3
-- Hermes Agent (the assistant host): MIT
+
+## System
+
+- Docker Engine (container runtime): Apache-2.0
+  https://github.com/moby/moby
+- NVIDIA Container Toolkit (gpu offload, when a card is present): Apache-2.0
+  https://github.com/NVIDIA/nvidia-container-toolkit
+- Trivy (the security scanner that audits the stack): Apache-2.0
+  https://github.com/aquasecurity/trivy
+- Hermes Agent (the on-box agent): MIT
   https://github.com/NousResearch/hermes-agent
+- gum (terminal interface): MIT
+  https://github.com/charmbracelet/gum
 
-## Bundled assets
+## Icons
 
-- App icons: Homarr (Apache-2.0) and selfh.st (CC-BY-4.0).
-  Attribution lives in assets/icons/ATTRIBUTION.md.
+The icons folder ships the panel's app icons. Their sources and
+licenses (Apache-2.0 and CC-BY-4.0, per project) are listed in
+icons/ATTRIBUTION.md, next to the files themselves.
 
-The kit downloads the official images and binaries from Docker Hub,
-GitHub, and each project's package repository. Nothing is modified.
+## License texts
+
+The full texts of the GNU AGPLv3, GPL-3.0, Apache-2.0, MIT and
+BSD-3-Clause licenses are published by their authors at the links
+above and by the license stewards at:
+
+  https://www.gnu.org/licenses/agpl-3.0.html
+  https://www.gnu.org/licenses/gpl-3.0.html
+  https://www.apache.org/licenses/LICENSE-2.0
+  https://opensource.org/license/mit
+  https://opensource.org/license/bsd-3-clause
