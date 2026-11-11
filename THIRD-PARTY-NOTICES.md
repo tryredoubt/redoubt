@@ -27,6 +27,8 @@ can read exactly what the kit installs.
   https://github.com/pi-hole/pi-hole
 - Hagezi DNS blocklists (the ad shield's lists): GPL-3.0
   https://github.com/hagezi/dns-blocklists
+- StevenBlack hosts (the ad shield's base hosts list): MIT
+  https://github.com/StevenBlack/hosts
 - Unbound (DNS resolver): BSD-3-Clause upstream, MIT container image
   https://github.com/NLnetLabs/unbound
   https://github.com/klutchell/unbound
@@ -52,6 +54,7 @@ can read exactly what the kit installs.
   https://github.com/ggml-org/llama.cpp
 - Qwen (the model weights): Apache-2.0
   https://github.com/QwenLM/Qwen3
+  (the brain ships the Q4_K_M GGUF build from unsloth/Qwen3.5-4B-GGUF)
 
 ## System
 
@@ -74,6 +77,14 @@ listed in icons/ATTRIBUTION.md, next to the files themselves.
 The Papirus set (PapirusDevelopmentTeam/papirus_icons, GPL-3.0)
 rides as a channel tarball and is served to the panel tiles by
 the local edge under the same upstream path.
+
+## Referenced, not shipped
+
+These projects are linked from the kit's messages and guides but
+their code is never downloaded or served:
+
+- DoesItAgeVerify (linked in the age-gate message): BSD-2-Clause
+  https://github.com/BryanLunduke/DoesItAgeVerify
 
 ## License texts
 
