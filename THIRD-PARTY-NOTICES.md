@@ -29,9 +29,17 @@ can read exactly what the kit installs.
   https://github.com/hagezi/dns-blocklists
 - StevenBlack hosts (the ad shield's base hosts list): MIT
   https://github.com/StevenBlack/hosts
+- 1Hosts Xtra (the ad shield's secondary list): MPL-2.0
+  https://github.com/badmojr/1Hosts
+- oisd big (the ad shield's third list): GPL-3.0
+  https://github.com/sjhgvr/oisd
 - Unbound (DNS resolver): BSD-3-Clause upstream, MIT container image
   https://github.com/NLnetLabs/unbound
   https://github.com/klutchell/unbound
+- nginx (the selfhost mesh reverse proxy): BSD-2-Clause
+  https://nginx.org/
+- BusyBox (the selfhost wait helper): GPL-2.0
+  https://busybox.net/
 - Caddy (web server and certificates): Apache-2.0
   https://github.com/caddyserver/caddy
 - Glances (system monitor): LGPL-3.0
