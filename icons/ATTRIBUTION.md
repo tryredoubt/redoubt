@@ -8,6 +8,8 @@ so anyone can verify them against their sources without running the kit.
 
 - gh/homarr-labs/dashboard-icons/: from https://github.com/homarr-labs/dashboard-icons (Apache-2.0). The paths mirror the upstream repo, so each file can be diffed directly against its source.
 - gh/selfhst/icons/: from https://github.com/selfhst/icons (CC-BY-4.0). The paths mirror the upstream repo.
+- simpleicons/: 3,466 svg marks from https://github.com/simple-icons/simple-icons
+  (CC0-1.0), served by the local edge under /cdn/simpleicons/.
 - gh/PapirusDevelopmentTeam/papirus_icons/: from
   https://github.com/PapirusDevelopmentTeam/papirus_icons (GPL-3.0). The kit
   fetches this set as a release-channel tarball (icons-papirus.tar.gz) and the
