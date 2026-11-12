@@ -45,3 +45,10 @@ Debian/Ubuntu, Arch, Fedora and openSUSE families.
 ## Built by Naruto 🍥
 
 One command, and the data comes home.
+
+## License
+
+AGPL-3.0. Free software: use it, study it, share it, improve it. See
+[LICENSE](LICENSE). Copyright (C) 2026 Devitechy LLC. The Redoubt name
+and logo are reserved by Devitechy LLC. Third-party components and
+their licenses: [THIRD-PARTY-NOTICES.md](THIRD-PARTY-NOTICES.md).

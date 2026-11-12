@@ -96,12 +96,23 @@ their code is never downloaded or served:
 
 ## License texts
 
-The full texts of the GNU AGPLv3, GPL-3.0, Apache-2.0, MIT and
-BSD-3-Clause licenses are published by their authors at the links
-above and by the license stewards at:
+The full texts of the licenses used by these components are published
+by their authors at the links above and by the license stewards at:
 
   https://www.gnu.org/licenses/agpl-3.0.html
   https://www.gnu.org/licenses/gpl-3.0.html
+  https://www.gnu.org/licenses/gpl-2.0.html
+  https://www.gnu.org/licenses/lgpl-3.0.html
   https://www.apache.org/licenses/LICENSE-2.0
   https://opensource.org/license/mit
   https://opensource.org/license/bsd-3-clause
+  https://opensource.org/license/bsd-2-clause
+  https://joinup.ec.europa.eu/collection/eupl/eupl-text-eupl-12
+  https://www.mozilla.org/en-US/MPL/2.0/
+  https://creativecommons.org/licenses/by/4.0/
+  https://creativecommons.org/publicdomain/zero/1.0/
+  https://www.postgresql.org/about/licence/
+
+NetBird, Docker, Caddy, Nextcloud, Immich, SearXNG, Pi-hole and other
+product names are trademarks of their respective owners. Use here does
+not imply endorsement by, or affiliation with, those projects.
