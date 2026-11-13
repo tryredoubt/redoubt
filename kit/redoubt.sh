@@ -1,5 +1,19 @@
 #!/bin/bash
 # Redoubt kit v2.0: one command for your own private cloud, zero subscriptions.
+# Copyright (C) 2026 Devitechy LLC
+#
+# This program is free software: you can redistribute it and/or modify
+# it under the terms of the GNU Affero General Public License as
+# published by the Free Software Foundation, version 3 of the License.
+#
+# This program is distributed in the hope that it will be useful, but
+# WITHOUT ANY WARRANTY; without even the implied warranty of
+# MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE. See the GNU
+# Affero General Public License for more details.
+#
+# You should have received a copy of the GNU Affero General Public
+# License along with this program. If not, see
+# <https://www.gnu.org/licenses/>.
 #
 # This installs Docker, then the whole stack: photos (immich), files
 # (nextcloud), search (searxng), an https edge signed by your own local
@@ -58,6 +72,13 @@ if ! kill -0 "$CENT_PID" 2>/dev/null; then
           ;;
       esac
     fi
+    # a SIGKILL'd pass leaves its sentinel holding the flock with no
+    # owner to kill it: reclaim the lock by killing line 2 as well
+    OLD_SENT="$(sed -n 2p "$LOCK" 2>/dev/null)"
+    if [ -n "$OLD_SENT" ] && [ "$OLD_SENT" != "$$" ] \
+       && kill -0 "$OLD_SENT" 2>/dev/null; then
+      kill "$OLD_SENT" 2>/dev/null || true
+    fi
     ( exec 9>>"$LOCK"; flock -n 9 2>/dev/null || exit 1; exec sleep infinity ) &
     CENT_PID=$!
     sleep 1
@@ -77,21 +98,90 @@ if ! kill -0 "$CENT_PID" 2>/dev/null; then
 else
   printf '%s\n%s\n' "$$" "$CENT_PID" > "$LOCK"
 fi
-trap 'kill "$CENT_PID" 2>/dev/null; [ -n "${ANIM_PID:-}" ] && kill "$ANIM_PID" 2>/dev/null; rm -f "/tmp/redoubt-compose-out.$$"' EXIT
-trap 'kill "$CENT_PID" 2>/dev/null; [ -n "${ANIM_PID:-}" ] && kill "$ANIM_PID" 2>/dev/null; rm -f "/tmp/redoubt-compose-out.$$"; exit 130' INT TERM HUP
+trap 'kill "$CENT_PID" 2>/dev/null; [ -n "${ANIM_PID:-}" ] && kill "$ANIM_PID" 2>/dev/null; [ -n "${WARM_BEAT_PID:-}" ] && kill "${WARM_BEAT_PID}" 2>/dev/null; [ -n "${BAR_STATE:-}" ] && rm -f "${BAR_STATE}" "${BAR_STATE}.new" 2>/dev/null; rm -f "/tmp/redoubt-compose-out.$$"; [ -n "${_ENV_TMP:-}" ] && { shred -u "${_ENV_TMP}" 2>/dev/null || rm -f "${_ENV_TMP}"; }' EXIT
+trap 'kill "$CENT_PID" 2>/dev/null; [ -n "${ANIM_PID:-}" ] && kill "$ANIM_PID" 2>/dev/null; [ -n "${WARM_BEAT_PID:-}" ] && kill "${WARM_BEAT_PID}" 2>/dev/null; [ -n "${BAR_STATE:-}" ] && rm -f "${BAR_STATE}" "${BAR_STATE}.new" 2>/dev/null; rm -f "/tmp/redoubt-compose-out.$$"; [ -n "${_ENV_TMP:-}" ] && { shred -u "${_ENV_TMP}" 2>/dev/null || rm -f "${_ENV_TMP}"; }; exit 130' INT TERM HUP
 
 LOG=/var/log/redoubt-kit.log
 
 cursor_hide() { printf '\033[?25l' >&3 2>/dev/null || true; }  # no blinking block while the pass runs
 cursor_show() { printf '\033[?25h' >&3 2>/dev/null || true; }
 
+anim_stop() {  # the one way to take the painter down
+  # kill -9 alone leaves a zombie until bash reaps it, and a zombie still
+  # answers kill -0: draw_bar would then think the painter is alive and
+  # never relaunch it (the bar vanishes). wait reaps it here, so no late
+  # frame can land after the clear below, and ANIM_PID never goes stale.
+  local _AP=${ANIM_PID:-}
+  ANIM_PID=""
+  if [ -n "$_AP" ]; then
+    kill -9 "$_AP" 2>/dev/null || true
+    wait "$_AP" 2>/dev/null || true
+  fi
+  [ -t 3 ] && printf '\r\033[K' >&3 2>/dev/null
+  return 0
+}
+
+pl_glyphs() {  # sets the gutter glyphs: unicode on a desktop, ascii on the VGA console
+  if [ "${TERM:-dumb}" = "linux" ]; then
+    PL_OK=+ PL_NOTE=- PL_WARN='!' PL_FAIL=x PL_DET='>'
+  else
+    PL_OK=✓ PL_NOTE=· PL_WARN='!' PL_FAIL=✗ PL_DET=›
+  fi
+}
+pl_row() {  # one settled row. $1 glyph color, $2 glyph, $3 text color, $4 text, $5 seconds taken
+  # text always starts at column 4. A step that took 2s or more gets a dim
+  # duration right-aligned near column 76; the stamp is dropped when the
+  # row would not fit. No forks: durations come from SECONDS deltas.
+  local _gc=$1 _g=$2 _tc=$3 _t=$4 _s=${5:-0} _d="" _pad=""
+  case "$_s" in ''|*[!0-9]*) _s=0 ;; esac
+  if [ "$_s" -ge 2 ]; then
+    if [ "$_s" -lt 60 ]; then
+      printf -v _d '%ds' "$_s"
+    else
+      printf -v _d '%dm%02ds' "$(( _s / 60 ))" "$(( _s % 60 ))"
+    fi
+    _pad=$(( 76 - 4 - ${#_t} - ${#_d} ))
+    if [ "$_pad" -ge 1 ]; then
+      printf -v _pad '%*s' "$_pad" ''
+    else
+      _d=""
+      _pad=""
+    fi
+  fi
+  {
+    printf '  %s%s%s %s%s%s' "$_gc" "$_g" "${RESET:-}" "$_tc" "$_t" "${_tc:+${RESET:-}}"
+    [ -n "$_d" ] && printf '%s%s%s%s' "$_pad" "${EMD:-}" "$_d" "${RESET:-}"
+    printf '\n'
+  } >&3
+}
+fail_line() {  # $1 = text. A failure: stops the painter, red row on a tty, plain FAIL: text otherwise
+  anim_stop
+  pl_glyphs
+  if [ -t 3 ]; then
+    printf '  %s%s %s%s\n' "${ERR:-}" "$PL_FAIL" "$1" "${RESET:-}" >&3
+  else
+    printf 'FAIL: %s\n' "$1" >&3
+  fi
+}
 log() {  # visible status line: clears the bar first, then tty + log.
   # The bar dies here on purpose: its 30fps redraw would repaint over
   # the line this milestone just wrote. draw_bar relaunches it below.
-  [ -n "${ANIM_PID:-}" ] && kill -9 "$ANIM_PID" 2>/dev/null || true
-  ANIM_PID=""
-  printf '\r\033[K' >&3
-  printf '%s\n' "$1" >&3
+  anim_stop
+  local _d
+  pl_glyphs
+  _d=$(( SECONDS - ${PL_MARK:-$SECONDS} ))
+  PL_MARK=$SECONDS
+  if [ -t 3 ]; then
+    case "$1" in
+      "OK: "*)   pl_row "${EM1:-}" "$PL_OK" "" "${1#OK: }" "$_d" ;;
+      "NOTE: "*) pl_row "${EMD:-}" "$PL_NOTE" "" "${1#NOTE: }" 0 ;;
+      "WARN: "*) pl_row "${AMB:-}" "$PL_WARN" "${AMB:-}" "${1#WARN: }" 0 ;;
+      "FAIL: "*) pl_row "${ERR:-}" "$PL_FAIL" "${ERR:-}" "${1#FAIL: }" 0 ;;
+      *)         printf '%s\n' "$1" >&3 ;;
+    esac
+  else
+    printf '%s\n' "$1" >&3
+  fi
   printf '%s\n' "$1" >> "$LOG"
 }
 dbg() {  # technical detail: log only, never on the terminal
@@ -155,7 +245,7 @@ tui_setup() {
   # symbols): the headless path keeps the native bar and palette while
   # the noise still routes to the log, so the screen stays clean. The
   # the gum TUI belongs to modern terminals only.
-  if [ "$TERM" = "linux" ]; then
+  if [ "${TERM:-dumb}" = "linux" ]; then
     TUI=1
     return 0
   fi
@@ -182,11 +272,12 @@ tui_setup
 
 # TUI or plain: noise goes to the log, milestones come through fd 3.
 exec >> "$LOG" 2>&1
-# the log carries credentials (owner pass, recovery phrase): root only
+# secrets (owner pass, recovery phrase) never reach the log: they ride
+# fd 3 to the console only, and the log stays root-only regardless
 chmod 600 "$LOG" 2>/dev/null || true
 
 echo "[redoubt-kit] $(date -u +%FT%TZ) boot"
-[ "$(id -u)" -ne 0 ] && { echo "FAIL: root required" >&3; exit 1; }
+[ "$(id -u)" -ne 0 ] && { fail_line "root required"; exit 1; }
 
 # The mesh pieces resolve their latest official release on every pass:
 # the GitHub API names it and the download urls carry the version. The
@@ -257,7 +348,7 @@ case "${ID_LIKE:-} $ID" in
   *arch*)            PKG_FAMILY=pacman ;;
   *fedora*|*rhel*)   PKG_FAMILY=dnf ;;
   *suse*)            PKG_FAMILY=zypper ;;
-  *) echo "FAIL: unsupported distro: $ID" >&3; exit 2;;
+  *) fail_line "unsupported distro: $ID"; exit 2;;
 esac
 dbg "OK: distro $ID ${VERSION_ID:-rolling} (family: $PKG_FAMILY)"
 
@@ -265,7 +356,7 @@ dbg "OK: distro $ID ${VERSION_ID:-rolling} (family: $PKG_FAMILY)"
 # (a) No WSL. The kit must not cannibalize the
 #     Windows installer; Windows customers have their own purchase path.
 if grep -qiE 'microsoft|wsl' /proc/version 2>/dev/null; then
-  echo "FAIL: this is WSL (Windows Subsystem for Linux)." >&3
+  fail_line "this is WSL (Windows Subsystem for Linux)."
   echo "The Linux kit does not install inside Windows."
   echo "For Windows, use the Redoubt installer: https://tryredoubt.com"
   exit 7
@@ -315,14 +406,15 @@ if [ -z "$AGE_HIT" ] && command -v dpkg >/dev/null 2>&1 && dpkg -l 2>/dev/null |
   AGE_HIT="age verification package installed"
 fi
 if [ -n "$AGE_HIT" ]; then
-  echo "FAIL: this machine has an age gate built into the system." >&3
+  fail_line "this machine has an age gate built into the system."
   echo "Detected: $AGE_HIT" >&3
   echo "" >&3
   echo "Redoubt is a private cloud - a machine that gates its owner is the" >&3
   echo "opposite of what we build, so the kit stops here and changes nothing." >&3
   echo "" >&3
   echo "What you can do:" >&3
-  echo "  - Install a distribution without an age gate:" >&3
+  echo "  - Install a distribution without an age gate: the tracker below" >&3
+  echo "    lists which systems refused to add one (the community keeps it):" >&3
   echo "    https://github.com/BryanLunduke/DoesItAgeVerify" >&3
   echo "  - Or use the Redoubt disk image: it ships a clean system." >&3
   echo "" >&3
@@ -335,10 +427,12 @@ fi
 #     terminals that ignore them just show the text.
 # the VGA console has no truecolor and maps the emerald gradient to an
 # off blue: hand it the native greens so the brand reads the same there
-if [ "$TERM" = "linux" ]; then
+if [ "${TERM:-dumb}" = "linux" ]; then
   EM1=$'\033[32m'; EM2=$'\033[1;32m'; EM3=$'\033[1;37m'; EM1B=$'\033[1;32m'; ERR=$'\033[1;31m'; RESET=$'\033[0m'
+  EMD=$'\033[1;30m'; AMB=$'\033[1;33m'
 else
   EM1=$'\033[38;2;52;211;153m'; EM2=$'\033[38;2;110;231;183m'; EM3=$'\033[38;2;167;243;208m'; EM1B=$'\033[1;38;2;52;211;153m'; ERR=$'\033[38;2;248;113;113m'; RESET=$'\033[0m'
+  EMD=$'\033[38;2;4;120;87m'; AMB=$'\033[38;2;251;191;36m'
 fi
 # Truncated labels must never carry a multibyte glyph onto the VGA
 # console: it paints in CP437 mode there, where the ellipsis shows as
@@ -456,7 +550,7 @@ print_rule() {
 # the bastion, emerald gradient top to bottom, over the wordmark.
 print_bastion
 printf "$EM1\n" >&3
-if [ "$TERM" = "linux" ]; then
+if [ "${TERM:-dumb}" = "linux" ]; then
   if [ "$REINSTALL" = "1" ]; then
     print_banner_vga "repatch - your cloud gets an update"
   else
@@ -507,67 +601,138 @@ ANIM_PID=""
 LAST_PCT=""
 LAST_LABEL=""
 BAR_STATE=$(mktemp /tmp/redoubt-bar.XXXXXX)
-dot_f() {  # $1 = frame index, one braille frame, cycles 0..9
-  case $(( $1 % 10 )) in
-    0) printf '⠋' ;; 1) printf '⠙' ;; 2) printf '⠹' ;; 3) printf '⠸' ;; 4) printf '⠼' ;;
-    5) printf '⠴' ;; 6) printf '⠦' ;; 7) printf '⠧' ;; 8) printf '⠇' ;; 9) printf '⠏' ;;
-  esac
+DOT_G=(⠋ ⠙ ⠹ ⠸ ⠼ ⠴ ⠦ ⠧ ⠇ ⠏)
+dot_spin() {  # braille frame on the wall clock, no fork: sets DOT_SP
+  local micros=${EPOCHREALTIME#*.}
+  DOT_SP=${DOT_G[10#${micros:0:2} / 5 % 10]}
 }
-dot_frame() {  # wall-clock frame, ~30fps
-  local micros
+# The one painter for the desktop and the VGA console. Layout of the live row:
+#   gutter-spinner  bar  pct  clock  label
+# The bar and the percent are fixed columns, only the label truncates. Measured
+# work climbs as filled cells; a bar parked at 99 or more (silent steps) blanks
+# the percent and sweeps a three cell run on the wall clock, so waiting never
+# looks like done. The VGA console gets the full block, dashes and an ascii
+# spinner. No forks per tick: printf -v, dot_spin and EPOCHREALTIME only.
+PL_T0=$SECONDS
+PL_RE1='^(.*) \(step [0-9]+/[0-9]+\)$'
+PL_RE2='^(.*) \([0-9]+:[0-9]{2}\)$'
+PL_SPA=('-' '\' '|' '/')
+pl_paint() {  # $1 = bar width. Reads BAR_PCT and BAR_LABEL, writes one frame to fd 3
+  local W=$1 nA nB nC a b hd tk sa sb sc pct clk lbl g gc lmax micros secs el
+  local FG=▰ EG=▱
+  pl_glyphs
   micros=${EPOCHREALTIME#*.}
-  # 10# forces base-10; "09" would otherwise be read as octal and blow up
-  printf '%d' $(( 10#${micros:0:2} / 5 % 10 ))
-}
-# the VGA console has no unicode glyphs and no truecolor: the bar
-# paints with raw CP437 block bytes (0xdb full, 0xb1 half) after leaving
-# UTF-8 mode, the emerald brand maps to the VGA green, and the spinner
-# is plain ascii. The desktop path never reaches this function.
-draw_line_vga() {  # $1 = bar width, $2 = fill cells, $3 = pct, $4 = label
-  local W=$1 F=$2 PCT=$3 LABEL=$4 f sp REST BODY
+  secs=${EPOCHREALTIME%.*}
+  if [ "${TERM:-dumb}" = "linux" ]; then
+    FG='█'
+    EG='-'
+  fi
   if [ "${CLEAN_BAR:-0}" = "1" ]; then
-    sp=''
+    g=$PL_OK
+    gc=$EM1B
   else
-    f=$(dot_frame)
-    case $(( f % 4 )) in 0) sp='-' ;; 1) sp='\\' ;; 2) sp='|' ;; 3) sp='/' ;; esac
+    gc=$EM1
+    if [ "${TERM:-dumb}" = "linux" ]; then
+      g=${PL_SPA[10#${micros:0:2} / 25 % 4]}
+    else
+      dot_spin
+      g=$DOT_SP
+    fi
   fi
-  # the check glyph is UTF-8 only: hand the VGA console the plain "+"
-  LABEL=${LABEL//✓/+}
-  LABEL_MAX=$(( ${COLUMNS:-80} - W - 16 ))
-  [ "$LABEL_MAX" -lt 8 ] && LABEL_MAX=8
-  if [ ${#LABEL} -gt "$LABEL_MAX" ]; then
-    LABEL="${LABEL:0:$((LABEL_MAX-1))}~"
-  fi
-  printf -v REST '%*s' "$(( W - F ))" ''
-  REST=${REST// /-}
-  if [ "$F" -gt 0 ]; then
-    # bash swaps the multibyte block itself, so no tr (tr would work
-    # byte-wise and mangle the UTF-8 under a non-utf locale)
-    printf -v BODY '%*s' "$(( F - 1 ))" ''
-    BODY=${BODY// /█}
-    printf "${EM1}  %s${EM3}█${EM1}%s %3d%%  %s %s${RESET}\033[K\r" "$BODY" "$REST" "$PCT" "$LABEL" "$sp" >&3
+  el=$(( SECONDS - PL_T0 ))
+  printf -v clk '%d:%02d' "$(( el / 60 ))" "$(( el % 60 ))"
+  printf -v clk '%5s' "$clk"
+  if [ "$BAR_PCT" -ge 99 ] && [ "${CLEAN_BAR:-0}" != "1" ]; then
+    tk=$(( (10#$secs % 1000) * 10 + 10#${micros:0:1} ))
+    hd=$(( tk % (W + 3) ))
+    a=$(( hd - 2 ))
+    [ "$a" -lt 0 ] && a=0
+    b=$hd
+    [ "$b" -gt $(( W - 1 )) ] && b=$(( W - 1 ))
+    nA=$a
+    nB=$(( b - a + 1 ))
+    [ "$nB" -lt 0 ] && nB=0
+    nC=$(( W - nA - nB ))
+    [ "$nC" -lt 0 ] && nC=0
+    pct='    '
   else
-    printf "${EM1}  %s %3d%%  %s %s${RESET}\033[K\r" "$REST" "$PCT" "$LABEL" "$sp" >&3
+    nA=0
+    nB=$(( BAR_PCT * W / 100 ))
+    nC=$(( W - nB ))
+    printf -v pct '%3d%%' "$BAR_PCT"
   fi
+  lbl=$BAR_LABEL
+  # the step counter lives on the section rule now, and the painter has its
+  # own clock, so both label suffixes are dropped here (the state file and
+  # the warm beat stay byte-identical)
+  if [[ $lbl =~ $PL_RE1 ]]; then lbl=${BASH_REMATCH[1]}; fi
+  if [[ $lbl =~ $PL_RE2 ]]; then lbl=${BASH_REMATCH[1]}; fi
+  case "$lbl" in
+    "guardian: "*) lbl="guardian $PL_DET ${lbl#guardian: }" ;;
+  esac
+  # 2 + gutter 2 + bar + 1 + pct 4 + 2 + clock 5 + 2 leaves the label this
+  # much, one column short of COLUMNS so the line never wraps
+  lmax=$(( ${COLUMNS:-80} - W - 19 ))
+  [ "$lmax" -lt 8 ] && lmax=8
+  if [ ${#lbl} -gt "$lmax" ]; then
+    lbl="${lbl:0:$((lmax-1))}$TRUNC"
+  fi
+  # width by padding, then glyphs by string substitution: tr works on
+  # bytes and would mangle the multibyte cells.
+  printf -v sa '%*s' "$nA" ''
+  sa=${sa// /$EG}
+  printf -v sb '%*s' "$nB" ''
+  sb=${sb// /$FG}
+  printf -v sc '%*s' "$nC" ''
+  sc=${sc// /$EG}
+  printf '  %s%s%s %s%s%s%s%s%s%s %s%s%s  %s%s%s  %s%s%s\033[K\r' \
+    "$gc" "$g" "$RESET" \
+    "$EMD" "$sa" "$EM1B" "$sb" "$EMD" "$sc" "$RESET" \
+    "$EM1" "$pct" "$RESET" \
+    "$EMD" "$clk" "$RESET" \
+    "$EM2" "$lbl" "$RESET" >&3
 }
-
+pl_stage() {  # section rule before each stage: N/STAGES, a thin rule, the elapsed clock
+  [ -t 3 ] || return 0
+  anim_stop
+  local _el _clk _rule _n _rc=─
+  [ "${TERM:-dumb}" = "linux" ] && _rc=-
+  _el=$(( SECONDS - ${PL_T0:-$SECONDS} ))
+  printf -v _clk '%d:%02d' "$(( _el / 60 ))" "$(( _el % 60 ))"
+  _n="${STAGE}/${STAGES}"
+  printf -v _rule '%*s' "$(( 76 - 4 - ${#_n} - ${#_clk} ))" ''
+  _rule=${_rule// /$_rc}
+  printf '\n  %s%s %s%s %s%s\n' "${EM1B:-}" "$_n" "${EMD:-}" "$_rule" "$_clk" "${RESET:-}" >&3
+}
+pl_cascade() {  # $1 = text, $2 = color (default EMD): a detail row under a milestone
+  # the leading \r and the trailing clear remove any stub of the bar line
+  {
+    pl_glyphs
+    if [ -t 3 ]; then
+      printf '\r    %s%s %s%s\033[K\n' "${2:-${EMD:-}}" "$PL_DET" "$1" "${RESET:-}"
+    else
+      printf '    %s\n' "$1"
+    fi
+  } >&3 2>/dev/null || true
+}
 draw_line() {  # Paints the current state. Only the animator loop calls this.
-  local W F FILL REST BODY f sp
+  local W sp
   # The animator runs in a forked child, so read the state the parent wrote.
   if [ -n "$BAR_STATE" ] && [ -f "$BAR_STATE" ]; then
     IFS='|' read -r BAR_PCT BAR_LABEL < "$BAR_STATE"
   fi
   case "$BAR_PCT" in ''|*[!0-9]*) BAR_PCT=0 ;; esac
-  # The bar adapts to the terminal but always reserves 58 columns for the
-  # label, step counter, % and dots, leaving 10..22 cells for the bar.
-  # A line that hits exactly COLUMNS wraps, and a wrapped line breaks the
-  # \r redraw, so the bar flickers. Hence the cap.
+  # a full bar under a live spinner reads as done but hanging: the
+  # painter holds 99 while work runs, only the clean landing shows 100
+  [ "$BAR_PCT" -gt 99 ] && [ "${CLEAN_BAR:-0}" != "1" ] && BAR_PCT=99
+  # The bar adapts to the terminal: the label budget is COLUMNS - W - 19
+  # (see pl_paint). A line that hits exactly COLUMNS wraps, and a wrapped
+  # line breaks the \r redraw, so the bar flickers. Hence the cap.
   W=$(( ${COLUMNS:-80} - 58 ))
-  [ "$W" -gt 22 ] && W=22
+  [ "$W" -gt 16 ] && W=16
   [ "$W" -lt 10 ] && W=10
-  F=$(( BAR_PCT * W / 100 ))
-  if [ "$TERM" = "linux" ]; then
-    draw_line_vga "$W" "$F" "$BAR_PCT" "$BAR_LABEL"
+  if [ "${TERM:-dumb}" = "linux" ]; then
+    pl_paint "$W"
     return
   fi
   if [ "${TUI:-0}" = "1" ]; then
@@ -578,8 +743,8 @@ draw_line() {  # Paints the current state. Only the animator loop calls this.
       if [ "${CLEAN_BAR:-0}" = "1" ]; then
         sp=""
       else
-        f=$(dot_frame)
-        sp="$(dot_f "$f")"
+        dot_spin
+        sp=$DOT_SP
       fi
       LABEL_MAX=$(( ${COLUMNS:-80} - 16 ))
       [ "$LABEL_MAX" -lt 8 ] && LABEL_MAX=8
@@ -590,43 +755,9 @@ draw_line() {  # Paints the current state. Only the animator loop calls this.
     fi
     return
   fi
-  # printf %*s sets the width, then bash swaps spaces for glyphs at the
-  # string level. tr would mangle the multibyte ▰ (it works on bytes, not
-  # characters) and leave broken UTF-8 behind.
-  printf -v FILL '%*s' "$F" ''
-  FILL=${FILL// /▰}
-  printf -v REST '%*s' "$(( W - F ))" ''
-  REST=${REST// /▱}
+  # one painter for the desktop and the VGA console: see pl_paint
   if [ -t 3 ]; then
-    # One braille dot on the wall clock: a calm signal, no extra
-    # animated noise. The animator repaints ~30 times a second, so the
-    # dot spins on its own rhythm instead of waiting for bar updates.
-    # CLEAN_BAR lands the final line without the dot: the finished
-    # guardian and done lines read cleaner that way.
-    if [ "${CLEAN_BAR:-0}" = "1" ]; then
-      sp=""
-    else
-      f=$(dot_frame)
-      sp="$(dot_f "$f")"
-    fi
-    # The label gets its own budget (2 + bar + % + separators + dots).
-    # Over budget it would wrap the line and break the \r redraw.
-    LABEL_MAX=$(( ${COLUMNS:-80} - W - 16 ))
-    [ "$LABEL_MAX" -lt 8 ] && LABEL_MAX=8
-    if [ ${#BAR_LABEL} -gt "$LABEL_MAX" ]; then
-      BAR_LABEL="${BAR_LABEL:0:$((LABEL_MAX-1))}…"
-    fi
-    # The fill is a clean emerald run with no decorative head cell
-    # (the bright block at the start did nothing and was removed on
-    # feedback). \033[K clears the rest of the line so a shorter label
-    # never leaves the tail of the previous one behind.
-    if [ "$F" -gt 0 ]; then
-      printf -v BODY '%*s' "$F" ''
-      BODY=${BODY// /▰}
-      printf "${EM1B}  %s${EM1}%s %3d%%  %s %s${RESET}\033[K\r" "$BODY" "$REST" "$BAR_PCT" "$BAR_LABEL" "$sp" >&3
-    else
-      printf "${EM1B}  %s %3d%%  %s %s${RESET}\033[K\r" "$REST" "$BAR_PCT" "$BAR_LABEL" "$sp" >&3
-    fi
+    pl_paint "$W"
   else
     # Non-tty (background runs, logs): print on state changes, not
     # 30 times a second.
@@ -637,12 +768,25 @@ draw_line() {  # Paints the current state. Only the animator loop calls this.
     fi
   fi
 }
-bar_anim() {  # Single writer: repaints the line at ~30fps forever. Dots
-  # run on the clock, the bar on the state file. Two rhythms, one line.
+bar_anim() {  # Single writer: repaints the line at ~30fps forever. The
+  # spinner glyph and the sweep run on the clock, the bar on the state
+  # file. Two rhythms, one line.
   while :; do
     draw_line
     sleep 0.033
   done
+}
+anim_start() {  # the one way to bring the painter up: tty only, never twice
+  # a second launch over a live painter orphans the first one (ANIM_PID
+  # forgets it, anim_stop can no longer reap it) and two writers fight
+  # over the same line
+  [ -t 3 ] || return 0
+  if [ -n "${ANIM_PID:-}" ] && kill -0 "$ANIM_PID" 2>/dev/null; then
+    return 0
+  fi
+  bar_anim &
+  ANIM_PID=$!
+  return 0
 }
 draw_bar() {  # $1 = pct, $2 = label. Writes the state for the animator.
   # Background & in bash forks, so the child never sees the parent's
@@ -654,7 +798,10 @@ draw_bar() {  # $1 = pct, $2 = label. Writes the state for the animator.
   # first counted (pull totals grow), and a backwards bar looks broken
   [ "$BAR_PCT" -lt "${LAST_BAR_PCT:-0}" ] && BAR_PCT=$LAST_BAR_PCT
   LAST_BAR_PCT=$BAR_PCT
-  [ -n "$BAR_STATE" ] && printf '%s|%s\n' "$BAR_PCT" "$BAR_LABEL" > "$BAR_STATE"
+  # write-then-rename: a plain > truncates first, and the animator reading
+  # in that window saw an empty file and painted 0% (the bar flashed back)
+  [ -n "$BAR_STATE" ] && { printf '%s|%s\n' "$BAR_PCT" "$BAR_LABEL" > "$BAR_STATE.new" \
+    && mv -f "$BAR_STATE.new" "$BAR_STATE"; }
   # Non-tty again: no animator on the other side, so print state changes
   # directly.
   if [ ! -t 3 ] && { [ "$BAR_PCT" != "$LAST_PCT" ] || [ "$BAR_LABEL" != "$LAST_LABEL" ]; }; then
@@ -665,16 +812,15 @@ draw_bar() {  # $1 = pct, $2 = label. Writes the state for the animator.
   # a log() line above killed the painter: relaunch it on the tty so
   # the bar keeps walking after every milestone. The repatch hold
   # keeps it down until the mesh question is answered.
-  if [ -t 3 ] && [ "${HOLD_BAR:-0}" != "1" ] \
-     && { [ -z "${ANIM_PID:-}" ] || ! kill -0 "$ANIM_PID" 2>/dev/null; }; then
-    bar_anim &
-    ANIM_PID=$!
+  if [ "${HOLD_BAR:-0}" != "1" ]; then
+    anim_start
   fi
 }
 step() {  # $1 = label. Milestones land the bar at the segment start.
   STAGE=$((STAGE+1))
   SEG_START=$(( (STAGE-1)*100/STAGES ))
   SEG_END=$(( STAGE*100/STAGES ))
+  pl_stage
   draw_bar "$SEG_START" "$1 (step $STAGE/$STAGES)"
 }
 
@@ -703,7 +849,7 @@ apt_feed() {  # $1 = seg start, $2 = seg end, $3 = label. Package stream.
               # green noise.
               DETAIL=${DETAIL#"${DETAIL%%[A-Za-z]*}"}
               [ ${#DETAIL} -gt 60 ] && DETAIL="${DETAIL:0:57}${TRUNC}"
-              printf "  ${EM2}%s\033[0m\n" "$DETAIL" >&3
+              pl_cascade "$DETAIL"
               [ "$DONE" -gt 49 ] && DONE=49
               P=$(( $1 + ( $2 - $1 ) * DONE / 50 ))
               draw_bar "$P" "$3"
@@ -717,7 +863,11 @@ apt_feed() {  # $1 = seg start, $2 = seg end, $3 = label. Package stream.
   [ -n "$QUIET" ] && draw_bar "$2" "$3"
 }
 cursor_hide
-{ echo "Building your Redoubt. This takes a few minutes."; echo ""; } >&3
+if [ -t 3 ]; then
+  printf '%sBuilding your Redoubt.%s %sThis takes a few minutes.%s\n' "$EM2" "$RESET" "$EMD" "$RESET" >&3
+else
+  { echo "Building your Redoubt. This takes a few minutes."; echo ""; } >&3
+fi
 # The line painter goes live here: one writer at ~30fps, dots on the
 # clock, bar on the state. Killed right before the final reveal.
 # On a repatch with a human at the console the mesh question comes
@@ -728,8 +878,7 @@ cursor_hide
 # painter on the first step and recreate the same flash.
 HOLD_BAR=0
 if [ -t 3 ] && [ "${REINSTALL:-0}" != "1" ]; then
-  bar_anim &
-  ANIM_PID=$!
+  anim_start
 elif [ -t 3 ]; then
   HOLD_BAR=1
 fi
@@ -768,8 +917,8 @@ fi
 DISK_GB=$(df -BG --output=avail / | tail -1 | tr -dc '0-9')
 RAM_MB=$(free -m | awk '/Mem:/{print $2}')
 dbg "free disk: ${DISK_GB}G | ram: ${RAM_MB}MB"
-[ "$DISK_GB" -lt 5 ] && { echo "FAIL: disk < 5G" >&3; exit 3; }
-[ "$RAM_MB" -lt 3500 ] && { echo "FAIL: ram < 3.5G (the full stack needs ~4G)" >&3; exit 4; }
+[ "$DISK_GB" -lt 5 ] && { fail_line "disk < 5G"; exit 3; }
+[ "$RAM_MB" -lt 3500 ] && { fail_line "ram < 3.5G (the full stack needs ~4G)"; exit 4; }
 
 # 3) Docker from the official repos. The podman shim counts as "no
 #    docker": Parrot and friends ship a docker-cli emulated by podman,
@@ -820,7 +969,7 @@ if ! command -v docker >/dev/null 2>&1 || docker info 2>&1 | grep -qi podman; th
         chmod 644 /etc/apt/sources.list.d/docker.list /etc/apt/keyrings/docker.asc
         apt-get update -y 2>&1 | apt_feed "$SEG_START" "$SEG_END" "docker engine (packages)" quiet ; apt-get install -y docker-ce docker-ce-cli containerd.io docker-compose-plugin 2>&1 | apt_feed "$SEG_START" "$SEG_END" "docker engine (packages)" quiet
       else
-        echo "FAIL: docker repo key missing - the engine stays out (no key, no repo)" >&3
+        fail_line "docker repo key missing - the engine stays out (no key, no repo)"
         exit 5
       fi
       # Removing podman-docker can take the docker group with it, and
@@ -852,7 +1001,7 @@ if ! command -v docker >/dev/null 2>&1 || docker info 2>&1 | grep -qi podman; th
       zypper --non-interactive install docker docker-compose >> "$LOG" 2>&1 || true
       ;;
     *)
-      echo "FAIL: unsupported distro '$ID' - docker needs Debian/Ubuntu, Arch, the Fedora family or openSUSE" >&3
+      fail_line "unsupported distro '$ID' - docker needs Debian/Ubuntu, Arch, the Fedora family or openSUSE"
       exit 5
       ;;
   esac
@@ -863,11 +1012,11 @@ if ! command -v docker >/dev/null 2>&1 || docker info 2>&1 | grep -qi podman; th
     usermod -aG docker "$SUDO_USER" 2>/dev/null || true
   fi
 fi
-docker version --format 'OK docker {{.Server.Version}}' >> "$LOG" 2>&1 || { echo "FAIL: docker not responding" >&3; exit 5; }
+docker version --format 'OK docker {{.Server.Version}}' >> "$LOG" 2>&1 || { fail_line "docker not responding"; exit 5; }
 # the headless console paints QRs on the framebuffer: the painter tools
 # ride the base install now, so the QR itself is instant when it shows
 # up later. GUI machines and ssh sessions never reach this branch.
-if [ "$TERM" = "linux" ]; then
+if [ "${TERM:-dumb}" = "linux" ]; then
   { command -v qrencode >/dev/null 2>&1 && command -v fbi >/dev/null 2>&1 \
     && command -v openvt >/dev/null 2>&1 && command -v chvt >/dev/null 2>&1 \
     && python3 -c 'import PIL' >/dev/null 2>&1; } \
@@ -944,11 +1093,64 @@ fi
 
 # 4a) Generated credentials. The customer creates nothing; that's the promise.
 genpass() { tr -dc 'A-Za-z0-9!@#%*_+-' < /dev/urandom | head -c 22; }
+
+kit_encrypt() {  # plaintext on stdin -> cipher file $1 (600)
+  # the passphrase derives from the machine-id: the file itself is 600
+  # root-only, so the encryption keeps honest hands out; a root-level
+  # attacker reads the file directly and no envelope would stop them
+  openssl enc -aes-256-cbc -pbkdf2 -iter 200000 -salt -pass pass:"$(cat /etc/machine-id 2>/dev/null | tr -d '\n')" -out "$1" 2>/dev/null
+  chmod 600 "$1" 2>/dev/null || true
+}
+kit_decrypt() {  # cipher file $1 -> plaintext on stdout
+  openssl enc -d -aes-256-cbc -pbkdf2 -iter 200000 -pass pass:"$(cat /etc/machine-id 2>/dev/null | tr -d '\n')" -in "$1" 2>/dev/null
+}
+kit_env_tmp() {  # decrypt the env into a 600 tmp and print its path
+  _ENV_TMP=$(mktemp /tmp/redoubt-env.XXXXXX)
+  chmod 600 "$_ENV_TMP" 2>/dev/null || true
+  if [ -f /etc/redoubt/redoubt.env ]; then
+    if head -c 8 /etc/redoubt/redoubt.env 2>/dev/null | grep -q 'Salted__'; then
+      kit_decrypt /etc/redoubt/redoubt.env > "$_ENV_TMP" 2>/dev/null || true
+    else
+      # the env predates the encryption: carry the plaintext into the
+      # tmp and let the next commit encrypt it in place
+      cp /etc/redoubt/redoubt.env "$_ENV_TMP"
+    fi
+  fi
+  printf '%s\n' "$_ENV_TMP"
+}
+kit_env_commit() {  # re-encrypt the tmp over the env; the tmp lives on
+  # for the later blocks (the firewall decision etc) and the exit
+  # trap drops it at the end of the pass
+  [ -n "${_ENV_TMP:-}" ] || return 0
+  # atomic: a truncated write must never replace the last good env
+  if kit_encrypt < "$_ENV_TMP" /etc/redoubt/redoubt.env.new \
+     && [ -s /etc/redoubt/redoubt.env.new ]; then
+    mv -f /etc/redoubt/redoubt.env.new /etc/redoubt/redoubt.env
+  else
+    rm -f /etc/redoubt/redoubt.env.new 2>/dev/null || true
+    dbg "WARNING: the env commit failed, the previous file stays"
+  fi
+  chmod 600 /etc/redoubt/redoubt.env 2>/dev/null || true
+}
+
 mkdir -p /etc/redoubt
+# the mesh agent binary: several top-level sections use it before the
+# join functions below define their own - resolve it right here (a
+# section touching $NBEXE while unset dies on set -u; the pass cut of
+# 11-nov-2026)
+NBEXE=$(command -v netbird 2>/dev/null || echo /usr/local/bin/netbird)
+_ENV_TMP="$(kit_env_tmp)"
 if [ -f /etc/redoubt/redoubt.env ]; then
   # Re-runs reuse the credentials. Never regenerate: that would break the DBs.
-  . /etc/redoubt/redoubt.env
+  . "$_ENV_TMP"
   RERUN=1
+  if [ -z "${OWNER_PASS:-}" ]; then
+    # an env that decrypts to nothing means the machine-id moved (a
+    # clone or an image restore) or the file broke: regenerating here
+    # would orphan every database password, so stop with the truth
+    fail_line "the saved credentials do not decrypt on this machine (restore the original machine-id or a backup of redoubt.env)" 2>/dev/null || true
+    exit 1
+  fi
   # one vault: dockge always follows the owner password, whatever
   # an older env file stored
   DOCKGE_PASS="$OWNER_PASS"
@@ -976,7 +1178,7 @@ if [ -z "${OWNER_PASS:-}" ]; then
   # the auth secret signs its login sessions. 64 hex chars each.
   HOMARR_SECRET=$(openssl rand -hex 32 2>/dev/null || genpass)
   HOMARR_AUTH_SECRET=$(openssl rand -hex 32 2>/dev/null || genpass)
-  cat >> /etc/redoubt/redoubt.env <<EOF
+  cat >> "$_ENV_TMP" <<EOF
 OWNER_USER="$OWNER_USER"
 OWNER_PASS="$OWNER_PASS"
 IMMICH_DB_PASS="$IMMICH_DB_PASS"
@@ -991,7 +1193,8 @@ MESH_STORE_KEY="$MESH_STORE_KEY"
 HOMARR_SECRET="$HOMARR_SECRET"
 HOMARR_AUTH_SECRET="$HOMARR_AUTH_SECRET"
 EOF
-  chmod 600 /etc/redoubt/redoubt.env
+  chmod 600 "$_ENV_TMP" 2>/dev/null || true
+  kit_env_commit
   dbg "credentials generated"
 else
   dbg "reusing existing credentials"
@@ -1001,8 +1204,19 @@ fi
 # containers would crash-loop on auth (seen on Rocky: immich edge
 # 502 with "password authentication failed"). Quarantine the orphan
 # instead of leaving a half-broken stack; nothing is deleted, the old
-# tree just moves aside for whoever wants to dig it out.
-if [ "${_HAD_ENV:-1}" = "0" ] && [ -d /var/lib/redoubt ] && [ -n "$(ls -A /var/lib/redoubt 2>/dev/null)" ]; then
+# tree just moves aside for whoever wants to dig it out. Only real
+# data dirs count: the skeleton mkdir above already created the empty
+# tree on a fresh box, and an empty skeleton is not an orphan.
+_STALE_HIT=0
+if [ "${_HAD_ENV:-1}" = "0" ]; then
+  for _DATADIR in /var/lib/redoubt/immich-db /var/lib/redoubt/nextcloud-db /var/lib/redoubt/immich /var/lib/redoubt/nextcloud; do
+    if [ -d "$_DATADIR" ] && [ -n "$(ls -A "$_DATADIR" 2>/dev/null)" ]; then
+      _STALE_HIT=1
+      break
+    fi
+  done
+fi
+if [ "$_STALE_HIT" = "1" ]; then
   _STALE="/var/lib/redoubt.stale-$(date +%Y%m%d-%H%M%S)"
   mv /var/lib/redoubt "$_STALE" 2>/dev/null || true
   dbg "orphaned data tree quarantined to $_STALE (its passwords died with the old env)"
@@ -1011,27 +1225,27 @@ fi
 # it get one generated here. Persist it so re-runs reuse the same one.
 if [ -z "${DOCKGE_PASS:-}" ]; then
   DOCKGE_PASS="$OWNER_PASS"
-  echo "DOCKGE_PASS=\"$DOCKGE_PASS\"" >> /etc/redoubt/redoubt.env
-  chmod 600 /etc/redoubt/redoubt.env
+  echo "DOCKGE_PASS=\"$DOCKGE_PASS\"" >> "$_ENV_TMP"
+  chmod 600 "$_ENV_TMP" 2>/dev/null || true
 fi
 # pre-paperless builds stored the search secret under the old name:
 # carry it over once and write the current one, so both sides of the
 # rename read the same value on the next pass
 if [ -z "${SEARXNG_SECRET:-}" ] && [ -n "${PAPERLESS_SECRET:-}" ]; then
   SEARXNG_SECRET="$PAPERLESS_SECRET"
-  echo "SEARXNG_SECRET=\"$SEARXNG_SECRET\"" >> /etc/redoubt/redoubt.env
-  chmod 600 /etc/redoubt/redoubt.env
+  echo "SEARXNG_SECRET=\"$SEARXNG_SECRET\"" >> "$_ENV_TMP"
+  chmod 600 "$_ENV_TMP" 2>/dev/null || true
 fi
 # machines that predate the panel get its two secrets here, same idiom
 if [ -z "${HOMARR_SECRET:-}" ]; then
   HOMARR_SECRET=$(openssl rand -hex 32 2>/dev/null || genpass)
-  echo "HOMARR_SECRET=\"$HOMARR_SECRET\"" >> /etc/redoubt/redoubt.env
-  chmod 600 /etc/redoubt/redoubt.env
+  echo "HOMARR_SECRET=\"$HOMARR_SECRET\"" >> "$_ENV_TMP"
+  chmod 600 "$_ENV_TMP" 2>/dev/null || true
 fi
 if [ -z "${HOMARR_AUTH_SECRET:-}" ]; then
   HOMARR_AUTH_SECRET=$(openssl rand -hex 32 2>/dev/null || genpass)
-  echo "HOMARR_AUTH_SECRET=\"$HOMARR_AUTH_SECRET\"" >> /etc/redoubt/redoubt.env
-  chmod 600 /etc/redoubt/redoubt.env
+  echo "HOMARR_AUTH_SECRET=\"$HOMARR_AUTH_SECRET\"" >> "$_ENV_TMP"
+  chmod 600 "$_ENV_TMP" 2>/dev/null || true
 fi
 # Legacy envs can hold mesh secrets with YAML-hostile characters. A
 # backslash in a double-quoted string either corrupts the value silently
@@ -1043,7 +1257,8 @@ for _mk in MESH_AUTH_SECRET MESH_COOKIE_KEY; do
   case "$_mv" in
     *[!A-Za-z0-9!@#%*+_-]*)
       printf -v "$_mk" '%s' "$(tr -dc 'A-Za-z0-9!@#%*_+-' < /dev/urandom | head -c 32)"
-      sed -i "s|^$_mk=.*|$_mk=\"${!_mk}\"|" /etc/redoubt/redoubt.env
+      sed -i "s|^$_mk=.*|$_mk=\"${!_mk}\"|" "$_ENV_TMP"
+      kit_env_commit
       dbg "regenerated legacy $_mk (unsafe charset)"
       ;;
   esac
@@ -1081,7 +1296,7 @@ for spec in "IMMICH 2283" "NEXTCLOUD 8080" "SEARXNG 8081" "EDGE1 8443" "EDGE2 84
   set -- $spec
   NAME=$1; PN=PORT_$NAME; CUR=${!PN-}
   if port_busy "$CUR" && [ "${RERUN:-0}" != "1" ]; then
-    NEW=$(pick_free 8400 9499) || { echo "FAIL: no free port found for $NAME" >&3; exit 9; }
+    NEW=$(pick_free 8400 9499) || { fail_line "no free port found for $NAME"; exit 9; }
     printf -v "PORT_$NAME" '%s' "$NEW"
     dbg "port $CUR is busy, $NAME now uses $NEW"
     PORTS_CHANGED="$PORTS_CHANGED PORT_$NAME=$NEW"
@@ -1092,7 +1307,7 @@ for spec in "IMMICH 2283" "NEXTCLOUD 8080" "SEARXNG 8081" "EDGE1 8443" "EDGE2 84
   fi
 done
 if [ -n "$PORTS_CHANGED" ]; then
-  sed -i '/^PORT_/d' /etc/redoubt/redoubt.env 2>/dev/null || true
+  sed -i '/^PORT_/d' "$_ENV_TMP" 2>/dev/null || true
   {
     echo "PORT_IMMICH=$PORT_IMMICH"
     echo "PORT_NEXTCLOUD=$PORT_NEXTCLOUD"
@@ -1102,13 +1317,15 @@ if [ -n "$PORTS_CHANGED" ]; then
     echo "PORT_EDGE3=$PORT_EDGE3"
     echo "PORT_NETBIRD=$PORT_NETBIRD"
     echo "PORT_NETBIRD_MGMT=$PORT_NETBIRD_MGMT"
+    echo "PORT_DASH=$PORT_DASH"
     echo "PORT_EDGE4=$PORT_EDGE4"
     echo "PORT_EDGE5=$PORT_EDGE5"
     echo "PORT_EDGE_CDN=$PORT_EDGE_CDN"
     echo "PORT_DOCKGE=$PORT_DOCKGE"
-  } >> /etc/redoubt/redoubt.env
-  chmod 600 /etc/redoubt/redoubt.env
-  dbg "chosen ports saved to /etc/redoubt/redoubt.env"
+  } >> "$_ENV_TMP"
+  chmod 600 "$_ENV_TMP" 2>/dev/null || true
+  kit_env_commit
+  dbg "chosen ports saved"
 fi
 dbg "ports in use: immich $PORT_IMMICH, nextcloud $PORT_NEXTCLOUD, searxng $PORT_SEARXNG, edge $PORT_EDGE1/$PORT_EDGE2/$PORT_EDGE3, netbird $PORT_NETBIRD/$PORT_NETBIRD_MGMT, panel $PORT_EDGE4, ad shield $PORT_EDGE5, dockge $PORT_DOCKGE"
 
@@ -1365,7 +1582,7 @@ join_cloud_with_key() {
     while [ "$_DT" -lt 3 ]; do
       printf '%s' "$NETBIRD_SETUP_KEY" > "$STACKDIR/.join-key.tmp"
       chmod 600 "$STACKDIR/.join-key.tmp"
-      NBUPE=$(timeout -k 5 120 "$NBEXE" up --management-url "https://api.netbird.io" --disable-dns --setup-key-file "$STACKDIR/.join-key.tmp" 2>&1 || true)
+      NBUPE=$(timeout -k 5 120 "$NBEXE" up --management-url "https://api.netbird.io" --disable-dns --dns-resolver-address 127.0.0.1:5053 --setup-key-file "$STACKDIR/.join-key.tmp" 2>&1 || true)
       echo "cloud join attempt: $(printf '%s' "$NBUPE" | tr '\n' ' ' | head -c 200)" >> "$LOG"
       rm -f "$STACKDIR/.join-key.tmp"
       case "$NBUPE" in
@@ -1422,15 +1639,22 @@ drain_tty() {
 read_setup_key() {
   local _K="" _T=0
   while [ "$_T" -lt 2 ]; do
-    _T=$((_T+1))
     printf 'Type your NetBird Setup Key (or its link): ' >&3
-    # two minutes is plenty to paste a key; without the timeout a box
-    # with nobody at the keyboard stalls the whole install right here
+    # waits for the paste with no timeout: the owner started this, so
+    # it waits. A blank enter asks again without burning a try; a dead
+    # session (EOF) falls through with an empty key and the flow warns.
     stty echo icanon <&3 2>/dev/null || true
     cursor_show
-    read -r -t 120 _K <&3 2>/dev/null || true
+    if ! read -r _K <&3 2>/dev/null; then
+      cursor_hide
+      drain_tty
+      NETBIRD_SETUP_KEY=""
+      return 0
+    fi
     cursor_hide
     drain_tty
+    [ -z "$_K" ] && continue
+    _T=$((_T+1))
     echo "setup key input: attempt $_T, got ${#_K} chars, bytes: $(printf '%s' "$_K" | od -An -tx1 | tr -d ' \n')" >> "$LOG"
     _K="$(resolve_netbird_key "$_K")"
     [ -n "$_K" ] && { NETBIRD_SETUP_KEY="$_K"; return 0; }
@@ -1451,15 +1675,29 @@ nb_token_flow() {
   _NB_TOKFILE="$STACKDIR/.nb-token.tmp"
   printf '%s' "Authorization: Token $1" > "$_NB_TOKFILE"
   chmod 600 "$_NB_TOKFILE"
+  # the PAT is also the key to the cloud split-DNS: keep it (root-only)
+  # so the zone publication later in the pass can refresh redoubt.remote
+  # in the account. Every call site feeds it: the credential flow and
+  # the shield retry prompt alike, or a retry-pasted token arms the
+  # nameserver but the zone guard below never sees a PAT and the cloud
+  # record keeps a dead address
+  case "$1" in
+    nbp_*)
+      mkdir -p /etc/redoubt
+      printf '%s\n' "$1" > /etc/redoubt/cloud-pat.txt
+      chmod 600 /etc/redoubt/cloud-pat.txt
+      ;;
+  esac
   _NB_API="https://api.netbird.io"
   # proof of life: the token must be able to list setup keys. Log the
   # real answer (code + short body) so a rejection is diagnosable from
   # the kit log instead of a guess. The code alone is the verdict: an
   # empty key list is a perfectly valid answer ("[]") and must not
   # read as a rejection (the quote check did exactly that).
-  _NB_PROBE=$(curl -s --max-time 20 --retry 2 -o /tmp/redoubt-probe.json -w '%{http_code}' -H "@$_NB_TOKFILE" "$_NB_API/api/setup-keys" 2>/dev/null || true)
-  _NB_PROBE_BODY=$(head -c 300 /tmp/redoubt-probe.json 2>/dev/null | tr '\n' ' ')
-  rm -f /tmp/redoubt-probe.json
+  _NB_TMP=$(mktemp /tmp/redoubt-probe.XXXXXX) || { rm -f "$_NB_TOKFILE"; return 1; }
+  _NB_PROBE=$(curl -s --max-time 20 --retry 2 -o "$_NB_TMP" -w '%{http_code}' -H "@$_NB_TOKFILE" "$_NB_API/api/setup-keys" 2>/dev/null || true)
+  _NB_PROBE_BODY=$(head -c 300 "$_NB_TMP" 2>/dev/null | tr '\n' ' ')
+  rm -f "$_NB_TMP"
   echo "token probe: http ${_NB_PROBE:-none}, body: $(printf '%s' "$_NB_PROBE_BODY" | head -c 200)" >> "$LOG"
   if [ "$_NB_PROBE" != "200" ]; then
     rm -f "$_NB_TOKFILE"
@@ -1468,12 +1706,13 @@ nb_token_flow() {
   fi
   _NB_NAME="redoubt $(hostname 2>/dev/null | cut -c1-32)"
   _NB_BODY=$(printf '{"name":"%s","type":"one-off","expires_in":31536000,"auto_groups":[],"usage_limit":1,"ephemeral":false,"allow_extra_dns_labels":false}' "$_NB_NAME")
-  _NB_RESP=$(curl -s --max-time 30 --retry 2 -X POST -o /tmp/redoubt-key.json -w '%{http_code}' -H "@$_NB_TOKFILE" -H 'Content-Type: application/json' --data-raw "$_NB_BODY" "$_NB_API/api/setup-keys" 2>/dev/null || true)
-  _NB_KEY=$(sed -n 's/.*"key":"\([^"]*\)".*/\1/p' /tmp/redoubt-key.json 2>/dev/null)
+  _NB_TMP=$(mktemp /tmp/redoubt-key.XXXXXX) || { rm -f "$_NB_TOKFILE"; return 1; }
+  _NB_RESP=$(curl -s --max-time 30 --retry 2 -X POST -o "$_NB_TMP" -w '%{http_code}' -H "@$_NB_TOKFILE" -H 'Content-Type: application/json' --data-raw "$_NB_BODY" "$_NB_API/api/setup-keys" 2>/dev/null || true)
+  _NB_KEY=$(sed -n 's/.*"key":"\([^"]*\)".*/\1/p' "$_NB_TMP" 2>/dev/null)
   # the minted key is a live enrollment credential until it is spent:
   # mask it in the log body copy, it must never sit in plain text
-  _NB_ERR=$(head -c 300 /tmp/redoubt-key.json 2>/dev/null | sed 's/"key":"[^"]*"/"key":"***"/' | tr '\n' ' ')
-  rm -f /tmp/redoubt-key.json
+  _NB_ERR=$(head -c 300 "$_NB_TMP" 2>/dev/null | sed 's/"key":"[^"]*"/"key":"***"/' | tr '\n' ' ')
+  rm -f "$_NB_TMP"
   echo "token mint: http ${_NB_RESP:-none}, body: $(printf '%s' "$_NB_ERR" | head -c 200)" >> "$LOG"
   if [ -z "$_NB_KEY" ]; then
     rm -f "$_NB_TOKFILE"
@@ -1490,6 +1729,11 @@ nb_token_flow() {
 # agent will never connect again on its own and a fresh join with a new
 # key gets silently ignored while the old config lives. Clear it before
 # any enrollment attempt so the new credential actually lands.
+# the naive *connected* glob also matches "disconnected": test the word
+# itself with a non-letter boundary on both sides, everywhere
+nb_connected() {
+  printf '%s' "$1" | grep -qE '(^|[^a-z])connected([^a-z]|$)'
+}
 nb_reset_stale_identity() {
   # Any enrollment attempt starts from a clean slate: a stored config
   # from another mode (a lab run, a selfhost profile) keeps the daemon
@@ -1528,9 +1772,27 @@ nb_reset_stale_identity() {
 # token file only exists on the pass that minted it, and the nameserver
 # check is idempotent for any later pass that still finds the file.
 arm_mesh_nameserver() {
-  [ -f "$STACKDIR/.nb-token.tmp" ] || return 0
+  # no token means the arm cannot talk to the account: leave the
+  # pending marker so a later pass (or the retry below) offers the
+  # token prompt instead of silently skipping the shield forever
+  [ -f "$STACKDIR/.nb-token.tmp" ] \
+    || { touch /etc/redoubt/mesh-ns-pending 2>/dev/null || true; return 0; }
   _NB_TOKFILE="$STACKDIR/.nb-token.tmp"
   _NB_API="https://api.netbird.io"
+  # the settled account address is the stable value: a status read a
+  # second after the up line can still carry the transient enroll
+  # address, so wait for the management link to report Connected
+  # before trusting the ip below
+  _NB_SETTLED=0
+  for _i in $(seq 1 30); do
+    for _NB in $(command -v netbird 2>/dev/null) /usr/local/bin/netbird /usr/bin/netbird /usr/sbin/netbird; do
+      [ -x "$_NB" ] || continue
+      "$_NB" status 2>/dev/null | grep -q "Management: Connected" && _NB_SETTLED=1
+      break
+    done
+    [ "$_NB_SETTLED" = "1" ] && break
+    sleep 2
+  done
   # the mesh address arrives a beat after the join: wait for it
   _NB_MESH_IP=""
   for _i in $(seq 1 15); do
@@ -1566,27 +1828,64 @@ arm_mesh_nameserver() {
       return 0
       ;;
   esac
-  # idempotent: a nameserver on the same address is already armed
-  _NB_EXIST=$(curl -fsS --max-time 20 -H "@$_NB_TOKFILE" "$_NB_API/api/dns/nameservers" 2>/dev/null | grep -c "\"ip\":\"$_NB_MESH_IP\"") || true
-  if [ -n "$_NB_EXIST" ] && [ "$_NB_EXIST" -gt 0 ]; then
-    rm -f "$_NB_TOKFILE" /etc/redoubt/mesh-ns-pending
+  # one account, one shield, always the current mesh address: delete
+  # every Redoubt Shield first (a same-ip shield still carries the
+  # group it was armed with, so a same-ip early return would keep the
+  # old group alive across recycles), then arm fresh below
+  for _NB_NS_ID in $(curl -fsS --max-time 20 -H "@$_NB_TOKFILE" "$_NB_API/api/dns/nameservers" 2>/dev/null \
+      | python3 -c 'import json,sys
+try:
+  for g in json.load(sys.stdin):
+    if g.get("name","").lower()=="redoubt shield":
+      print(g.get("id",""))
+except Exception:
+  pass' 2>/dev/null); do
+    curl -s --max-time 20 -X DELETE -H "@$_NB_TOKFILE" "$_NB_API/api/dns/nameservers/$_NB_NS_ID" >/dev/null 2>&1 || true
+  done
+  # the shield rides a dedicated group, never the built-in All: arming
+  # on All hands this box its own nameserver and the daemon proxy
+  # above loops. The group carries every peer whose address differs
+  # from the box's own mesh ip, created or refreshed on each arm
+  _NB_PEERS_JSON=$(curl -fsS --max-time 20 -H "@$_NB_TOKFILE" "$_NB_API/api/peers" 2>/dev/null \
+    | python3 -c 'import json,sys
+try:
+  ps=json.load(sys.stdin)
+  out=[p.get("id","") for p in ps if p.get("ip","") and p.get("ip","")!=sys.argv[1]]
+  print(json.dumps(out))
+except Exception:
+  pass' "$_NB_MESH_IP" 2>/dev/null)
+  if [ -z "$_NB_PEERS_JSON" ] || [ "$_NB_PEERS_JSON" = "[]" ]; then
+    dbg "nameserver arm skipped - no peers besides this box to shield"
+    rm -f "$_NB_TOKFILE"
+    touch /etc/redoubt/mesh-ns-pending 2>/dev/null || true
     return 0
   fi
-  # a nameserver group must target at least one peer group: take the
-  # account's built-in "All" group (every account ships one) so the
-  # shield covers every peer, phones included (groups:[] died
-  # with a 422 because a shield nobody receives is invalid)
   _NB_GROUP_ID=$(curl -fsS --max-time 20 -H "@$_NB_TOKFILE" "$_NB_API/api/groups" 2>/dev/null \
     | python3 -c 'import json,sys
 try:
-  gs=json.load(sys.stdin)
-  for g in gs:
-    if g.get("name","").lower()=="all":
+  for g in json.load(sys.stdin):
+    if g.get("name","")=="Shield peers":
       print(g.get("id","")); break
 except Exception:
   pass' 2>/dev/null)
+  _NB_GROUP_BODY=$(printf '{"name":"Shield peers","peers":%s}' "$_NB_PEERS_JSON")
+  if [ -n "$_NB_GROUP_ID" ]; then
+    curl -s --max-time 20 -X PUT -H "@$_NB_TOKFILE" -H 'Content-Type: application/json' \
+      --data-raw "$_NB_GROUP_BODY" "$_NB_API/api/groups/$_NB_GROUP_ID" >/dev/null 2>&1 || true
+  else
+    _NB_GTMP=$(mktemp /tmp/redoubt-group.XXXXXX) || { rm -f "$_NB_TOKFILE"; return 1; }
+    _NB_GROUP_ID=$(curl -s --max-time 30 --retry 2 -X POST -o "$_NB_GTMP" \
+      -H "@$_NB_TOKFILE" -H 'Content-Type: application/json' \
+      --data-raw "$_NB_GROUP_BODY" "$_NB_API/api/groups" 2>/dev/null \
+      && python3 -c 'import json,sys
+try:
+  print(json.load(open(sys.argv[1])).get("id",""))
+except Exception:
+  pass' "$_NB_GTMP" 2>/dev/null)
+    rm -f "$_NB_GTMP"
+  fi
   if [ -z "$_NB_GROUP_ID" ]; then
-    dbg "nameserver arm skipped - the account has no peer group to target"
+    dbg "nameserver arm skipped - the Shield peers group could not be built"
     rm -f "$_NB_TOKFILE"
     touch /etc/redoubt/mesh-ns-pending 2>/dev/null || true
     return 0
@@ -1596,12 +1895,13 @@ except Exception:
   # resolver for the whole account (the flat "ip" body died
   # with a 422 on the current API).
   _NB_NS_BODY=$(printf '{"name":"Redoubt Shield","description":"pi-hole on the mesh - ad blocking anywhere","nameservers":[{"ip":"%s","ns_type":"udp","port":53}],"enabled":true,"groups":["%s"],"primary":true,"domains":[],"search_domains_enabled":false}' "$_NB_MESH_IP" "$_NB_GROUP_ID")
-  _NB_NS_CODE=$(curl -s --max-time 30 --retry 2 -X POST -o /tmp/redoubt-ns.json -w '%{http_code}' -H "@$_NB_TOKFILE" -H 'Content-Type: application/json' --data-raw "$_NB_NS_BODY" "$_NB_API/api/dns/nameservers" 2>/dev/null || true)
+  _NB_NSTMP=$(mktemp /tmp/redoubt-ns.XXXXXX) || { rm -f "$_NB_TOKFILE"; return 1; }
+  _NB_NS_CODE=$(curl -s --max-time 30 --retry 2 -X POST -o "$_NB_NSTMP" -w '%{http_code}' -H "@$_NB_TOKFILE" -H 'Content-Type: application/json' --data-raw "$_NB_NS_BODY" "$_NB_API/api/dns/nameservers" 2>/dev/null || true)
   _NB_NS_OK=0
   if [ "$_NB_NS_CODE" = "200" ]; then
     _NB_NS_OK=1
   else
-    _NB_NS_ERR=$(head -c 400 /tmp/redoubt-ns.json 2>/dev/null | tr '\n' ' ')
+    _NB_NS_ERR=$(head -c 400 "$_NB_NSTMP" 2>/dev/null | tr '\n' ' ')
     # a reinstall enrolls with a fresh mesh address while the account
     # still holds a shield with the same name (the API's uniqueness
     # check is case-insensitive): update the existing group's
@@ -1618,16 +1918,16 @@ try:
 except Exception:
   pass' | head -1)
       if [ -n "$_NB_NS_ID" ]; then
-        _NB_NS_CODE=$(curl -s --max-time 30 --retry 2 -X PUT -o /tmp/redoubt-ns.json -w '%{http_code}' -H "@$_NB_TOKFILE" -H 'Content-Type: application/json' --data-raw "$_NB_NS_BODY" "$_NB_API/api/dns/nameservers/$_NB_NS_ID" 2>/dev/null || true)
+        _NB_NS_CODE=$(curl -s --max-time 30 --retry 2 -X PUT -o "$_NB_NSTMP" -w '%{http_code}' -H "@$_NB_TOKFILE" -H 'Content-Type: application/json' --data-raw "$_NB_NS_BODY" "$_NB_API/api/dns/nameservers/$_NB_NS_ID" 2>/dev/null || true)
         [ "$_NB_NS_CODE" = "200" ] && _NB_NS_OK=1
-        _NB_NS_ERR=$(head -c 400 /tmp/redoubt-ns.json 2>/dev/null | tr '\n' ' ')
+        _NB_NS_ERR=$(head -c 400 "$_NB_NSTMP" 2>/dev/null | tr '\n' ' ')
       fi
     fi
   fi
   if [ "$_NB_NS_OK" = "1" ]; then
     # same family as the rest of the pass: emerald, no glyph, and no
     # raw mesh address on the pretty line (the log keeps the IP)
-    printf '  %bmesh DNS shield armed: Home & Remote%b\n' "$EM2" "$RESET" >&3 2>/dev/null || true
+    { anim_stop; pl_glyphs; pl_row "$EM1B" "$PL_OK" "" "mesh DNS shield armed: Home & Remote" 0; } 2>/dev/null || true
     dbg "OK: mesh nameserver armed on $_NB_MESH_IP"
     rm -f /etc/redoubt/mesh-ns-pending
     # the private resolver serves cdn.jsdelivr.net for the CDN mirror:
@@ -1645,7 +1945,7 @@ except Exception:
     dbg "nameserver arm failed (code ${_NB_NS_CODE:-none}; sent: $(printf '%s' "$_NB_NS_BODY" | head -c 220); answer: $(printf '%s' "$_NB_NS_ERR" | head -c 300))"
     touch /etc/redoubt/mesh-ns-pending 2>/dev/null || true
   fi
-  rm -f /tmp/redoubt-ns.json
+  rm -f "$_NB_NSTMP"
   # the token's job is done either way: nothing stays on the box
   rm -f "$_NB_TOKFILE"
   return 0
@@ -1683,9 +1983,25 @@ publish_remote_zone() {
   # zone, one A record, both get-or-create: a re-run refreshes the
   # mesh address instead of stacking duplicates.
   _ZONE_API=$1; _ZONE_AUTH=$2; _ZONE_LABEL=$3
+  # the live mesh address is the truth: the env value can hold the
+  # previous mode's ip, and a zone published from it alone plants a
+  # phantom A record. Re-read the status right here; env as fallback.
+  _ZONE_IP=""
+  for _NB in $(command -v netbird 2>/dev/null) /usr/local/bin/netbird /usr/bin/netbird /usr/sbin/netbird; do
+    [ -x "$_NB" ] || continue
+    _ZONE_IP="$("$_NB" status 2>/dev/null | sed -n 's/^NetBird IP: //p' | head -1 | cut -d/ -f1)"
+    case "$_ZONE_IP" in [0-9]*.[0-9]*.[0-9]*.[0-9]*) ;; *) _ZONE_IP="" ;; esac
+    break
+  done
+  [ -n "$_ZONE_IP" ] || _ZONE_IP="${NETBIRD_IP:-}"
+  # the fallback can carry a junk token (the netbird CLI prints
+  # "N/A" when logged out and the cut turns it into an N): never let
+  # a non-address reach the zone record or /etc/hosts
+  case "$_ZONE_IP" in [0-9]*.[0-9]*.[0-9]*.[0-9]*) ;; *) return 0 ;; esac
   _ZONE_GROUP=$(curl -s --max-time 20 "$_ZONE_API/api/groups" -H "$_ZONE_AUTH" \
     | python3 -c "import sys,json; print(next((g.get('id','') for g in json.load(sys.stdin) if g.get('name')=='All'), ''))" 2>/dev/null)
   if [ -z "$_ZONE_GROUP" ]; then
+    dbg "WARN: the $_ZONE_LABEL zone skipped - the account has no All group"
     return 0
   fi
   _ZONE_ID=$(curl -s --max-time 20 "$_ZONE_API/api/dns/zones" -H "$_ZONE_AUTH" \
@@ -1705,15 +2021,39 @@ publish_remote_zone() {
   if [ -n "$_ZONE_REC" ]; then
     curl -s --max-time 20 -X PUT "$_ZONE_API/api/dns/zones/$_ZONE_ID/records/$_ZONE_REC" \
       -H "$_ZONE_AUTH" -H "Content-Type: application/json" \
-      -d "{\"name\":\"redoubt.remote\",\"type\":\"A\",\"content\":\"$NETBIRD_IP\",\"ttl\":300}" >/dev/null 2>&1 || true
+      -d "{\"name\":\"redoubt.remote\",\"type\":\"A\",\"content\":\"$_ZONE_IP\",\"ttl\":300}" >/dev/null 2>&1 || true
   else
     curl -s --max-time 20 -X POST "$_ZONE_API/api/dns/zones/$_ZONE_ID/records" \
       -H "$_ZONE_AUTH" -H "Content-Type: application/json" \
-      -d "{\"name\":\"redoubt.remote\",\"type\":\"A\",\"content\":\"$NETBIRD_IP\",\"ttl\":300}" >/dev/null 2>&1 || true
+      -d "{\"name\":\"redoubt.remote\",\"type\":\"A\",\"content\":\"$_ZONE_IP\",\"ttl\":300}" >/dev/null 2>&1 || true
   fi
-  sed -i '/[[:space:]]redoubt\\.remote[[:space:]]*$/d' /etc/hosts 2>/dev/null || true
+  sed -i '/[[:space:]]redoubt\.remote[[:space:]]*$/d' /etc/hosts 2>/dev/null || true
+  printf '%s\t%s\n' "$_ZONE_IP" "redoubt.remote" >> /etc/hosts 2>/dev/null || true
+  dbg "OK: $_ZONE_LABEL zone redoubt.remote points at $_ZONE_IP"
+}
+
+refresh_remote_dns() {
+  # the pi-hole and the unbound carry redoubt.remote: after the join
+  # settles the records must carry the live mesh address, not the
+  # compose-time fallback. FTLCONF is read-only at runtime, so the
+  # pi-hole line rides a sed + recreate; the unbound line a sed +
+  # restart. Both seds are no-ops when the address already matches.
+  [ -n "${NETBIRD_IP:-}" ] || return 0
+  case "$NETBIRD_IP" in [0-9]*.[0-9]*.[0-9]*.[0-9]*) ;; *) return 0 ;; esac
+  if [ -f "$STACKDIR/docker-compose.yml" ]; then
+    sed -i -E "s|^([[:space:]]*FTLCONF_dns_hosts: \"[0-9.]+ redoubt\\.lan;)[0-9.]+( redoubt\\.remote\")|\1${NETBIRD_IP}\2|" "$STACKDIR/docker-compose.yml" \
+      && docker compose -f "$STACKDIR/docker-compose.yml" up -d pihole >/dev/null 2>&1 || true
+  fi
+  if [ -f "$STACKDIR/unbound.conf" ]; then
+    sed -i "s|redoubt\\.remote\\. 300 IN A [^\"]*|redoubt.remote. 300 IN A ${NETBIRD_IP}|" "$STACKDIR/unbound.conf" \
+      && docker compose -f "$STACKDIR/docker-compose.yml" restart dns >/dev/null 2>&1 || true
+  fi
+  # the host's own /etc/hosts carries .remote too, and the first match
+  # wins: the old address must go before the new one lands, or the host
+  # keeps resolving a phantom mesh ip while the pi-hole and the unbound
+  # are already correct
+  sed -i '/[[:space:]]redoubt\.remote[[:space:]]*$/d' /etc/hosts 2>/dev/null || true
   printf '%s\t%s\n' "$NETBIRD_IP" "redoubt.remote" >> /etc/hosts 2>/dev/null || true
-  dbg "OK: $_ZONE_LABEL zone redoubt.remote points at $NETBIRD_IP"
 }
 nb_fetch() {
   # $1 = release asset, $2 = checksums file, $3 = work dir. Downloads
@@ -1772,6 +2112,11 @@ cloud_key_flow() {
       [ -n "$_NB_FQDN" ] && break
     done
     if nb_cloud_live; then
+      # a live link must still re-check the shield on every pass: the
+      # arm re-reads the settled mesh address and refreshes the account
+      # shield, and without a token it leaves the pending marker so the
+      # retry below fires in this same pass
+      arm_mesh_nameserver
       if [ -f /etc/redoubt/mesh-ns-pending ]; then
         echo "Cloud link live, but the nameserver did not arm in the previous run" >&3 2>/dev/null || true
         echo "paste a fresh token below to arm it now (it dies right after)" >&3 2>/dev/null || true
@@ -1814,10 +2159,7 @@ cloud_key_flow() {
 if [ -z "${NETBIRD_SETUP_KEY:-}" ] && [ -z "${REDOUBT_MESH_MODE:-}" ] && [ -t 3 ]; then
   # the bar painter repaints ~30 times a second: stop it while the
   # question is on screen, or its carriage-return redraws shred the text
-  if [ -n "${ANIM_PID:-}" ]; then
-    kill -9 "$ANIM_PID" 2>/dev/null || true
-  fi
-  printf '\r\033[K' >&3
+  anim_stop
   if [ "${RERUN:-0}" = "1" ]; then
     # a decision already lives on this machine: a single yes/no, never
     # the whole menu again. Except the broken-cloud case: the machine
@@ -1855,10 +2197,10 @@ if [ -z "${NETBIRD_SETUP_KEY:-}" ] && [ -z "${REDOUBT_MESH_MODE:-}" ] && [ -t 3 
   if [ "$SHOW_MENU" = "1" ]; then
     echo "" >&3
     echo "Your mesh, your rules:" >&3
-    echo "  1) NetBird cloud (recommended) - one admin token; the kit mints" >&3
-    echo "     the key, arms the shield, destroys the token. Any device works" >&3
-    echo "     from any network; at home the same links run over wifi." >&3
-    echo "  2) Self-hosted - the coordinator runs here, zero third parties" >&3
+    echo "  1) Self-hosted (recommended) - the coordinator runs on this box:" >&3
+    echo "     your NAS, your keys, your rules." >&3
+    echo "  2) NetBird cloud - one admin token; the kit mints the key, arms" >&3
+    echo "     the shield, destroys the token. Works from any network." >&3
     # same strict gate as the repatch question: junk asks again,
     # cancel words stop the run cleanly before anything else moves
     while :; do
@@ -1891,17 +2233,21 @@ if [ -z "${NETBIRD_SETUP_KEY:-}" ] && [ -z "${REDOUBT_MESH_MODE:-}" ] && [ -t 3 
   # this menu block on every mode
   [ "$KIT_HAS_GUI" = "1" ] && HAS_GUI=1
   case "${MESH_CHOICE:-1}" in
-    2) MESH_MODE="selfhost" ;;
-    *)
+    2)
       cloud_key_flow
       MESH_MODE="cloud"
       ;;
+    *)
+      MESH_MODE="selfhost"
+      ;;
   esac
+  # the menu can flip the mode after the switch flag was computed up
+  # top: a stale flag would leave the firewall block below on the old
+  # model (an interactive switch never re-models the doors). Recompute
+  # here, right after the case, with the same guard as the first pass.
+  if [ -n "$FW_MODE_PREV" ] && [ "$FW_MODE_PREV" != "$MESH_MODE" ]; then
+    MESH_MODE_CHANGED=1
   fi
-  # the answer is in: bring the painter back on the current state
-  if [ -t 3 ]; then
-    bar_anim &
-    ANIM_PID=$!
   fi
 fi
 
@@ -1909,18 +2255,18 @@ fi
 # it back until the question, and a run that skipped the menu (the
 # mesh mode pinned by env) still needs it for the rest of the pass.
 HOLD_BAR=0
-if [ -t 3 ] && { [ -z "${ANIM_PID:-}" ] || ! kill -0 "$ANIM_PID" 2>/dev/null; }; then
-  bar_anim &
-  ANIM_PID=$!
-fi
+anim_start
 
 # Persist the choice. The auto-update re-runs the kit and has to land on
 # the same mesh, never back on a default.
-if grep -qs '^MESH_MODE=' /etc/redoubt/redoubt.env 2>/dev/null; then
-  sed -i "s|^MESH_MODE=.*|MESH_MODE=$MESH_MODE|" /etc/redoubt/redoubt.env
+if grep -qs '^MESH_MODE=' "$_ENV_TMP" 2>/dev/null; then
+  sed -i "s|^MESH_MODE=.*|MESH_MODE=$MESH_MODE|" "$_ENV_TMP"
 else
-  echo "MESH_MODE=$MESH_MODE" >> /etc/redoubt/redoubt.env
+  echo "MESH_MODE=$MESH_MODE" >> "$_ENV_TMP"
 fi
+# the sed arm edits the existing line and must commit too: a switch
+# made on a re-run never reached the disk without this
+kit_env_commit
 
 # A cloud machine that never linked must not keep running unlinked: it
 # waits right here for the key, no timeout, no fallback to the LAN
@@ -1931,8 +2277,7 @@ fi
 if [ "$MESH_MODE" = "cloud" ] && [ -t 3 ] && [ -z "${NETBIRD_SETUP_KEY:-}" ] \
    && ! nb_cloud_live; then
   NBEXE=$(command -v netbird 2>/dev/null || echo /usr/local/bin/netbird)
-  [ -n "${ANIM_PID:-}" ] && kill -9 "$ANIM_PID" 2>/dev/null || true
-  printf '\r\033[K' >&3
+  anim_stop
   echo "Mesh set to cloud, but the link is not alive." >&3
   show_cloud_link_qr
   while :; do
@@ -1968,7 +2313,7 @@ if [ "$MESH_MODE" = "cloud" ] && [ -t 3 ] && [ -z "${NETBIRD_SETUP_KEY:-}" ] \
     nb_reset_stale_identity
     printf '%s' "$NETBIRD_SETUP_KEY" > "$STACKDIR/.join-key.tmp"
     chmod 600 "$STACKDIR/.join-key.tmp"
-    NBUPE=$(timeout -k 5 120 "$NBEXE" up --management-url "https://api.netbird.io" --disable-dns --setup-key-file "$STACKDIR/.join-key.tmp" 2>&1 || true)
+    NBUPE=$(timeout -k 5 120 "$NBEXE" up --management-url "https://api.netbird.io" --disable-dns --dns-resolver-address 127.0.0.1:5053 --setup-key-file "$STACKDIR/.join-key.tmp" 2>&1 || true)
     rm -f "$STACKDIR/.join-key.tmp"
     case "$NBUPE" in
       *"invalid"*|*"failed"*|*"error"*|*"unauthorized"*|*"expired"*|*"revoked"*|*"not found"*)
@@ -1981,8 +2326,7 @@ if [ "$MESH_MODE" = "cloud" ] && [ -t 3 ] && [ -z "${NETBIRD_SETUP_KEY:-}" ] \
     arm_mesh_nameserver
     break
   done
-  bar_anim &
-  ANIM_PID=$!
+  anim_start
 fi
 
 # The cloud link is key-only: a desktop never falls back to the app
@@ -2016,11 +2360,20 @@ NBVER="$(latest_netbird)"
 # dashboard, so its edge keeps the original ports untouched
 CADDY_DASH_PORT=""
 [ "$MESH_MODE" = "selfhost" ] && CADDY_DASH_PORT="      - \"0.0.0.0:${PORT_DASH}:8448\""
+# the ad shield serves redoubt.remote on the LAN too: the compose
+# needs the mesh address now (fallback: the LAN address while the
+# agent is still enrolling), and the post-join refresh lands the
+# settled ip on both resolvers
+MESH_DNS_IP=""
+if command -v netbird >/dev/null 2>&1; then
+  MESH_DNS_IP="$(netbird status 2>/dev/null | sed -n 's/^NetBird IP: //p' | head -1 | cut -d/ -f1)"
+fi
+case "$MESH_DNS_IP" in [0-9]*.[0-9]*.[0-9]*.[0-9]*) ;; *) MESH_DNS_IP="$LAN_IP" ;; esac
 cat > "$STACKDIR/docker-compose.yml" <<COMPOSE
 name: redoubt
 services:
   dns:
-    image: klutchell/unbound:latest
+    image: klutchell/unbound:latest@sha256:50cbeb32b5838a829a7226b19cb151f9535bd7f9f3190f950780f452fe807478
     container_name: redoubt-dns-1
     restart: unless-stopped
     command: ["-d"]
@@ -2049,7 +2402,11 @@ services:
     environment:
       FTLCONF_dns_upstreams: "172.28.0.53#53"
       FTLCONF_dns_listeningMode: "ALL"
-      FTLCONF_dns_hosts: "${LAN_IP} redoubt.lan"
+      # NX answers a blocked name with no address: the NULL default
+      # hands phones 0.0.0.0 and every blocked app screams 'not secure'
+      # while the VPN is on. NX is the quiet refusal.
+      FTLCONF_dns_blocking_mode: "NX"
+      FTLCONF_dns_hosts: "${LAN_IP} redoubt.lan;${MESH_DNS_IP} redoubt.remote"
       FTLCONF_webserver_api_password: "${OWNER_PASS}"
     ports:
       # bound to the LAN address and loopback only: the mesh address
@@ -2064,10 +2421,10 @@ services:
       - pihole-data:/etc/pihole
       - pihole-dnsmasq:/etc/dnsmasq.d
   immich-server:
-    # floating tags are digest-pinned (see the release notes): to update,
+    # tags carry their registry digest (pinned here); netbird-server rides the versioned tag with the vendor checksum verified at fetch time: to update,
     # bump the tag AND the digest together - docker buildx imagetools
     # inspect <image>:<tag> --format '{{.Manifest.Digest}}'
-    image: ghcr.io/immich-app/immich-server:release
+    image: ghcr.io/immich-app/immich-server:release@sha256:7c489add298fc2f92cda4c777de6462aa206877e04087b815f62c7664af0b53b
     dns: [172.28.0.53, 127.0.0.11]
     restart: unless-stopped
     volumes:
@@ -2145,7 +2502,7 @@ services:
       timeout: 3s
       retries: 20
   searxng:
-    image: searxng/searxng:latest
+    image: searxng/searxng:latest@sha256:0b104e2e1117b0ca83a36f3ac6ecda7d9ee948ccea6ead74750a03e1b856229a
     dns: [172.28.0.53, 127.0.0.11]
     restart: unless-stopped
     ports:
@@ -2164,7 +2521,7 @@ services:
     # the health feed for the panel's system widget: cpu, ram and disk
     # of the HOST (pid: host), not of a container. No host ports: only
     # the panel reaches it over the stack network.
-    image: docker.io/nicolargo/glances:latest
+    image: docker.io/nicolargo/glances:latest@sha256:a8a1614c2d531f8bd66125050968be3317c093484c82730cc96c83a2df3c732c
     dns: [172.28.0.53, 127.0.0.11]
     restart: unless-stopped
     environment:
@@ -2177,7 +2534,7 @@ services:
     # it is only reachable through the local edge (the panel site), so it
     # lives behind the same perimeter as every other app. The admin, the
     # tiles and the branding are seeded by the kit after the first boot.
-    image: ghcr.io/homarr-labs/homarr:latest
+    image: ghcr.io/homarr-labs/homarr:latest@sha256:44c480afe9df57ce9de44cb664aec53199ea19926ebdd4e590c7b2c2c0a5ef79
     dns: [172.28.0.53, 127.0.0.11]
     restart: unless-stopped
     environment:
@@ -2246,7 +2603,7 @@ $CADDY_DASH_PORT
       - /var/lib/redoubt/netbird-config.yaml:/etc/netbird/config.yaml
     command: ["--config", "/etc/netbird/config.yaml"]
   dockge:
-    image: louislam/dockge:latest
+    image: louislam/dockge:latest@sha256:335c6368b880ecc203236ed89e6e5232e0d6578e8ef5920e4a502390451502bf
     container_name: redoubt-dockge-1
     dns: [172.28.0.53, 127.0.0.11]
     restart: unless-stopped
@@ -2263,7 +2620,7 @@ $CADDY_DASH_PORT
       - /opt/stacks:/opt/stacks
   dashboard:
     profiles: ["selfhost"]
-    image: netbirdio/dashboard:latest
+    image: netbirdio/dashboard:latest@sha256:203b2dc90dc20d3fd45729caac7c922deb399586a68202e0a35be099720bac7d
     dns: [172.28.0.53, 127.0.0.11]
     restart: unless-stopped
     depends_on:
@@ -2302,7 +2659,7 @@ $CADDY_DASH_PORT
       - /var/lib/redoubt:/data
   mesh-wait:
     profiles: ["selfhost"]
-    image: busybox:latest
+    image: busybox:latest@sha256:a46257e06c82ad85242d0d38077d0a52d9896389ca60a1a59d3463db586e5fa4
     dns: [172.28.0.53, 127.0.0.11]
     command: ["sh", "-c", "i=0; while [ \$\$i -lt 300 ] && [ ! -f /markers/mesh-ready.txt ]; do sleep 2; i=\$\$((i+1)); done; exit 0"]
     restart: "no"
@@ -2538,6 +2895,18 @@ https://$LAN_IP:$PORT_DASH, https://127.0.0.1:$PORT_DASH {
 CONSOLE
 fi
 
+# an unknown SNI on the published doors must die, never receive the
+# local CA: without a catch-all the edge answers default_sni to any
+# name on these ports, so an app that lands here by accident flags the
+# whole box 'not secure' (a self-inflicted MITM). The per-host vhosts
+# above keep serving; this block only covers the rest.
+cat >> "$STACKDIR/local-caddy.Caddyfile" <<'CATCHALL'
+
+https://:443, https://:8443, https://:8444, https://:8445, https://:8446, https://:8447, https://:8448 {
+	abort
+}
+CATCHALL
+
 # every site also answers by its split-DNS name: the same links work
 # from home without the mesh (the pi-hole or /etc/hosts resolve
 # redoubt.lan). On re-runs the running edge must reload the new file
@@ -2663,9 +3032,15 @@ _MESH_DNS_IP="$LAN_IP"
 _NB_BIN=$(command -v netbird 2>/dev/null || echo /usr/local/bin/netbird)
 if [ -x "$_NB_BIN" ]; then
   _MESH_TMP=$("$_NB_BIN" status 2>/dev/null | sed -n 's/^NetBird IP: //p' | head -1)
-  [ -n "$_MESH_TMP" ] && _MESH_DNS_IP="${_MESH_TMP%%/*}"
+  case "${_MESH_TMP%%/*}" in
+    [0-9]*.[0-9]*.[0-9]*.[0-9]*) _MESH_DNS_IP="${_MESH_TMP%%/*}" ;;
+  esac
 fi
 printf 'server:\nlocal-zone: "cdn.jsdelivr.net" redirect\nlocal-data: "cdn.jsdelivr.net. 300 IN A %s"\n' "$_MESH_DNS_IP" >> "$STACKDIR/unbound.conf"
+# the stack containers resolve redoubt.remote through this same pair:
+# the pi-hole record serves the LAN devices, the unbound pair serves
+# the containers (their dns is 172.28.0.53, they never ask the pi-hole)
+printf 'local-zone: "redoubt.remote" redirect\nlocal-data: "redoubt.remote. 300 IN A %s"\n' "$_MESH_DNS_IP" >> "$STACKDIR/unbound.conf"
 dbg "OK: private resolver config written (Quad9 over TLS)"
   # a re-run rewrites the resolver file; the container reads it only
   # at boot, so bounce it when it is already up
@@ -2815,8 +3190,8 @@ pull_stack() {
         # just technical noise then, so it stays in the log only
         if [ "${RERUN:-0}" != "1" ]; then
           [ ${#nm} -gt 44 ] && nm="${nm:0:41}${TRUNC}"
-          printf '\r\033[K' >&3
-          printf "  ${EM2}image done: %s\033[0m\n" "$nm" >&3
+          [ -t 3 ] && printf '\r\033[K' >&3
+          pl_cascade "pulled $nm"
         fi
       done
       LAST_N=$N
@@ -2847,6 +3222,68 @@ pull_stack() {
   draw_bar "$SEG_END" "stack pulled - $N_IMG/$N_IMG images"
 }
 
+stack_up() {  # $1 = extra compose args (e.g. --profile selfhost)
+  # the up is the longest silent stretch of the pass: stream each
+  # container verdict to the terminal so the screen reads as work
+  # happening, never as frozen. The animator stops first (its \r
+  # repaint would smear the cascade); the log keeps the full stream.
+  anim_stop
+  # shellcheck disable=SC2086
+  # --profile is a GLOBAL flag on compose v5.x (before the subcommand):
+  # "up -d --profile selfhost" dies with "unknown flag: --profile" and
+  # the coordinator never deploys. $1 rides in FRONT of the subcommand.
+  docker compose $1 up -d 2>&1 | tee -a "$COMP_OUT" | while IFS= read -r L; do
+    printf '%s\n' "$L" >> "$LOG"
+    case "$L" in
+      *Started*|*Running*|*Created*|*Recreated*)
+        pl_cascade "${L#"${L%%[![:space:]]*}"}" "$EM1" ;;
+      *rror*|*ailed*)
+        pl_cascade "${L#"${L%%[![:space:]]*}"}" "$ERR" ;;
+    esac
+  done
+}
+
+# dockerd recreates bridge devices only at daemon start: a network object
+# that survived a wipe (local-kv.db is not part of the data tree) can
+# point at a br- device the kernel no longer has, and every container
+# then sticks in Created with "Device does not exist"
+bridge_dead() {
+  local _n _id _dev
+  for _n in $(docker network ls --format '{{.Name}}' 2>/dev/null | grep '^redoubt_'); do
+    [ "$(docker network inspect -f '{{.Driver}}' "$_n" 2>/dev/null)" = "bridge" ] || continue
+    _id=$(docker network inspect -f '{{.Id}}' "$_n" 2>/dev/null) || continue
+    _dev=$(docker network inspect -f '{{index .Options "com.docker.network.bridge.name"}}' "$_n" 2>/dev/null)
+    [ -n "$_dev" ] && [ "$_dev" != "<no value>" ] || _dev="br-${_id:0:12}"
+    ip link show "$_dev" >/dev/null 2>&1 || { dbg "bridge $_dev of $_n is missing"; return 0; }
+  done
+  return 1
+}
+# network prune skips networks referenced by any container, Created ones
+# included, so the containers go first, then the network object, then a
+# daemon restart rebuilds the bridge and its iptables chains
+bridge_heal() {
+  local _n
+  docker compose --profile '*' down --remove-orphans >> "$LOG" 2>&1 || true
+  for _n in $(docker network ls --format '{{.Name}}' 2>/dev/null | grep '^redoubt_'); do
+    docker network rm "$_n" >> "$LOG" 2>&1 || true
+  done
+  systemctl restart docker >> "$LOG" 2>&1 || true
+  sleep 4
+}
+# -a matters: plain ps omits Created containers, so a stack stuck before
+# networking read 0/0 and every full-count gate went blind
+stack_ps() {
+  if [ "$MESH_MODE" = "cloud" ]; then
+    docker compose ps -a --format '{{.Name}} {{.State}}' | grep -vE 'redoubt-(netbird|dashboard|mesh-router|mesh-wait)-1'
+  else
+    docker compose ps -a --format '{{.Name}} {{.State}}' | grep -v 'redoubt-mesh-wait-1'
+  fi
+}
+if bridge_dead; then
+  bridge_heal
+  log "OK: dead docker bridge cleared before the stack comes up"
+fi
+
 case "$MESH_MODE" in
   cloud)
     dbg "OK: mesh mode cloud (NetBird brokers the handshake)"
@@ -2858,24 +3295,44 @@ case "$MESH_MODE" in
     # them so only the cloud set runs
     docker compose --profile selfhost rm -sf netbird dashboard mesh-router mesh-wait >> "$LOG" 2>&1 || true
     COMP_OUT=/tmp/redoubt-compose-out.$$
-    docker compose up -d 2>&1 | tee -a "$COMP_OUT" >> "$LOG"
+    stack_up ""
     ;;
   selfhost)
     IMGS=$(docker compose --profile selfhost config --images 2>/dev/null)
     N_IMG=$(echo "$IMGS" | wc -w)
     pull_stack
     COMP_OUT=/tmp/redoubt-compose-out.$$
-    docker compose --profile selfhost up -d 2>&1 | tee -a "$COMP_OUT" >> "$LOG"
+    stack_up "--profile selfhost"
     ;;
 esac
+# boot grace: right after the up, a service can crash once or twice while
+# its dependency finishes the first migration (immich-server queries
+# system_metadata before postgres has the table) and compose restarts it
+# within ~30-60s. A single snapshot in that window counted 14/15 and
+# fail-closed a healthy pass. Re-check while any container is restarting
+# or still created, 8 tries x 20s (~160s). exited/dead and an empty list
+# are final and never wait. Leaves the last snapshot in _SETTLE_PS.
+stack_settle() {
+  local _i=0 _up _tot _wait
+  while :; do
+    _SETTLE_PS=$(stack_ps)
+    _up=$(printf '%s\n' "$_SETTLE_PS" | awk '$2=="running"{n++} END{print n+0}')
+    _tot=$(printf '%s\n' "$_SETTLE_PS" | awk 'NF{n++} END{print n+0}')
+    _wait=$(printf '%s\n' "$_SETTLE_PS" | awk '$2=="restarting"||$2=="created"{n++} END{print n+0}')
+    if [ "$_tot" -eq 0 ] || [ "$_up" -eq "$_tot" ] || [ "$_wait" -eq 0 ] || [ "$_i" -ge 8 ]; then
+      break
+    fi
+    _i=$((_i + 1))
+    printf '%s\n' "$_SETTLE_PS" | awk '$2!="running"{print "  " $1 " " $2}' >> "$LOG"
+    log "  ${EM2}stack ${_up}/${_tot} up${RESET} ${EMD}${_wait} starting, grace ${_i}/8${RESET}"
+    sleep 20
+  done
+}
 # the count is mode-aware: the other mode's containers must never leak
 # into the number (a jump used to read 16/16 while the mesh-wait helper
 # was still standing). One stack, the active mode's services only.
-if [ "$MESH_MODE" = "cloud" ]; then
-  _STACK_PS=$(docker compose ps --format '{{.Name}} {{.State}}' | grep -vE 'redoubt-(netbird|dashboard|mesh-router|mesh-wait)-1')
-else
-  _STACK_PS=$(docker compose ps --format '{{.Name}} {{.State}}' | grep -v 'redoubt-mesh-wait-1')
-fi
+stack_settle
+_STACK_PS=$_SETTLE_PS
 printf '%s' "$_STACK_PS" >> "$LOG"
 _STACK_SUM=$(printf '%s' "$_STACK_PS" | awk -v c="$EM2" '$2=="running"{up++} END{printf "  %sstack: %d/%d containers running\033[0m", c, up, NR}')
 log "$_STACK_SUM"
@@ -2885,6 +3342,10 @@ log "$_STACK_SUM"
 # the verdict, not silence
 _STACK_UP=$(printf '%s' "$_STACK_PS" | awk '$2=="running"{n++} END{print n+0}')
 _STACK_TOT=$(printf '%s' "$_STACK_PS" | wc -l)
+# re-pin the bar: the anim died for the cascade above, and the zones
+# after the stack (mtu, firewall, certs) print nothing - the spinning
+# dot keeps the screen alive through them
+draw_bar "$SEG_END" "stack: ${_STACK_UP}/${_STACK_TOT} containers running" 2>/dev/null || true
 if [ "$_STACK_UP" = "$_STACK_TOT" ] && [ "${_STACK_TOT:-0}" -gt 0 ] \
    && grep -q 'unexpectedly nil' "$COMP_OUT" 2>/dev/null; then
   log "OK: stack back up (a container had a stale layer from an interrupted run)"
@@ -2899,14 +3360,44 @@ fi
 _STACK_DOWN=$(printf '%s' "$_STACK_PS" | awk '$2=="exited"||$2=="dead"{print $1}' | head -1)
 if [ -n "$_STACK_DOWN" ] && grep -q 'unexpectedly nil' "$COMP_OUT" 2>/dev/null; then
   docker rm -f "$_STACK_DOWN" >/dev/null 2>&1 || true
-  docker compose up -d >> "$LOG" 2>&1 || true
+  # the profile flag matters here: without it the selfhost services
+  # (netbird-server, dashboard) never heal
+  docker compose --profile '*' up -d >> "$LOG" 2>&1 || true
   log "OK: stack rebuilt ($_STACK_DOWN had a stale layer)"
   # the verdict must match what the owner sees: recount after the heal
-  _STACK_PS2=$(docker compose ps --format '{{.Name}} {{.State}}' | grep -vE 'redoubt-(netbird|dashboard|mesh-router|mesh-wait)-1')
+  _STACK_PS2=$(stack_ps)
   _STACK_SUM2=$(printf '%s' "$_STACK_PS2" | awk -v c="$EM2" '$2=="running"{up++} END{printf "  %sstack: %d/%d containers running\033[0m", c, up, NR}')
   log "$_STACK_SUM2"
 fi
+# a lab wipe (or a host restore) can leave a docker NETWORK whose
+# bridge device is gone: every container sticks in Created with
+# "failed to set up container networking ... Device does not exist".
+# The network objects survive volume wipes, so prune the dead one,
+# restart the daemon (its iptables chains die with the bridge surgery)
+# and re-create the stack on a fresh bridge. Proved live on a hung
+# pass: the wake checks never recover without this, they only wait.
+if grep -q 'failed to set up container networking' "$COMP_OUT" 2>/dev/null || bridge_dead; then
+  bridge_heal
+  docker compose --profile '*' up -d >> "$LOG" 2>&1 || true
+  log "OK: docker network rebuilt (the old bridge died with a wipe); stack re-created"
+  _STACK_PS3=$(stack_ps)
+  _STACK_SUM3=$(printf '%s' "$_STACK_PS3" | awk -v c="$EM2" '$2=="running"{up++} END{printf "  %sstack: %d/%d containers running\033[0m", c, up, NR}')
+  log "$_STACK_SUM3"
+fi
 rm -f "$COMP_OUT"
+# the gate for everything after the stack (ad shield, panel seed, admin,
+# guardian): those steps only log WARNs on a dead stack and the pass used
+# to end looking half done. An empty count is a broken stack, not a pass.
+stack_settle
+_STACK_PSF=$_SETTLE_PS
+_STACK_UPF=$(printf '%s\n' "$_STACK_PSF" | awk '$2=="running"{n++} END{print n+0}')
+_STACK_TOTF=$(printf '%s\n' "$_STACK_PSF" | awk 'NF{n++} END{print n+0}')
+if [ "$_STACK_TOTF" -eq 0 ] || [ "$_STACK_UPF" -ne "$_STACK_TOTF" ]; then
+  printf '%s\n' "$_STACK_PSF" >> "$LOG"
+  log "FAIL: stack ${_STACK_UPF}/${_STACK_TOTF} containers running - the pass stops here (re-run the kit; see $LOG)"
+  fail_line "incomplete stack (see $LOG)" 2>/dev/null || true
+  exit 1
+fi
 
 # 5) MTU/MSS hardening. ISPs with WAN MTU under 1500 break Go's fat TLS hellos (e.g. PQ MLKEM).
 WANIF=$(ip route show default | awk '/default/ {print $5; exit}')
@@ -2921,10 +3412,13 @@ fi
 #    cloud: NetBird's servers broker the handshake with the user's setup
 #    key. The phone works from any network; no servers of ours involved.
 # a hard-killed agent leaves its wireguard interface behind, and the
-# next start makes wt1, then wt2: drop every stale one first so the
-# applet always shows a single clean tunnel
+# next start makes wt1, then wt2: drop every stale NETBIRD one first so
+# the applet always shows a single clean tunnel. Other wireguard
+# interfaces on the box (the owner's own VPNs) are not ours to touch.
 for _WT in $(ip -o link show type wireguard 2>/dev/null | awk -F': ' '{print $2}' | sed 's/@.*//'); do
-  ip link delete dev "$_WT" 2>/dev/null || true
+  case "$_WT" in
+    wt[0-9]*) ip link delete dev "$_WT" 2>/dev/null || true ;;
+  esac
 done
 if [ "$MESH_MODE" = "selfhost" ]; then
 if [ -z "${OWNER_PASS:-}" ]; then
@@ -3168,8 +3662,13 @@ for k in json.load(open(sys.argv[3])):
           NBOK=1
           # 0.79 ships the binary in /usr/bin (older releases used
           # /usr/sbin), so resolve the real path instead of hardcoding.
-          NBEXE=$(command -v netbird 2>/dev/null || echo /usr/bin/netbird)
+          # Drop the tarball copy BEFORE resolving: on a cloud->selfhost
+          # jump it sits first in PATH, the lookup would pin NBEXE to the
+          # file deleted right after, and every [ -x "$NBEXE" ] below
+          # would silently skip the service setup and the local join.
           rm -f /usr/local/bin/netbird
+          hash -r 2>/dev/null || true
+          NBEXE=$(command -v netbird 2>/dev/null || echo /usr/bin/netbird)
         fi
         rm -rf "$NBTMP"
       else
@@ -3190,16 +3689,33 @@ for k in json.load(open(sys.argv[3])):
     fi
     # The daemon: the GUI and tray speak to the agent over its local
     # socket, so the service has to run and come back after a reboot.
-    if [ -x "$NBEXE" ] && [ ! -S /var/run/netbird.sock ]; then
-      "$NBEXE" service install >/dev/null 2>&1 || true
-      "$NBEXE" service start >/dev/null 2>&1 || true
+    if [ -x "$NBEXE" ]; then
+      # a unit from a tarball-era install pins its start condition to
+      # /usr/local/bin/netbird; the deb moves the binary to /usr/bin
+      # and the old copy is removed, so that stale unit can never
+      # start again (every stop becomes permanent and the join dies
+      # on a dead daemon). Rewrite the unit when its condition path
+      # disagrees with the live binary.
+      NB_UNIT=/etc/systemd/system/netbird.service
+      NB_REAL=$(readlink -f "$NBEXE")
+      if [ -f "$NB_UNIT" ] && ! grep -q "ConditionFileIsExecutable=$NB_REAL" "$NB_UNIT" 2>/dev/null; then
+        rm -f "$NB_UNIT"
+        systemctl daemon-reload >/dev/null 2>&1 || true
+        dbg "OK: netbird unit rebuilt (its start condition pinned an old binary path)"
+      fi
+      if [ ! -f "$NB_UNIT" ]; then
+        "$NBEXE" service install >/dev/null 2>&1 || true
+      fi
+      if [ ! -S /var/run/netbird.sock ]; then
+        "$NBEXE" service start >/dev/null 2>&1 || true
+      fi
+      # the config wiped (disk image, reset): a restart rewrites it;
+      # an up would just 500 on it
+      if [ ! -f /var/lib/netbird/default.json ]; then
+        systemctl restart netbird >/dev/null 2>&1 || true
+      fi
       systemctl enable netbird >/dev/null 2>&1 || true
       dbg "OK: netbird service running"
-    elif [ -x "$NBEXE" ] && [ ! -f /var/lib/netbird/default.json ]; then
-      # daemon alive but its config was wiped (disk image, reset):
-      # a restart rewrites the config; an up would just 500 on it
-      systemctl restart netbird >/dev/null 2>&1 || true
-      dbg "OK: netbird service restarted to rebuild its config"
     fi
     # This milestone sits outside the conditionals. On a repatch the
     # agent may already be running, but the bar still has to walk its segment.
@@ -3326,6 +3842,18 @@ NBDESKTOP
     chmod 644 /etc/redoubt/netbird.version
   fi
     if [ -x "$NBEXE" ]; then
+      # a leftover unit from a tarball install keeps pointing at
+      # /usr/local/bin while the deb owns /usr/bin: the daemon then
+      # dies on its condition check and every up below fails on the
+      # missing socket. Realign the unit to the active binary first,
+      # mirroring the cloud block above.
+      if [ ! -S /var/run/netbird.sock ]; then
+        "$NBEXE" service uninstall >/dev/null 2>&1 || true
+        "$NBEXE" service install >/dev/null 2>&1 || true
+        systemctl daemon-reload >/dev/null 2>&1 || true
+        systemctl enable netbird >/dev/null 2>&1 || true
+        "$NBEXE" service start >/dev/null 2>&1 || true
+      fi
       UP=$("$NBEXE" status 2>/dev/null | tr 'A-Z' 'a-z')
       JOINED_LOCAL=0
       # an agent linked to the cloud belongs to a different network:
@@ -3333,33 +3861,62 @@ NBDESKTOP
       # coordinator, or the host silently keeps its cloud link while
       # the local mesh runs without it
       # a cloud (or lab) config would keep the daemon on the wrong
-      # management and the local up below never persists: clear it
-      nb_reset_stale_identity
+      # management and the local up below never persists: clear it.
+      # The wipe only runs when the identity really points elsewhere
+      # (cloud link, dead management, or no identity yet): a healthy
+      # local link must survive the pass untouched.
+      case "$UP" in
+        *netbird.cloud*|*disconnected*|"")
+          nb_reset_stale_identity
+          ;;
+      esac
       for _i in $(seq 1 30); do
         "$NBEXE" status >/dev/null 2>&1 && break
         sleep 1
       done
       UP=$("$NBEXE" status 2>/dev/null | tr 'A-Z' 'a-z')
-      case "$UP" in
-        *connected*) ;;
-        *)
+      # 'connected' alone is not enough: an agent still linked to
+      # NetBird's cloud also reports connected, and the local up below
+      # would just answer 'already connected' while the host stays on
+      # the wrong network. The cloud fqdn in the status is the tell.
+      if printf '%s' "$UP" | grep -q 'netbird.cloud'; then
+        "$NBEXE" down >/dev/null 2>&1 || true
+        systemctl stop netbird >/dev/null 2>&1 || true
+        pkill -9 -f '[n]etbird service' >/dev/null 2>&1 || true
+        sleep 2
+        rm -rf /var/lib/netbird
+        mkdir -p /var/lib/netbird
+        rm -f /etc/netbird/config.json
+        systemctl start netbird >/dev/null 2>&1 || true
+        sleep 3
+        UP=$("$NBEXE" status 2>/dev/null | tr 'A-Z' 'a-z')
+      fi
+      # a cloud link still alive after the reset masks the join: mark
+      # it unjoined so the local up below really runs instead of the
+      # 'already connected' no-op
+      if nb_connected "$UP"; then
+        printf '%s' "$UP" | grep -q 'netbird.cloud' && UP="needs-join"
+      fi
+      if ! nb_connected "$UP"; then
           # The setup key travels via a 600 file, never argv. Any
           # local user can read /proc cmdline while the join runs.
           printf '%s' "$HOST_KEY" > "$STACKDIR/.join-key.tmp"
           chmod 600 "$STACKDIR/.join-key.tmp"
-          UPERR=$(timeout -k 5 120 "$NBEXE" up --management-url "http://127.0.0.1:$PORT_NETBIRD" --disable-dns --setup-key-file "$STACKDIR/.join-key.tmp" 2>&1 || true)
+          UPERR=$(timeout -k 5 120 "$NBEXE" up --management-url "http://127.0.0.1:$PORT_NETBIRD" --disable-dns --dns-resolver-address 127.0.0.1:5053 --setup-key-file "$STACKDIR/.join-key.tmp" 2>&1 || true)
+          dbg "selfhost join attempt: $(printf '%s' "$UPERR" | tr '\n' ' ' | head -c 200)"
           rm -f "$STACKDIR/.join-key.tmp"
           for i in $(seq 1 30); do
             UP=$("$NBEXE" status 2>/dev/null | tr 'A-Z' 'a-z')
-            case "$UP" in *connected*) break ;; esac
+            nb_connected "$UP" && break
             sleep 10
           done
-          case "$UP" in *connected*) JOINED_LOCAL=1 ;; esac
-        ;;
-      esac
-      case "$UP" in
-        *connected*)
-          if [ "$JOINED_LOCAL" = "1" ]; then
+          nb_connected "$UP" && JOINED_LOCAL=1
+          [ "$JOINED_LOCAL" = "1" ] || dbg "selfhost join did not settle: $(printf '%s' "$UP" | tr '\n' ' ' | head -c 160)"
+      fi
+      if nb_connected "$UP"; then
+          if printf '%s' "$UP" | grep -q 'netbird.cloud'; then
+            dbg "WARNING: host still linked to the cloud, local join failed"
+          elif [ "$JOINED_LOCAL" = "1" ]; then
             dbg "OK: host joined its own mesh"
           else
             dbg "OK: host keeps its existing mesh link"
@@ -3376,11 +3933,207 @@ for p in json.load(sys.stdin):
         print(p.get('id', '')); break" 2>/dev/null)
       if [ -n "$PEER_ID" ]; then
         if [ -f "$PEER_ID_FILE" ] && [ "$(cat "$PEER_ID_FILE")" != "$PEER_ID" ]; then
-          echo "WARNING: the mesh peer identity changed (was $(cat "$PEER_ID_FILE"), now $PEER_ID). If you did not reinstall, the host key may have been used by another machine." >&3
+          dbg "mesh peer identity changed (was $(cat "$PEER_ID_FILE"), now $PEER_ID) - normal after a re-enroll, check the log if you did not reinstall"
         fi
         printf '%s\n' "$PEER_ID" > "$PEER_ID_FILE"
         chmod 600 "$PEER_ID_FILE"
       fi
+      # Certificate posture check (NetBird 0.81+, local coordinator only).
+      # The coordinator trusts the kit's own local CA (the caddy root the
+      # edge and the phone already trust: one CA, no new hierarchy) and
+      # this host holds a device cert signed by it under /etc/netbird/certs,
+      # where the Linux agent collects its proof. The cert is signed by the
+      # ROOT, never by caddy's intermediate: caddy rotates the intermediate
+      # every few days and a cert chained to a retired one would fail the
+      # check within a week. A copied cert without its key fails the signed
+      # challenge (repeated every 4h). Phones never send certificate
+      # proofs, so the check gates only the host group, never the Default
+      # policy the phone rides. Future desktop peers can join the certified
+      # group for the same protection. Every step is get-or-create.
+      # NOTE: while Default stays All to All the host still connects
+      # through it; this policy is the gate in place, it bites once Default
+      # narrows to the peers that cannot prove a cert (the phones).
+      case "${MESH_MODE:-}" in
+        selfhost|both)
+          NB_PKI=/var/lib/redoubt/caddy-local/caddy/pki/authorities/local
+          NB_CERTDIR=/etc/netbird/certs
+          NB_DEV_CRT="$NB_CERTDIR/redoubt-device.pem"
+          NB_DEV_KEY="$NB_CERTDIR/redoubt-device.key"
+          if [ ! -f "$NB_PKI/root.crt" ] || [ ! -f "$NB_PKI/root.key" ]; then
+            dbg "posture: local CA not on disk yet, device cert skipped (next pass)"
+          elif [ -z "${PAT:-}" ]; then
+            dbg "posture: no mesh PAT, certificate check skipped"
+          else
+            # the agent refuses symlinks: the dir and both files are real
+            [ -L "$NB_CERTDIR" ] && rm -f "$NB_CERTDIR"
+            install -d -m 700 -o root -g root "$NB_CERTDIR"
+            NB_DEV_OK=0
+            if [ -f "$NB_DEV_CRT" ] && [ ! -L "$NB_DEV_CRT" ] \
+               && [ -f "$NB_DEV_KEY" ] && [ ! -L "$NB_DEV_KEY" ] \
+               && openssl x509 -in "$NB_DEV_CRT" -noout -checkend 86400 >/dev/null 2>&1 \
+               && openssl verify -CAfile "$NB_PKI/root.crt" "$NB_DEV_CRT" >/dev/null 2>&1 \
+               && [ "$(openssl x509 -in "$NB_DEV_CRT" -noout -pubkey 2>/dev/null)" = "$(openssl pkey -in "$NB_DEV_KEY" -pubout 2>/dev/null)" ]; then
+              NB_DEV_OK=1
+              dbg "posture: device cert valid, kept"
+            fi
+            if [ "$NB_DEV_OK" = "0" ]; then
+              # never outlive the root that signs it
+              NB_ROOT_END=$(date -d "$(openssl x509 -in "$NB_PKI/root.crt" -noout -enddate 2>/dev/null | cut -d= -f2)" +%s 2>/dev/null || echo 0)
+              NB_DEV_DAYS=$(( (NB_ROOT_END - $(date +%s)) / 86400 - 1 ))
+              [ "$NB_DEV_DAYS" -gt 3650 ] && NB_DEV_DAYS=3650
+              if [ "$NB_DEV_DAYS" -lt 2 ]; then
+                dbg "WARNING: posture: local CA root expires too soon, device cert not issued"
+              else
+                NB_DEV_TMP=$(mktemp -d /tmp/nb-devcert.XXXXXX)
+                chmod 700 "$NB_DEV_TMP"
+                NB_DEV_CN="redoubt-device-$(hostname 2>/dev/null | cut -c1-40)"
+                # no EKU on purpose: a clientAuth-only EKU fails a verifier
+                # running with default options; no EKU means any usage
+                if openssl genpkey -algorithm EC -pkeyopt ec_paramgen_curve:P-256 \
+                     -out "$NB_DEV_TMP/dev.key" >/dev/null 2>&1 \
+                   && openssl req -new -key "$NB_DEV_TMP/dev.key" -subj "/CN=$NB_DEV_CN" \
+                     -out "$NB_DEV_TMP/dev.csr" >/dev/null 2>&1 \
+                   && openssl x509 -req -in "$NB_DEV_TMP/dev.csr" \
+                     -CA "$NB_PKI/root.crt" -CAkey "$NB_PKI/root.key" \
+                     -CAserial "$NB_DEV_TMP/root.srl" -CAcreateserial -days "$NB_DEV_DAYS" \
+                     -extfile <(printf 'basicConstraints=critical,CA:FALSE\nkeyUsage=critical,digitalSignature\n') \
+                     -out "$NB_DEV_TMP/dev.crt" >/dev/null 2>&1 \
+                   && cat "$NB_DEV_TMP/dev.crt" "$NB_PKI/root.crt" > "$NB_DEV_TMP/dev.pem"; then
+                  rm -f "$NB_DEV_KEY" "$NB_DEV_CRT"
+                  install -m 600 -o root -g root "$NB_DEV_TMP/dev.key" "$NB_DEV_KEY"
+                  install -m 600 -o root -g root "$NB_DEV_TMP/dev.pem" "$NB_DEV_CRT"
+                  dbg "OK: posture: device cert issued ($NB_DEV_CN, $NB_DEV_DAYS days)"
+                  # only on a fresh cert: the agent picks the new proof up
+                  # on start, then wait for the link to settle again
+                  systemctl restart netbird >/dev/null 2>&1 || true
+                  for _i in $(seq 1 30); do
+                    NB_PC_UP=$("$NBEXE" status 2>/dev/null | tr 'A-Z' 'a-z')
+                    nb_connected "$NB_PC_UP" && break
+                    sleep 2
+                  done
+                else
+                  dbg "WARNING: posture: device cert could not be issued"
+                fi
+                rm -rf "$NB_DEV_TMP"
+              fi
+            fi
+            NBAPI_PC="http://127.0.0.1:$PORT_NETBIRD/api"
+            NB_PC_TMP=$(mktemp /tmp/nb-posture.XXXXXX)
+            NB_PC_OUT=$(mktemp /tmp/nb-posture-out.XXXXXX)
+            NB_CHECK_NAME="Redoubt device certificate"
+            NB_CHECK_ID=""
+            NB_PC_RC=$(curl -s --max-time 20 -o "$NB_PC_TMP" -w '%{http_code}' \
+              "$NBAPI_PC/posture-checks" -H "Authorization: Bearer $PAT" 2>/dev/null || true)
+            if [ "$NB_PC_RC" = "200" ]; then
+              NB_CHECK_ID=$(python3 -c '
+import sys, json
+for c in json.load(open(sys.argv[1])):
+    if c.get("name") == sys.argv[2]:
+        print(c.get("id", "")); break
+' "$NB_PC_TMP" "$NB_CHECK_NAME" 2>/dev/null)
+              if [ -n "$NB_CHECK_ID" ]; then
+                dbg "posture: check present ($NB_CHECK_ID), left as is"
+                NB_CA_SAME=$(python3 -c '
+import sys, json
+want = "".join(open(sys.argv[3]).read().split())
+for c in json.load(open(sys.argv[1])):
+    if c.get("name") == sys.argv[2]:
+        cc = (c.get("checks") or {}).get("certificate_check") or {}
+        cas = cc.get("ca_certificates") or []
+        print("yes" if any("".join(x.split()) == want for x in cas) else "no"); break
+' "$NB_PC_TMP" "$NB_CHECK_NAME" "$NB_PKI/root.crt" 2>/dev/null)
+                [ "$NB_CA_SAME" = "no" ] && dbg "WARNING: posture: the check trusts another CA than the current local root (CA rebuilt?)"
+              else
+                python3 -c '
+import sys, json
+print(json.dumps({
+    "name": sys.argv[1],
+    "description": "device must hold a cert from the Redoubt local CA",
+    "checks": {"certificate_check": {"ca_certificates": [open(sys.argv[2]).read()]}},
+}))
+' "$NB_CHECK_NAME" "$NB_PKI/root.crt" > "$NB_PC_TMP" 2>/dev/null
+                NB_PC_RC=$(curl -s --max-time 20 -o "$NB_PC_OUT" -w '%{http_code}' -X POST \
+                  "$NBAPI_PC/posture-checks" -H "Authorization: Bearer $PAT" \
+                  -H "Content-Type: application/json" --data-binary @"$NB_PC_TMP" 2>/dev/null || true)
+                NB_CHECK_ID=$(python3 -c 'import sys,json; print(json.load(open(sys.argv[1])).get("id",""))' "$NB_PC_OUT" 2>/dev/null)
+                if [ -n "$NB_CHECK_ID" ]; then
+                  dbg "OK: posture: check created ($NB_CHECK_ID)"
+                else
+                  dbg "WARNING: posture: check create failed (http ${NB_PC_RC:-none}): $(head -c 160 "$NB_PC_OUT" 2>/dev/null | tr '\n' ' ')"
+                fi
+              fi
+            else
+              dbg "posture: check list unreadable (http ${NB_PC_RC:-none}), skipped this pass"
+            fi
+            if [ -n "$NB_CHECK_ID" ]; then
+              NB_POL_NAME="Redoubt certified hosts"
+              curl -s --max-time 20 -o "$NB_PC_TMP" "$NBAPI_PC/groups" -H "Authorization: Bearer $PAT" 2>/dev/null || true
+              NB_HG_ID=$(python3 -c '
+import sys, json
+print(next((g.get("id", "") for g in json.load(open(sys.argv[1])) if g.get("name") == sys.argv[2]), ""))
+' "$NB_PC_TMP" "host-$MESH_ID" 2>/dev/null)
+              NB_ALL_ID=$(python3 -c '
+import sys, json
+print(next((g.get("id", "") for g in json.load(open(sys.argv[1])) if g.get("name") == "All"), ""))
+' "$NB_PC_TMP" 2>/dev/null)
+              NB_POL_ID=""
+              NB_PC_RC=$(curl -s --max-time 20 -o "$NB_PC_TMP" -w '%{http_code}' \
+                "$NBAPI_PC/policies" -H "Authorization: Bearer $PAT" 2>/dev/null || true)
+              [ "$NB_PC_RC" = "200" ] && NB_POL_ID=$(python3 -c '
+import sys, json
+print(next((p.get("id", "") for p in json.load(open(sys.argv[1])) if p.get("name") == sys.argv[2]), ""))
+' "$NB_PC_TMP" "$NB_POL_NAME" 2>/dev/null)
+              if [ "$NB_PC_RC" != "200" ] || [ -z "$NB_HG_ID" ] || [ -z "$NB_ALL_ID" ]; then
+                dbg "posture: policy skipped (policies http ${NB_PC_RC:-none}, host group ${NB_HG_ID:-missing}, All ${NB_ALL_ID:-missing})"
+              else
+                python3 -c '
+import sys, json
+print(json.dumps({
+    "name": sys.argv[1],
+    "description": "the host group must prove the Redoubt device cert",
+    "enabled": True,
+    "source_posture_checks": [sys.argv[2]],
+    "rules": [{
+        "name": sys.argv[1],
+        "description": "certified host to everyone",
+        "enabled": True,
+        "action": "accept",
+        "bidirectional": True,
+        "protocol": "all",
+        "sources": [sys.argv[3]],
+        "destinations": [sys.argv[4]],
+    }],
+}))
+' "$NB_POL_NAME" "$NB_CHECK_ID" "$NB_HG_ID" "$NB_ALL_ID" > "$NB_PC_TMP" 2>/dev/null
+                if [ -n "$NB_POL_ID" ]; then
+                  NB_PC_RC=$(curl -s --max-time 20 -o "$NB_PC_OUT" -w '%{http_code}' -X PUT \
+                    "$NBAPI_PC/policies/$NB_POL_ID" -H "Authorization: Bearer $PAT" \
+                    -H "Content-Type: application/json" --data-binary @"$NB_PC_TMP" 2>/dev/null || true)
+                else
+                  NB_PC_RC=$(curl -s --max-time 20 -o "$NB_PC_OUT" -w '%{http_code}' -X POST \
+                    "$NBAPI_PC/policies" -H "Authorization: Bearer $PAT" \
+                    -H "Content-Type: application/json" --data-binary @"$NB_PC_TMP" 2>/dev/null || true)
+                fi
+                # read the answer back: a wrong field name is accepted
+                # silently, so prove the check id really landed
+                NB_POL_OK=$(python3 -c '
+import sys, json
+d = json.load(open(sys.argv[1]))
+pc = d.get("source_posture_checks") or []
+ids = [x.get("id") if isinstance(x, dict) else x for x in pc]
+print("ok" if sys.argv[2] in ids else "no")
+' "$NB_PC_OUT" "$NB_CHECK_ID" 2>/dev/null)
+                if [ "$NB_POL_OK" = "ok" ]; then
+                  dbg "OK: posture: policy '$NB_POL_NAME' gates host-$MESH_ID with the cert check"
+                else
+                  dbg "WARNING: posture: policy write http ${NB_PC_RC:-none}, check id not in the answer: $(head -c 160 "$NB_PC_OUT" 2>/dev/null | tr '\n' ' ')"
+                fi
+              fi
+            fi
+            rm -f "$NB_PC_TMP" "$NB_PC_OUT"
+          fi
+          ;;
+      esac
       # one wireguard profile is enough: network manager auto-creates a
       # profile each time the agent brings its interface up, and joins
       # across passes can pile up duplicate "wt0" entries in the network
@@ -3398,6 +4151,9 @@ for p in json.load(sys.stdin):
             sleep 5
           done
           case "$NETBIRD_IP" in *.*.*.*) ;; *) NETBIRD_IP="" ;; esac
+          # the remote records ride the settled address now, not the
+          # compose-time fallback
+          refresh_remote_dns
           if [ -n "$LAN_IP" ]; then
             # mgmt 0.79 dropped 'netbird routes add', so the home-network
             # route is created on the API (and the network itself when
@@ -3455,9 +4211,9 @@ for p in json.load(sys.stdin):
               dbg "OK: edge serves one cert for every address (lan, mesh, localhost)"
             fi
           fi
-        ;;
-        *) echo "WARNING: host agent not connected yet, devices work on LAN (join: $UPERR)" ;;
-      esac
+      else
+        echo "WARNING: host agent not connected yet, devices work on LAN (join: $UPERR)"
+      fi
     fi
   fi
 fi
@@ -3633,7 +4389,7 @@ NBDESK
         if [ "$JOIN_WAIT" = "1" ]; then
           for i in $(seq 1 30); do
             UP=$("$NBEXE" status 2>/dev/null | tr 'A-Z' 'a-z')
-            case "$UP" in *connected*) break ;; esac
+            nb_connected "$UP" && break
             sleep 10
           done
         fi
@@ -3644,10 +4400,7 @@ NBDESK
         # dead code on reruns and the customer never gets a second
         # chance to arm the nameserver.
         if [ -f /etc/redoubt/mesh-ns-pending ]; then
-          if [ -n "${ANIM_PID:-}" ]; then
-            kill -9 "$ANIM_PID" 2>/dev/null || true
-          fi
-          printf '\r\033[K' >&3
+          anim_stop
           echo "Cloud link live, but the nameserver did not arm in the previous run" >&3 2>/dev/null || true
           echo "paste a fresh admin token to arm it now (it dies right after)" >&3 2>/dev/null || true
           read_cloud_key "Type your NetBird API token: "
@@ -3661,14 +4414,10 @@ NBDESK
               echo "not a token - skipped (a later pass can retry the shield)" >&3 2>/dev/null || true
               ;;
           esac
-          if [ -t 3 ]; then
-            bar_anim &
-            ANIM_PID=$!
-          fi
+          anim_start
         fi
     fi
-    case "$UP" in
-      *connected*)
+    if nb_connected "$UP"; then
         dbg "OK: host joined NetBird cloud"
         NETBIRD_IP=""
         for _NBT in $(seq 1 6); do
@@ -3676,6 +4425,12 @@ NBDESK
           case "$NETBIRD_IP" in *.*.*.*) break ;; esac
           sleep 2
         done
+        # a disconnected client prints "NetBird IP: N/A": the cut
+        # above turns that into a bare N, which would ride into the
+        # remote records and the unbound config as a real address, so
+        # the value is validated and dropped before anything reads it
+        case "$NETBIRD_IP" in *.*.*.*) ;; *) NETBIRD_IP="" ;; esac
+        refresh_remote_dns
         if [ -n "$LAN_IP" ]; then
           "$NBEXE" routes add --network "${LAN_IP%.*}.0/24" --description "home network" >/dev/null 2>&1
           dbg "OK: home network announced"
@@ -3704,9 +4459,9 @@ NBDESK
             dbg "OK: edge serves one cert for every address (lan, mesh, localhost)"
           fi
         fi
-      ;;
-      *) echo "WARNING: the cloud link is not up yet${NBUPE:+ (join: $NBUPE)}; devices work on LAN" ;;
-    esac
+    else
+      echo "WARNING: the cloud link is not up yet${NBUPE:+ (join: $NBUPE)}; devices work on LAN"
+    fi
   fi
 fi
 
@@ -3736,7 +4491,7 @@ check_netbird() {
     fi
     sleep 4
   done
-  printf "  ${ERR}FAIL: netbird not responding\033[0m\n" >&3
+  fail_line "netbird not responding"
   return 1
 }
 
@@ -3794,7 +4549,7 @@ check_edge() {
   wait $E2 2>/dev/null || true
   wait $E3 2>/dev/null || true
 
-[ $RC -eq 0 ] && step "stack healthy" && echo "OK: redoubt v1 complete on $ID ${VERSION_ID:-rolling}, stack alive" >> "$LOG" || { echo "FAIL: incomplete stack (see $LOG)" >&3; }
+[ $RC -eq 0 ] && step "stack healthy" && echo "OK: redoubt v1 complete on $ID ${VERSION_ID:-rolling}, stack alive" >> "$LOG" || { fail_line "incomplete stack (see $LOG)"; }
 # the ad shield proves itself with a LOCAL query (redoubt.lan lives
 # in its own records): no internet needed, so the verdict never lies
 if docker ps --format '{{.Names}}' 2>/dev/null | grep -qx redoubt-pihole-1; then
@@ -3817,15 +4572,39 @@ if docker ps --format '{{.Names}}' 2>/dev/null | grep -qx redoubt-pihole-1; then
 fi
 # v6 keeps the blocklists in gravity.db, not in the adlists file (that
 # one only migrates once). The image ships with StevenBlack alone,
-# which leaves whole ad networks open: the kit adds OISD Big on every
-# install, plus the strict extra (1Hosts Xtra, ~1.5M domains) when
-# REDOUBT_ADLIST=strict asks for it. Idempotent: each list is checked
-# before it is written, so re-passes never duplicate rows. The db is
-# reached from the host through the named volume because the container
-# image does not ship sqlite3.
+# which leaves whole ad networks open: the kit replaces the defaults
+# with the Hagezi Pro++ family on every install (the same filter
+# sources Brave and uBlock build on), plus the Threat Intelligence
+# Feeds, the pop-up list and the fake/scam list. REDOUBT_ADLIST=strict
+# escalates the main tier to Ultimate. The set is REPLACED, never
+# stacked: the old-list rows are deleted first so a tier change
+# actually lands and re-passes never duplicate rows. The db is reached
+# from the host through the named volume because the container image
+# does not ship sqlite3.
+_ADL_HG="https://raw.githubusercontent.com/hagezi/dns-blocklists/main/adblock/pro.plus.txt"
+_ADL_HG_NAME="Hagezi Pro++"
+if [ "${REDOUBT_ADLIST:-}" = "strict" ]; then
+  _ADL_HG="https://raw.githubusercontent.com/hagezi/dns-blocklists/main/adblock/ultimate.txt"
+  _ADL_HG_NAME="Hagezi Ultimate"
+fi
 if docker ps --format '{{.Names}}' 2>/dev/null | grep -qx redoubt-pihole-1; then
   _ADL_CHANGED=0
-  for _ADL in "https://raw.githubusercontent.com/StevenBlack/hosts/master/hosts|StevenBlack" "https://big.oisd.nl/|OISD Big"; do
+  # the old set (image default + previous kit tiers) leaves the db so
+  # the replacement below is the whole truth of what blocks
+  python3 -c "
+import sqlite3
+c = sqlite3.connect('/var/lib/docker/volumes/redoubt_pihole-data/_data/gravity.db')
+old = ['https://raw.githubusercontent.com/StevenBlack/hosts/master/hosts',
+       'https://big.oisd.nl/',
+       'https://badmojr.github.io/1Hosts/Xtra/hosts.txt']
+n = c.execute('DELETE FROM adlist WHERE address IN (%s)' % ','.join('?'*len(old)), old).rowcount
+c.commit()
+print('removed:%d' % n)
+" 2>/dev/null | grep -q "removed:[1-9]" && _ADL_CHANGED=1
+  for _ADL in "$_ADL_HG|$_ADL_HG_NAME" \
+              "https://raw.githubusercontent.com/hagezi/dns-blocklists/main/adblock/tif.txt|Hagezi TIF" \
+              "https://raw.githubusercontent.com/hagezi/dns-blocklists/main/adblock/popupads.txt|Hagezi PopUp Ads" \
+              "https://raw.githubusercontent.com/hagezi/dns-blocklists/main/adblock/fake.txt|Hagezi Fake"; do
     _ADL_URL="${_ADL%%|*}"; _ADL_NAME="${_ADL##*|}"
     python3 -c "
 import sqlite3
@@ -3836,25 +4615,14 @@ if c.execute('SELECT COUNT(*) FROM adlist WHERE address = ?', ('$_ADL_URL',)).fe
     print('added')
 " 2>/dev/null | grep -q added && _ADL_CHANGED=1
   done
-  if [ "${REDOUBT_ADLIST:-}" = "strict" ]; then
-    python3 -c "
-import sqlite3
-c = sqlite3.connect('/var/lib/docker/volumes/redoubt_pihole-data/_data/gravity.db')
-if c.execute('SELECT COUNT(*) FROM adlist WHERE address = ?', ('https://badmojr.github.io/1Hosts/Xtra/hosts.txt',)).fetchone()[0] == 0:
-    c.execute('INSERT INTO adlist (address, enabled, comment) VALUES (?, 1, ?)', ('https://badmojr.github.io/1Hosts/Xtra/hosts.txt', '1Hosts Xtra'))
-    c.commit()
-    print('added')
-" 2>/dev/null | grep -q added && _ADL_CHANGED=1
-    dbg "strict adlists on (1Hosts Xtra): the shield holds ~1.5M domains, more RAM"
-  fi
   if [ "$_ADL_CHANGED" = "1" ]; then
     docker exec redoubt-pihole-1 pihole -g >/dev/null 2>&1 || true
     _ADL_N=$(python3 -c "
 import sqlite3
 c = sqlite3.connect('/var/lib/docker/volumes/redoubt_pihole-data/_data/gravity.db')
-print(c.execute('SELECT COUNT(*) FROM adlist').fetchone()[0])
+print(c.execute('SELECT COUNT(*) FROM gravity').fetchone()[0])
 " 2>/dev/null | tr -cd '0-9')
-    dbg "ad shield blocklists loaded: ${_ADL_N:-?}${REDOUBT_ADLIST:+ (strict)}"
+    dbg "ad shield blocklists loaded: ${_ADL_N:-?} domains (${_ADL_HG_NAME} + TIF)"
   fi
 fi
 
@@ -3896,53 +4664,183 @@ fi
 if [ "$MESH_MODE" = "selfhost" ]; then
   PANEL_LINE=" | https://$LAN_IP:$PORT_EDGE4 (panel)"
 else
-  PANEL_LINE=""
+  # the panel ships in cloud mode too: same edge door, redoubt address
+  PANEL_LINE=" | https://${REMOTE_HOST}:$PORT_EDGE4 (panel)"
 fi
+# the welcome refines REMOTE_HOST to the raw mesh IP when no PAT can
+# publish the zone; the credentials must carry the same value or the
+# creds and the vault disagree on the addresses
+[ "$MESH_MODE" != "selfhost" ] && [ ! -f /etc/redoubt/cloud-pat.txt ] \
+  && REMOTE_HOST="${NETBIRD_IP:-$LAN_IP}"
 cat > /etc/redoubt/credentials.txt <<EOF
 REDOUBT: your credentials (this file is the key to your cloud; keep it somewhere safe)
 user: $OWNER_USER
 pass: $OWNER_PASS
 on this machine: https://127.0.0.1:$PORT_EDGE1 (photos) | https://127.0.0.1:$PORT_EDGE2 (files) | https://127.0.0.1:$PORT_EDGE3 (search)$PANEL_LINE | http://127.0.0.1:$PORT_DOCKGE (stack manager)
-on any device (same wifi): https://$LAN_IP:$PORT_EDGE1 (photos) | https://$LAN_IP:$PORT_EDGE2 (files) | https://$LAN_IP:$PORT_EDGE3 (search)
+anywhere (mesh): https://${REMOTE_HOST}:$PORT_EDGE1 (photos) | https://${REMOTE_HOST}:$PORT_EDGE2 (files) | https://${REMOTE_HOST}:$PORT_EDGE3 (search)
+same wifi: https://${LAN_HOST}:$PORT_EDGE1 (photos) | https://${LAN_HOST}:$PORT_EDGE2 (files) | https://${LAN_HOST}:$PORT_EDGE3 (search)
+ad shield: https://${REMOTE_HOST}:$PORT_EDGE5/admin | (home) https://${LAN_HOST}:$PORT_EDGE5/admin
+phone cert: http://${REMOTE_HOST}:8086/ca (open it on the phone and install it)
 immich:  email $IMMICH_EMAIL | pass $OWNER_PASS
 nextcloud: user $OWNER_USER | pass $OWNER_PASS
 dockge:  user $OWNER_USER | pass $OWNER_PASS
-pi-hole: user $OWNER_USER | pass $OWNER_PASS (https://redoubt.lan:$PORT_EDGE5/admin)
-anywhere: $PHONE_LINE
+pi-hole: user $OWNER_USER | pass $OWNER_PASS
+phone sign-in: $PHONE_LINE
 EOF
 chmod 600 /etc/redoubt/credentials.txt
-echo ""
-if [ "$REINSTALL" != "1" ]; then
-  print_rule
-  printf "${EM1}  YOUR CREDENTIALS (generated by the kit)${RESET}\n"
-  printf '%b\n' "${EM2}  user: $OWNER_USER${RESET}"
-  printf '%b\n' "${EM2}  password: $OWNER_PASS${RESET}"
-  printf '%b\n' "${EM2}  immich (email): $IMMICH_EMAIL${RESET}"
-  echo "  saved to: Documents/My Redoubt/Access.txt (read it anytime with: redoubt creds)"
-  print_rule
-else
-  echo "credentials kept from your first install (vault: Documents/My Redoubt/Access.txt, read anytime with: redoubt creds)"
-fi
+# the painter dies before the block: its \r repaint would leave bar text
+# trailing behind the shorter credential lines. The blank line is for the
+# terminal, so it rides fd 3 like the rest (a bare echo only fed the log).
+anim_stop
+# the credential block is gone: the reveal already lists the apps and the
+# owner reads user/pass from Access.txt (redoubt creds). Printing the
+# password to the terminal left it in the scrollback for nothing.
 
 # == 7z) the owner vault rides an encrypted store ==
 # Documents/My Redoubt is a gocryptfs mount. The same masterkey has two
-# wraps: the daily key derives from this machine's id (nothing secret on
-# disk, the store only opens on this box) and the owner's recovery phrase
-# (shown once below) opens it anywhere. The cipher directory sits next to
-# the mountpoint; the daily conf lives in /etc/redoubt, the recovery
-# phrase never touches the disk.
+# wraps: the daily key is a random keyfile (600, in the owner's home next
+# to the conf) and the owner's recovery phrase (shown once below) opens
+# it anywhere. The cipher directory sits next to the mountpoint; neither
+# the daily key nor the conf lives in /etc/redoubt (700 root, unreadable
+# by the owner), and the recovery phrase never touches the disk.
 VAULT_BIN=/usr/local/bin/gocryptfs
 VAULT_SHA="37ab7ee7e3f27cf96ba414a02d61e7810c730a4f95d0c7ee050bf3dbd048bacc"
+# the kernel motor: the dojo builds fscrypt v0.3.7 (bin + pam module)
+# and ships it through the release channel; the unpacked checksums are
+# pinned so a tampered tarball dies before anything runs. The distro
+# package (Debian/Ubuntu archives) comes first in the fetch below.
+FSCRYPT_BIN_SHA="8ca62527d1600175fd65e233b2d346f6ec4c2933468da5f93b6fd110c86e4c74"
+FSCRYPT_PAM_SHA="05bca66c0c889458ca806e87314ba9047ab0e7c63157d24126e5b992b461b558"
+gocryptfs_pf() {  # secret in GCFS_PW; remaining args go to gocryptfs
+  local d rc
+  d=$(mktemp -d /tmp/redoubt-pf.XXXXXX) || return 1
+  ( umask 077; printf '%s\n' "$GCFS_PW" > "$d/k" )
+  gocryptfs -passfile "$d/k" "$@"
+  rc=$?
+  rm -rf "$d"
+  return $rc
+}
 vault_derive() {
-  # the uid comes from the owner home itself, never from a saved name:
-  # an env can hold a literal like "owner" with no account behind it,
-  # and a key derived from a phantom user locks the store for good
-  printf 'redoubt-vault:%s:%s' "$(cat /etc/machine-id 2>/dev/null)" "$(stat -c %u "${OWNER_HOME:-$HOME}" 2>/dev/null || echo 0)" | sha256sum | cut -d' ' -f1
+  # the daily wrap: a random keyfile. The old formula hashed
+  # /etc/machine-id, which is world-readable, so any local user could
+  # derive the key and open the store. The keyfile keeps the "only
+  # this box" property without a public input. One file, generated on
+  # first use, never rotated: rotating it would orphan the existing
+  # cipher. The file lives next to the daily conf in the owner's home,
+  # 600 owner: /etc/redoubt is 700 root, so a key there could never be
+  # read by the login hook or the desktop helpers (the same trap the
+  # conf already dodged). A key left in /etc/redoubt by an earlier pass
+  # moves over byte for byte: a fresh key would orphan the cipher.
+  # OWNER_SYS_USER is the Linux account; OWNER_USER is the panel login
+  # and need not exist. No silent root fallback: an unresolved owner
+  # stops the vault with a hard warning.
+  _VAULT_OLDKEY=/etc/redoubt/vault-daily.key
+  _VAULT_UID=$(id -u "${OWNER_SYS_USER:-}" 2>/dev/null) || _VAULT_UID=""
+  _VAULT_GID=$(id -g "${OWNER_SYS_USER:-}" 2>/dev/null) || _VAULT_GID=""
+  if [ -z "${OWNER_SYS_USER:-}" ] || [ -z "$_VAULT_UID" ] || [ -z "$_VAULT_GID" ] \
+     || [ "$_VAULT_UID" = "0" ] || [ -z "${OWNER_HOME:-}" ]; then
+    dbg "WARNING: vault owner unresolved (OWNER_SYS_USER='${OWNER_SYS_USER:-}', home '${OWNER_HOME:-}') - no vault key"
+    return 1
+  fi
+  VAULT_KEYFILE="$OWNER_HOME/.local/share/redoubt/vault-daily.key"
+  # root writes into an owner-controlled tree: never follow a planted link
+  if [ -L "$VAULT_KEYFILE" ] || [ -L "$(dirname "$VAULT_KEYFILE")" ]; then
+    dbg "WARNING: the vault key path is a symlink - refused"
+    return 1
+  fi
+  mkdir -p "$(dirname "$VAULT_KEYFILE")" || { dbg "WARNING: could not create the vault key dir"; return 1; }
+  # the ancestors (.local, .local/share) may be born root 700 under the
+  # pass umask: hand the root-owned ones to the owner, only up to the home
+  _VKPAR="$(dirname "$VAULT_KEYFILE")"
+  while [ "$_VKPAR" != "$OWNER_HOME" ] && [ "$_VKPAR" != "/" ]; do
+    [ "$(stat -c %u "$_VKPAR" 2>/dev/null)" = "0" ] && chown "$_VAULT_UID:$_VAULT_GID" "$_VKPAR" 2>/dev/null
+    _VKPAR="$(dirname "$_VKPAR")"
+  done
+  if [ ! -s "$VAULT_KEYFILE" ] && [ -s "$_VAULT_OLDKEY" ]; then
+    if ( umask 077; cp "$_VAULT_OLDKEY" "$VAULT_KEYFILE" ) && cmp -s "$_VAULT_OLDKEY" "$VAULT_KEYFILE"; then
+      dbg "OK: vault key moved from /etc/redoubt to the owner's home"
+    else
+      dbg "WARNING: could not move the vault key to the owner's home"
+      rm -f "$VAULT_KEYFILE" 2>/dev/null || true
+      return 1
+    fi
+  fi
+  if [ ! -s "$VAULT_KEYFILE" ]; then
+    if ! ( umask 077; openssl rand -hex 32 2>/dev/null > "$VAULT_KEYFILE" ) \
+       || [ ! -s "$VAULT_KEYFILE" ]; then
+      dbg "WARNING: could not create the vault key file"
+      rm -f "$VAULT_KEYFILE" 2>/dev/null || true
+      return 1
+    fi
+  fi
+  chown "$_VAULT_UID:$_VAULT_GID" "$VAULT_KEYFILE" 2>/dev/null || { dbg "WARNING: vault key chown to $OWNER_SYS_USER failed"; return 1; }
+  chmod 600 "$VAULT_KEYFILE" 2>/dev/null || true
+  # the root copy is retired only once the home copy is proven identical
+  if [ -f "$_VAULT_OLDKEY" ]; then
+    if cmp -s "$_VAULT_OLDKEY" "$VAULT_KEYFILE"; then
+      rm -f "$_VAULT_OLDKEY"
+    else
+      dbg "WARNING: /etc/redoubt/vault-daily.key differs from the home key - kept for manual recovery"
+    fi
+  fi
+  cat "$VAULT_KEYFILE" 2>/dev/null
 }
 vault_mount() {
   # the daily wrap: only this box can derive the key
-  VAULT_KEY="$(vault_derive)"
+  VAULT_KEY="$(vault_derive)" || { dbg "WARNING: no vault key for the owner - mount skipped"; return 1; }
   VAULT_PRE=""
+  # a mount this pass already made is ours: keep it, do not sweep it
+  # (a re-mount races the dying fuse and loses the store; the fresh
+  # branch mounts right before the welcome, so the second call here
+  # found root's own fuse and tore it down - the two pass cycles of
+  # "vault mount failed")
+  # the mount table, never stat: a foreign fuse (the owner's login
+  # mount, no allow_other) answers EACCES to root's stat, so
+  # mountpoint -q read it as "not mounted" and the sweep never ran
+  # (the jump pass: "Invalid mountpoint ... permission denied").
+  # mountinfo escapes spaces as \040.
+  _MESC=$(printf '%s' "$MYREDOUBT" | sed 's/ /\\040/g')
+  _vault_mline() { grep -F -- " $_MESC " /proc/self/mountinfo 2>/dev/null | grep -F ' - fuse'; }
+  if _vault_mline | grep -Eq 'user_id=0(,|$)'; then
+    return 0
+  fi
+  # frees a foreign fuse on THIS folder; true only when the folder is
+  # really free (out of the table AND readable by root)
+  vault_sweep_foreign() {
+    local _p _x _n _pids="" _alive
+    if _vault_mline >/dev/null; then
+      # the gocryptfs serving THIS folder, by its own argv: mountinfo
+      # is per namespace, so the old match hit every vault on the box
+      # before the umount -l and none after it
+      for _p in $(pgrep -x gocryptfs 2>/dev/null); do
+        tr '\0' '\n' < "/proc/$_p/cmdline" 2>/dev/null \
+          | grep -qxF -e "$MYREDOUBT" -e "${VAULT_CIPHER:-/nonexistent}" && _pids="$_pids $_p"
+      done
+      # the clean close first, as the owner (runuser never prompts):
+      # it flushes and lets gocryptfs exit on its own
+      [ -n "${OWNER_SYS_USER:-}" ] && runuser -u "$OWNER_SYS_USER" -- fusermount -u "$MYREDOUBT" 2>/dev/null
+      # busy (the owner has it open): root detach, polite kill, hard kill
+      _vault_mline >/dev/null && { umount -l "$MYREDOUBT" 2>/dev/null || fusermount -u -z "$MYREDOUBT" 2>/dev/null; }
+      [ -n "$_pids" ] && kill $_pids 2>/dev/null
+      for _n in 1 2 3 4 5; do
+        _alive=""
+        for _x in $_pids; do kill -0 "$_x" 2>/dev/null && _alive=1; done
+        [ -z "$_alive" ] && break
+        sleep 1
+      done
+      for _x in $_pids; do kill -0 "$_x" 2>/dev/null && kill -9 "$_x" 2>/dev/null; done
+      sleep 1
+      # second pass: a mount still in the table gets one more detach
+      _vault_mline >/dev/null && { umount -l "$MYREDOUBT" 2>/dev/null; sleep 1; }
+    fi
+    _vault_mline >/dev/null && return 1
+    # a pending fuse can still answer EACCES: root must read the folder
+    [ ! -e "$MYREDOUBT" ] || ls -A "$MYREDOUBT" >/dev/null 2>&1
+  }
+  if ! vault_sweep_foreign; then
+    dbg "WARNING: a foreign fuse still holds $MYREDOUBT after the sweep - the vault is not mounted for the pass"
+    return 1
+  fi
   if ! mountpoint -q "$MYREDOUBT" 2>/dev/null; then
     # an older plain folder (dotfiles included) would block the mount:
     # park it, mount the store, then fold it back in
@@ -3950,18 +4848,192 @@ vault_mount() {
       VAULT_PRE=$(mktemp -d /tmp/redoubt-vault.XXXXXX) || return 1
       find "$MYREDOUBT" -mindepth 1 -maxdepth 1 -exec mv {} "$VAULT_PRE"/ \; 2>/dev/null
     fi
-    if ! gocryptfs -quiet -config "$VAULT_CONF" -passfile <(printf '%s\n' "$VAULT_KEY") "$VAULT_CIPHER" "$MYREDOUBT" 2>/dev/null; then
-      # never lose the plain files: put them back and stay plain
-      [ -n "$VAULT_PRE" ] && { find "$VAULT_PRE" -mindepth 1 -maxdepth 1 -exec mv {} "$MYREDOUBT"/ \; 2>/dev/null; rm -rf "$VAULT_PRE"; }
-      dbg "WARNING: vault mount failed - the owner folder stays encrypted"
-      return 1
+    # the mount error lands in the log now: a cipher the owner's
+    # desktop just opened fails with "resource busy", and a retry
+    # after the fuse release wins. Blind silence hid that race for
+    # two pass cycles.
+    VAULT_MOUNT_ERR=$(mktemp /tmp/redoubt-vault.XXXXXX) || return 1
+    if ! GCFS_PW="$VAULT_KEY" gocryptfs_pf -quiet -config "$VAULT_CONF" "$VAULT_CIPHER" "$MYREDOUBT" 2>"$VAULT_MOUNT_ERR"; then
+      dbg "vault mount error: $(tr '\n' ' ' < "$VAULT_MOUNT_ERR")"
+      # EACCES on the mountpoint is a foreign fuse that came back (the
+      # owner's login hook raced the sweep): sweep once more, then retry
+      grep -qi 'permission denied' "$VAULT_MOUNT_ERR" && vault_sweep_foreign
+      sleep 2
+      if ! GCFS_PW="$VAULT_KEY" gocryptfs_pf -quiet -config "$VAULT_CONF" "$VAULT_CIPHER" "$MYREDOUBT" 2>"$VAULT_MOUNT_ERR"; then
+        rm -f "$VAULT_MOUNT_ERR"
+        # never lose the plain files: put them back and stay plain. A
+        # failed mv must survive: rmdir only drops an EMPTY park, so a
+        # stuck file blocks the sweep instead of being deleted with it
+        [ -n "$VAULT_PRE" ] && {
+          find "$VAULT_PRE" -mindepth 1 -maxdepth 1 -exec mv {} "$MYREDOUBT"/ \; 2>/dev/null
+          find "$VAULT_PRE" -mindepth 1 -maxdepth 1 -exec mv -f {} "$MYREDOUBT"/ \; 2>/dev/null
+          rmdir "$VAULT_PRE" 2>/dev/null || dbg "WARNING: plain files stuck in $VAULT_PRE, kept for the owner"
+        }
+        dbg "WARNING: vault mount failed - the owner folder stays encrypted"
+        return 1
+      fi
     fi
-    [ -n "$VAULT_PRE" ] && { find "$VAULT_PRE" -mindepth 1 -maxdepth 1 -exec mv {} "$MYREDOUBT"/ \; 2>/dev/null; rm -rf "$VAULT_PRE"; }
+    rm -f "$VAULT_MOUNT_ERR"
+    # a welcome staged by a pass that met a foreign fuse lands now
+    if [ -d /var/lib/redoubt/welcome-pending ]; then
+      cp -a /var/lib/redoubt/welcome-pending/. "$MYREDOUBT"/ 2>/dev/null \
+        && rm -rf /var/lib/redoubt/welcome-pending \
+        || dbg "WARNING: the staged welcome did not fold in, kept in /var/lib/redoubt/welcome-pending"
+    fi
+    # fold the parked plain files into the mounted store; a stuck file
+    # must survive: rmdir only drops an EMPTY park
+    [ -n "$VAULT_PRE" ] && {
+      find "$VAULT_PRE" -mindepth 1 -maxdepth 1 -exec mv {} "$MYREDOUBT"/ \; 2>/dev/null
+      find "$VAULT_PRE" -mindepth 1 -maxdepth 1 -exec mv -f {} "$MYREDOUBT"/ \; 2>/dev/null
+      rmdir "$VAULT_PRE" 2>/dev/null || dbg "WARNING: plain files stuck in $VAULT_PRE, kept for the owner"
+    }
+  fi
+  # a fuse that survived the takeover is not ours: the welcome must
+  # not write into it (the writes would die and the owner would keep
+  # the previous pass's files). Only a root-owned mount is writable.
+  if ! mount | grep -q "$MYREDOUBT type fuse.*user_id=0"; then
+    dbg "WARNING: the vault did not mount for the pass (a foreign fuse holds it) - the welcome files stay plain"
+    return 1
   fi
   return 0
 }
+vault_crypt_fscrypt() {
+  # the kernel motor path (ext4/f2fs): the policy lives in the
+  # filesystem itself and the key rides a 600 file in the owner's home
+  # (the same threat model as the daily derive below: a disk thief
+  # gets ciphertext, the owner unlocks with zero prompts at login).
+  if ! command -v fscrypt >/dev/null 2>&1; then
+    # the distro's own package first (Debian and Ubuntu carry fscrypt +
+    # libpam-fscrypt in their archives); the dojo tarball covers
+    # distros without it, with the same pinned unpacked checksums
+    apt-get install -y -q fscrypt libpam-fscrypt >/dev/null 2>&1 \
+      || { apt-get update -q >/dev/null 2>&1; apt-get install -y -q fscrypt libpam-fscrypt >/dev/null 2>&1; } \
+      || dbg "NOTE: the fscrypt package did not install ($(apt-get install -y -q -s fscrypt 2>&1 | tail -1 | tr -s ' ')) - trying the dojo tarball"
+  fi
+  if ! command -v fscrypt >/dev/null 2>&1; then
+    FSCRYPT_TMP=$(mktemp -d /tmp/redoubt-fscrypt.XXXXXX) || return 1
+    curl -fsSL --retry 3 -o "$FSCRYPT_TMP/f.tar.gz" "https://install.tryredoubt.com/install/fscrypt-bin.tar.gz" 2>/dev/null \
+      || { dbg "WARNING: could not download fscrypt - the owner folder takes the fuse motor"; rm -rf "$FSCRYPT_TMP"; return 1; }
+    tar -xzf "$FSCRYPT_TMP/f.tar.gz" -C "$FSCRYPT_TMP" 2>/dev/null
+    [ "$(sha256sum "$FSCRYPT_TMP/fscrypt" 2>/dev/null | cut -d' ' -f1)" = "$FSCRYPT_BIN_SHA" ] \
+      && install -m 755 "$FSCRYPT_TMP/fscrypt" /usr/local/bin/fscrypt
+    [ "$(sha256sum "$FSCRYPT_TMP/pam_fscrypt.so" 2>/dev/null | cut -d' ' -f1)" = "$FSCRYPT_PAM_SHA" ] \
+      && install -m 644 "$FSCRYPT_TMP/pam_fscrypt.so" /usr/lib/security/pam_fscrypt.so
+    rm -rf "$FSCRYPT_TMP"
+    command -v fscrypt >/dev/null 2>&1 || { dbg "WARNING: fscrypt checksum mismatch - the fuse motor takes over"; return 1; }
+  fi
+  [ -f /etc/fscrypt.conf ] || fscrypt setup --force 2>/dev/null || true
+  VAULT_KEYFILE="$OWNER_HOME/.local/share/redoubt/vault.key"
+  # the owner uid comes from the home itself at the point of use,
+  # never from a variable a sibling branch sets
+  _FUID=$(stat -c %u "${OWNER_HOME:-$HOME}" 2>/dev/null || echo 0)
+  mkdir -p "$(dirname "$VAULT_KEYFILE")"
+  # the ancestors (.local, .local/share) may be born root-owned 700
+  # under this pass's umask: hand them to the owner or their own apps
+  # break. Only up to the home, never above.
+  if [ "$_FUID" != "0" ]; then
+    _VKPAR="$(dirname "$VAULT_KEYFILE")"
+    while [ "$_VKPAR" != "${OWNER_HOME:-$HOME}" ] && [ "$_VKPAR" != "/" ]; do
+      [ -d "$_VKPAR" ] && chown "$_FUID" "$_VKPAR" 2>/dev/null || true
+      _VKPAR="$(dirname "$_VKPAR")"
+    done
+  fi
+  if [ ! -f "$VAULT_KEYFILE" ]; then
+    head -c 32 /dev/urandom > "$VAULT_KEYFILE" || return 1
+    chmod 600 "$VAULT_KEYFILE"
+    [ "$_FUID" != "0" ] && chown "$_FUID" "$(dirname "$VAULT_KEYFILE")" "$VAULT_KEYFILE" 2>/dev/null || true
+  fi
+  if fscrypt status "$MYREDOUBT" >/dev/null 2>&1; then
+    # re-runs: the policy exists, just unlock and keep writing into it
+    fscrypt unlock --key="$VAULT_KEYFILE" "$MYREDOUBT" 2>/dev/null || true
+    return 0
+  fi
+  mkdir -p "$MYREDOUBT"
+  if ! fscrypt encrypt --quiet --source=raw_key --key="$VAULT_KEYFILE" --name=redoubt-vault "$MYREDOUBT" 2>/dev/null; then
+    dbg "WARNING: fscrypt encrypt failed - the owner folder stays plain"
+    return 1
+  fi
+  # the recovery: a second protector over the same policy. The phrase
+  # rides stdin (--stdin) instead of the terminal: a kit pass has no
+  # tty, and the old interactive prompts just hung or failed with the
+  # printed phrase wired to nothing. Two lines: enter + confirm.
+  VAULT_RECOVERY=$(tr -dc 'a-z0-9' < /dev/urandom | head -c 32)
+  # fd 3 only; the painter stops first so its repaint cannot smear the phrase
+  anim_stop
+  printf '\n  vault recovery phrase (copy it to your password manager - it is shown only once):\n  %s\n\n' "$VAULT_RECOVERY" >&3 2>/dev/null || true
+  FSCRYPT_MNT=$(findmnt -no TARGET -T "$MYREDOUBT" 2>/dev/null || echo "/")
+  RID=$(printf '%s\n%s\n' "$VAULT_RECOVERY" "$VAULT_RECOVERY" \
+    | fscrypt metadata create protector "$FSCRYPT_MNT" --source=custom_passphrase --name=redoubt-recovery --stdin 2>/dev/null \
+    | grep -o '[0-9a-f]\{16\}' | head -1)
+  if [ -n "$RID" ]; then
+    PID=$(fscrypt status "$MYREDOUBT" 2>/dev/null | grep '^Policy:' | awk '{print $2}')
+    # the add unlocks the policy with the daily key file, so the only
+    # prompt left is the protector's own passphrase: the phrase again
+    printf '%s\n' "$VAULT_RECOVERY" \
+      | fscrypt metadata add-protector-to-policy --protector="$FSCRYPT_MNT:$RID" --policy="$FSCRYPT_MNT:$PID" --key="$VAULT_KEYFILE" --stdin 2>/dev/null \
+      || dbg "WARNING: the recovery protector did not attach"
+  else
+    VAULT_RECOVERY=""
+    dbg "WARNING: the recovery protector was not created"
+  fi
+  return 0
+}
+
+# root-only marker: a recovery phrase is only "done" once a test mount
+# proved it. Without it, a re-run regenerates the phrase.
+VAULT_RECOVERY_MARK=/etc/redoubt/vault-recovery.verified
+# rewraps a temp copy of the daily conf with a fresh phrase, test-mounts
+# with that same copy, and only then installs it as the in-cipher conf.
+# A gocryptfs conf holds one wrapped master key, so testing the phrase
+# against the daily-key conf could never pass.
+vault_recovery_make() {
+  local _tmpc _mnt _phrase
+  VAULT_RECOVERY=""
+  _tmpc=$(mktemp /tmp/redoubt-recovery-conf.XXXXXX) || return 1
+  _mnt=$(mktemp -d /tmp/redoubt-recovery.XXXXXX) || { rm -f "$_tmpc"; return 1; }
+  cp "$VAULT_CONF" "$_tmpc"
+  _phrase=$(tr -dc 'a-z0-9' < /dev/urandom | head -c 32)
+  # -passwd asks for the new password twice
+  if ! GCFS_PW="$VAULT_KEY" gocryptfs_pf -passwd -quiet -config "$_tmpc" "$VAULT_CIPHER" <<PASSIN
+$_phrase
+$_phrase
+PASSIN
+  then
+    dbg "WARNING: vault rewrap with the recovery phrase failed"
+    rm -f "$_tmpc"; rmdir "$_mnt" 2>/dev/null
+    return 1
+  fi
+  # -ro: the daily mount may already hold the store, a read-only second
+  # mount proves the phrase without racing its writes
+  if GCFS_PW="$_phrase" gocryptfs_pf -quiet -ro -config "$_tmpc" "$VAULT_CIPHER" "$_mnt" 2>/dev/null; then
+    umount "$_mnt" 2>/dev/null || fusermount -u "$_mnt" 2>/dev/null || true
+    install -m 600 "$_tmpc" "$VAULT_CIPHER/gocryptfs.conf"
+    : > "$VAULT_RECOVERY_MARK" && chmod 600 "$VAULT_RECOVERY_MARK"
+    VAULT_RECOVERY="$_phrase"
+    dbg "OK: vault recovery phrase verified"
+  else
+    dbg "WARNING: the recovery phrase does not open the vault, it was dropped"
+  fi
+  rm -f "$_tmpc"; rmdir "$_mnt" 2>/dev/null || true
+  [ -n "$VAULT_RECOVERY" ]
+}
+
 vault_crypt() {
   [ -n "$MYREDOUBT" ] || return 0
+  # the kernel motor (fscrypt) only rides ext4/f2fs; every other
+  # filesystem (btrfs on Parrot/Fedora/openSUSE, xfs, zfs) takes the
+  # fuse motor below. The detection, not the motor, is the contract:
+  # the fscrypt branch installs its own binary, so a missing one is
+  # not a verdict - the function returns and the fuse takes over.
+  VAULT_FSTYPE=$(findmnt -no FSTYPE -T "$MYREDOUBT" 2>/dev/null || true)
+  case "$VAULT_FSTYPE" in
+    ext4|f2fs)
+      if vault_crypt_fscrypt; then
+        return 0
+      fi
+      dbg "NOTE: the fscrypt motor did not take - the vault rides the fuse motor this pass"
+      ;;
+  esac
   # the ciphertext hides as a dotfile next to the vault: the file
   # manager only shows the real folder, the raw store stays out of
   # sight (it is unreadable noise to anyone but the mount anyway)
@@ -3971,8 +5043,15 @@ vault_crypt() {
   VAULT_CONF="$OWNER_HOME/.local/share/redoubt/vault.gocryptfs.conf"
 
   # the binary: official static release, the unpacked binary checksum is
-  # pinned here so a tampered tarball dies before anything runs
-  if [ ! -x "$VAULT_BIN" ]; then
+  # pinned here so a tampered tarball dies before anything runs. The
+  # installed copy is re-compared on every pass: a bumped pin must
+  # replace an older binary instead of riding it silently.
+  # the pinned builds are x86_64 only: other arches must not burn a
+  # download on a checksum that can never match
+  [ "$(uname -m 2>/dev/null || true)" = "x86_64" ] \
+    || { dbg "WARNING: no pinned gocryptfs build for $(uname -m 2>/dev/null) - the owner folder stays plain"; return 1; }
+  if [ ! -x "$VAULT_BIN" ] \
+     || [ "$(sha256sum "$VAULT_BIN" 2>/dev/null | cut -d' ' -f1)" != "$VAULT_SHA" ]; then
     VAULT_TMP=$(mktemp -d /tmp/redoubt-vault.XXXXXX) || return 1
     curl -fsSL --retry 3 -o "$VAULT_TMP/g.tar.gz" "https://github.com/rfjakob/gocryptfs/releases/download/v2.6.1/gocryptfs_v2.6.1_linux-static_amd64.tar.gz" 2>/dev/null \
       || { dbg "WARNING: could not download gocryptfs - the owner folder stays plain"; rm -rf "$VAULT_TMP"; return 1; }
@@ -3993,34 +5072,80 @@ vault_crypt() {
 MODE="${1:-open}"
 V="$HOME/Documents/My Redoubt"
 C="$HOME/Documents/.My Redoubt.cipher"
-if ! mountpoint -q "$V" 2>/dev/null && [ -d "$C" ] && [ -x /usr/local/bin/gocryptfs ]; then
-  (printf 'redoubt-vault:%s:%s' "$(cat /etc/machine-id 2>/dev/null)" "$(id -u)" | sha256sum | cut -d' ' -f1 | gocryptfs -quiet -config "$HOME/.local/share/redoubt/vault.gocryptfs.conf" -passfile /dev/stdin "$C" "$V" 2>/dev/null) || true
+if command -v fscrypt >/dev/null 2>&1 && fscrypt status "$V" >/dev/null 2>&1; then
+  # the kernel motor (ext4/f2fs): unlock with the 600 key file
+  fscrypt unlock --key="$HOME/.local/share/redoubt/vault.key" "$V" 2>/dev/null || true
+elif ! mountpoint -q "$V" 2>/dev/null && [ -d "$C" ] && [ -x /usr/local/bin/gocryptfs ]; then
+  # the daily key file (600 owner, next to the conf). Pre-keyfile
+  # installs fall back to the old machine-id derivation so their
+  # stores keep opening.
+  K="$HOME/.local/share/redoubt/vault-daily.key"
+  if [ -s "$K" ]; then
+    (gocryptfs -quiet -config "$HOME/.local/share/redoubt/vault.gocryptfs.conf" -passfile "$K" "$C" "$V" 2>/dev/null) || true
+  else
+    (printf 'redoubt-vault:%s:%s' "$(cat /etc/machine-id 2>/dev/null)" "$(id -u)" | sha256sum | cut -d' ' -f1 | gocryptfs -quiet -config "$HOME/.local/share/redoubt/vault.gocryptfs.conf" -passfile /dev/stdin "$C" "$V" 2>/dev/null) || true
+  fi
 fi
 [ "$MODE" = "mount" ] || xdg-open "$V" 2>/dev/null || true
 VAULTOPEN
   chmod 755 /usr/local/bin/redoubt-vault-open
 
   if [ -f "$VAULT_CONF" ] && [ -d "$VAULT_CIPHER" ]; then
-    # re-runs: mount the store and keep writing into it
-    vault_mount || return 0
+    # re-runs: mount the store and keep writing into it. The desktop
+    # helpers run here too: a first pass whose mount failed left them
+    # out, and they are idempotent
+    vault_mount || { vault_helpers; return 0; }
+    # a pass that dropped the phrase left the store with no recovery
+    # path: make a new one from a fresh copy of the daily conf
+    if [ ! -f "$VAULT_RECOVERY_MARK" ]; then
+      dbg "NOTE: no verified vault recovery on record - regenerating the phrase"
+      vault_recovery_make || true
+    fi
+    vault_helpers
+    return 0
+  fi
+
+  # a crash between -init and the conf copy leaves a live cipher with
+  # no conf copy: repair the conf and take the re-run path, instead of
+  # re-running -init on a non-empty dir (which fails forever)
+  if [ ! -f "$VAULT_CONF" ] && [ -f "$VAULT_CIPHER/gocryptfs.conf" ]; then
+    mkdir -p "$(dirname "$VAULT_CONF")"
+    cp "$VAULT_CIPHER/gocryptfs.conf" "$VAULT_CONF"
+    chmod 600 "$VAULT_CONF"
+    dbg "OK: vault conf repaired from the cipher"
+    vault_mount || { vault_helpers; return 0; }
+    vault_helpers
     return 0
   fi
 
   mkdir -p "$VAULT_CIPHER" "$MYREDOUBT"
-  VAULT_KEY="$(vault_derive)"
-  gocryptfs -init -quiet -passfile <(printf '%s\n' "$VAULT_KEY") "$VAULT_CIPHER" 2>/dev/null \
+  VAULT_KEY="$(vault_derive)" || { dbg "WARNING: no vault key for the owner - the owner folder stays plain"; return 1; }
+  GCFS_PW="$VAULT_KEY" gocryptfs_pf -init -quiet "$VAULT_CIPHER" 2>/dev/null \
     || { dbg "WARNING: vault init failed - the owner folder stays plain"; return 1; }
   mkdir -p "$(dirname "$VAULT_CONF")"
   cp "$VAULT_CIPHER/gocryptfs.conf" "$VAULT_CONF"
   chmod 600 "$VAULT_CONF"
-  # the recovery phrase: random, shown to the owner once, never on disk
-  VAULT_RECOVERY=$(tr -dc 'a-z0-9' < /dev/urandom | head -c 32)
-  gocryptfs -passwd -quiet -passfile <(printf '%s\n' "$VAULT_KEY") "$VAULT_CIPHER" <<< "$VAULT_RECOVERY" 2>/dev/null \
-    || dbg "WARNING: vault rewrap with the recovery phrase failed"
-  vault_mount || { dbg "WARNING: the welcome files will stay plain this pass - re-run to fold them into the store"; return 0; }
-  # the owner owns the store and its keys: the daily mount runs as them
-  _VAULT_UID=$(stat -c %u "${OWNER_HOME:-$HOME}" 2>/dev/null || echo 0)
-  [ "$_VAULT_UID" != "0" ] && chown -R "$_VAULT_UID" "$VAULT_CIPHER" "$VAULT_CONF" "$MYREDOUBT" 2>/dev/null || true
+  # the recovery phrase: random, shown to the owner once, never on disk.
+  # A fresh store must not inherit a marker from a wiped one.
+  rm -f "$VAULT_RECOVERY_MARK"
+  vault_recovery_make || true
+  vault_mount || { dbg "WARNING: the welcome files will stay plain this pass - re-run to fold them into the store"; vault_helpers; return 0; }
+  vault_helpers
+  return 0
+}
+
+vault_helpers() {
+  # idempotent, runs every pass: the ownership fix, the graphical
+  # autostart entry and the login hook. A first pass whose mount
+  # failed must not leave the owner without them.
+  # uid:gid of the Linux owner: a uid-only chown left the conf group root
+  _VAULT_UID=$(id -u "${OWNER_SYS_USER:-}" 2>/dev/null || echo 0)
+  _VAULT_GID=$(id -g "${OWNER_SYS_USER:-}" 2>/dev/null || echo 0)
+  if [ "$_VAULT_UID" != "0" ] && [ "$_VAULT_GID" != "0" ]; then
+    chown -R "$_VAULT_UID:$_VAULT_GID" "$VAULT_CIPHER" "$(dirname "$VAULT_CONF")" "$MYREDOUBT" 2>/dev/null || true
+  else
+    dbg "WARNING: vault owner unresolved - ownership left as is"
+  fi
   # the graphical autostart: the vault mounts when the desktop session
   # starts, so the folder opens like any other from the file manager
   # even on desktops that never read .profile
@@ -4035,21 +5160,51 @@ Hidden=false
 NoDisplay=true
 X-GNOME-Autostart-enabled=true
 VAULTAUTO
-    chown "$OWNER_USER" "$OWNER_HOME/.config/autostart/redoubt-vault.desktop" 2>/dev/null || true
+    # OWNER_USER is the panel login and need not exist: a chown to it
+    # failed silently and left the entry 600 root, so it never fired
+    if [ "$_VAULT_UID" != "0" ] && [ "$_VAULT_GID" != "0" ]; then
+      chown "$_VAULT_UID:$_VAULT_GID" "$OWNER_HOME/.config/autostart" "$OWNER_HOME/.config/autostart/redoubt-vault.desktop" 2>/dev/null || true
+      [ "$(stat -c %u "$OWNER_HOME/.config" 2>/dev/null)" = "0" ] && chown "$_VAULT_UID:$_VAULT_GID" "$OWNER_HOME/.config" 2>/dev/null
+      chmod 644 "$OWNER_HOME/.config/autostart/redoubt-vault.desktop" 2>/dev/null || true
+    else
+      dbg "WARNING: vault owner unresolved - the autostart entry stays root-owned and will not fire"
+    fi
   fi
   # the login hook: the owner's shell mounts the vault on entry, so the
-  # folder opens like any other from the file manager
-  if [ -n "$OWNER_HOME" ] && [ -f "$OWNER_HOME/.profile" ] && ! grep -q 'redoubt-vault-mount' "$OWNER_HOME/.profile" 2>/dev/null; then
-    cat >> "$OWNER_HOME/.profile" <<'VAULTHOOK'
+  # folder opens like any other from the file manager. .profile on the
+  # debian family, .bash_profile where the distro only reads that one.
+  # an earlier pass appended a hook that reads the key from /etc/redoubt
+  # (unreadable for the owner); the marker below kept it from ever being
+  # refreshed. Drop that block so the loop appends the current one.
+  for _HOOKFILE in "$OWNER_HOME/.profile" "$OWNER_HOME/.bash_profile"; do
+    [ -n "$OWNER_HOME" ] && [ -f "$_HOOKFILE" ] && [ ! -L "$_HOOKFILE" ] \
+      && grep -q '/etc/redoubt/vault-daily.key' "$_HOOKFILE" 2>/dev/null || continue
+    _HOOKOWN=$(stat -c '%u:%g' "$_HOOKFILE")
+    sed -i '/^# redoubt-vault-mount:/,/^fi$/d' "$_HOOKFILE" && chown "$_HOOKOWN" "$_HOOKFILE" 2>/dev/null
+    dbg "OK: the old vault login hook was dropped from $_HOOKFILE"
+  done
+  _VAULT_HOOK=""
+  for _HOOKFILE in "$OWNER_HOME/.profile" "$OWNER_HOME/.bash_profile"; do
+    [ -n "$OWNER_HOME" ] && [ -f "$_HOOKFILE" ] && ! grep -q 'redoubt-vault-mount' "$_HOOKFILE" 2>/dev/null \
+      && { _VAULT_HOOK="$_HOOKFILE"; break; }
+  done
+  if [ -n "$_VAULT_HOOK" ]; then
+    cat >> "$_VAULT_HOOK" <<'VAULTHOOK'
 
-# redoubt-vault-mount: the owner vault mounts on login (only this box
-# can open it: the key derives from the machine id)
-if [ -d "$HOME/Documents/.My Redoubt.cipher" ] && ! mountpoint -q "$HOME/Documents/My Redoubt" 2>/dev/null && [ -x /usr/local/bin/gocryptfs ]; then
-  (printf 'redoubt-vault:%s:%s' "$(cat /etc/machine-id 2>/dev/null)" "$(id -u)" | sha256sum | cut -d' ' -f1 | gocryptfs -quiet -config "$HOME/.local/share/redoubt/vault.gocryptfs.conf" -passfile /dev/stdin "$HOME/Documents/.My Redoubt.cipher" "$HOME/Documents/My Redoubt" 2>/dev/null) || true
+# redoubt-vault-mount: the owner vault mounts on login (the daily key
+# lives next to the conf, 600 owner; pre-keyfile installs use the old
+# machine-id derivation so their stores keep opening)
+if command -v fscrypt >/dev/null 2>&1 && fscrypt status "$HOME/Documents/My Redoubt" >/dev/null 2>&1; then
+  fscrypt unlock --key="$HOME/.local/share/redoubt/vault.key" "$HOME/Documents/My Redoubt" 2>/dev/null || true
+elif [ -d "$HOME/Documents/.My Redoubt.cipher" ] && ! mountpoint -q "$HOME/Documents/My Redoubt" 2>/dev/null && [ -x /usr/local/bin/gocryptfs ]; then
+  if [ -s "$HOME/.local/share/redoubt/vault-daily.key" ]; then
+    (gocryptfs -quiet -config "$HOME/.local/share/redoubt/vault.gocryptfs.conf" -passfile "$HOME/.local/share/redoubt/vault-daily.key" "$HOME/Documents/.My Redoubt.cipher" "$HOME/Documents/My Redoubt" 2>/dev/null) || true
+  else
+    (printf 'redoubt-vault:%s:%s' "$(cat /etc/machine-id 2>/dev/null)" "$(id -u)" | sha256sum | cut -d' ' -f1 | gocryptfs -quiet -config "$HOME/.local/share/redoubt/vault.gocryptfs.conf" -passfile /dev/stdin "$HOME/Documents/.My Redoubt.cipher" "$HOME/Documents/My Redoubt" 2>/dev/null) || true
+  fi
 fi
 VAULTHOOK
   fi
-  return 0
 }
 
 # 8) Welcome: the folder, the guide, the QR codes and the panel seed,
@@ -4102,8 +5257,13 @@ VAULTHOOK
   fi
 SEED_SECTIONS="full"
 [ "$MESH_MODE" = "selfhost" ] && SEED_SECTIONS="minimal"
-for _i in $(seq 1 60); do
+# exec only reaches a running container: a homarr left in Created made
+# the gate wait out its whole window and skip the seed. Bring it up
+# first, and nudge it again every 5 minutes of the 15-minute window.
+docker compose -f "$STACKDIR/docker-compose.yml" up -d homarr >> "$LOG" 2>&1 || true
+for _i in $(seq 1 90); do
   docker compose -f "$STACKDIR/docker-compose.yml" exec -T homarr sh -c 'test -f /appdata/db/db.sqlite' >/dev/null 2>&1 && break
+  [ $((_i % 30)) -eq 0 ] && docker compose -f "$STACKDIR/docker-compose.yml" up -d homarr >> "$LOG" 2>&1
   sleep 10
 done
 if docker compose -f "$STACKDIR/docker-compose.yml" exec -T homarr sh -c 'test -f /appdata/db/db.sqlite' >/dev/null 2>&1; then
@@ -4112,14 +5272,35 @@ if docker compose -f "$STACKDIR/docker-compose.yml" exec -T homarr sh -c 'test -
   [ -z "${MYREDOUBT:-}" ] && MYREDOUBT="${OWNER_HOME:-/home/owner}/Documents/My Redoubt"
   # the vault (Access.txt) is the truth the owner types. A re-run can
   # hold a divergent pass in the env (the panel user then drifts from
-  # the vault), so the seed always hashes the vault pass
+  # the vault), so the seed always hashes the vault pass. The read
+  # only counts when the vault is really mounted: an unmounted plain
+  # dir holds no truth and must not override the env pass.
   _SEED_PASS="$OWNER_PASS"
-  _VAULT_PASS=$(awk -F': ' '/^[[:space:]]*pass:/ {print $2; exit}' "$MYREDOUBT/Access.txt" 2>/dev/null || true)
+  _VAULT_PASS=""
+  if mountpoint -q "$MYREDOUBT" 2>/dev/null; then
+    _VAULT_PASS=$(awk -F': ' '/^[[:space:]]*pass:/ {print $2; exit}' "$MYREDOUBT/Access.txt" 2>/dev/null || true)
+  fi
   [ -n "$_VAULT_PASS" ] && _SEED_PASS="$_VAULT_PASS"
-  SEED_OUT=$(docker compose -f "$STACKDIR/docker-compose.yml" exec -T \
-    -e SEED_USER="$OWNER_USER" -e SEED_EMAIL="$IMMICH_EMAIL" -e SEED_PASS="$_SEED_PASS" -e SEED_SECTIONS="$SEED_SECTIONS" \
-    -e SEED_PHOTOS="https://${SEED_HOST}:$PORT_EDGE1" -e SEED_FILES="https://${SEED_HOST}:$PORT_EDGE2" -e SEED_SEARCH="https://${SEED_HOST}:$PORT_EDGE3" -e SEED_PIHOLE="https://${SEED_HOST}:$PORT_EDGE5/admin" -e SEED_WHEREAMI="/whereami" -e SEED_CONSOLE="$SEED_CONSOLE" -e SEED_CONSOLE_PING="$SEED_CONSOLE_PING" \
-    homarr sh -c 'cat > /appdata/seed.js; node /appdata/seed.js; rc=$?; rm -f /appdata/seed.js; exit $rc' <<'SEEDJS'
+  # the seed rides stdin in two parts (env block, then the JS), so the
+  # owner password never appears in process arguments where any local
+  # user could read it with ps. The vault pass can hold anything the
+  # owner typed: single-quote it before it rides the env block.
+  _SEED_PASS_Q=$(printf '%s' "$_SEED_PASS" | sed "s/'/'\\\\''/g")
+  SEED_OUT=$( { cat <<SEEDENV
+SEED_USER=$OWNER_USER
+SEED_EMAIL=$IMMICH_EMAIL
+SEED_PASS='$_SEED_PASS_Q'
+SEED_SECTIONS=$SEED_SECTIONS
+SEED_PHOTOS=https://${SEED_HOST}:$PORT_EDGE1
+SEED_FILES=https://${SEED_HOST}:$PORT_EDGE2
+SEED_SEARCH=https://${SEED_HOST}:$PORT_EDGE3
+SEED_PIHOLE=https://${SEED_HOST}:$PORT_EDGE5/admin
+SEED_WHEREAMI=/whereami
+SEED_CONSOLE=$SEED_CONSOLE
+SEED_CONSOLE_PING=$SEED_CONSOLE_PING
+__SEED_JS__
+SEEDENV
+    cat <<'SEEDJS'
 // Redoubt panel seed: writes the admin, the app tiles and the finished
 // onboarding state, mirroring the wizard's own database writes. Runs
 // inside the homarr container with its own native modules only.
@@ -4144,6 +5325,9 @@ if docker compose -f "$STACKDIR/docker-compose.yml" exec -T homarr sh -c 'test -
   var USERNAME = process.env.SEED_USER || "owner";
   var EMAIL = process.env.SEED_EMAIL || "owner@redoubt.local";
   var PASSWORD = process.env.SEED_PASS || "";
+  // an empty password would bcrypt to a login that opens with nothing:
+  // refuse the seed instead of leaving a doorless panel
+  if (!PASSWORD) { console.error("homarr seed: no password given"); process.exit(3); }
   // the panel branding is the product's own: the default homarr
   // logo paths read as ghost icons on the login screen
   // the edge-local routes, not the public site: the panel is the
@@ -4200,17 +5384,19 @@ if docker compose -f "$STACKDIR/docker-compose.yml" exec -T homarr sh -c 'test -
     db.prepare("INSERT INTO groupMember (group_id, user_id) VALUES (?, ?)")
       .run(gid, uid);
   } else {
-    uid = db.prepare('SELECT id FROM "user" LIMIT 1').get().id;
+    var namedUser = db.prepare('SELECT id FROM "user" WHERE name = ?').get(USERNAME);
+    uid = namedUser ? namedUser.id : db.prepare('SELECT id FROM "user" LIMIT 1').get().id;
     // a re-run can arrive with a divergent env pass while the vault
     // holds the truth the owner types: re-hash every pass so the
-    // panel login always matches the vault
+    // panel login always matches the vault. The named user above keeps
+    // a multi-user board from re-hashing the wrong account.
     db.prepare('UPDATE "user" SET password = ? WHERE id = ?').run(hash, uid);
   }
 
   // one clean board: reuse the one the first boot seeded, or create it.
   // This runs on every pass: later passes refresh the branding and the
   // tile addresses, so a board seeded by an older build heals here too.
-  var board = db.prepare("SELECT id FROM board LIMIT 1").get();
+  var board = db.prepare("SELECT id FROM board WHERE name = 'Redoubt'").get() || db.prepare("SELECT id FROM board LIMIT 1").get();
   var boardId;
   if (board) {
     boardId = board.id;
@@ -4280,7 +5466,12 @@ if docker compose -f "$STACKDIR/docker-compose.yml" exec -T homarr sh -c 'test -
   }
 
   // drop the demo tiles, bookmark apps and default integrations the first
-  // boot seeded, then lay down the three Redoubt tiles
+  // boot seeded, then lay down the Redoubt tiles. Gated on a DB marker:
+  // a re-run must keep the owner's own tiles and integrations, so the
+  // wipe and the extras run once per database, and later passes only
+  // refresh the rows below.
+  var seeded = db.prepare("SELECT value FROM serverSetting WHERE setting_key = 'redoubt-seed-v2'").get();
+  if (!seeded) {
   db.prepare("DELETE FROM item_layout WHERE item_id IN (SELECT id FROM item WHERE board_id = ?)").run(boardId);
   db.prepare("DELETE FROM integration_item WHERE item_id IN (SELECT id FROM item WHERE board_id = ?)").run(boardId);
   db.prepare("DELETE FROM item WHERE board_id = ?").run(boardId);
@@ -4325,6 +5516,8 @@ if docker compose -f "$STACKDIR/docker-compose.yml" exec -T homarr sh -c 'test -
       db.prepare("INSERT INTO item_layout (item_id, section_id, layout_id, x_offset, y_offset, width, height) VALUES (?, ?, ?, ?, ?, ?, ?)")
         .run(extraItems[e], section.id, layouts[l].id, pos.x, pos.y, pos.w, pos.h);
     }
+  }
+  db.prepare("INSERT INTO serverSetting (setting_key, value) VALUES ('redoubt-seed-v2', 'done')").run();
   }
   for (var i = 0; i < APPS.length; i++) {
     var app = APPS[i];
@@ -4396,7 +5589,8 @@ if docker compose -f "$STACKDIR/docker-compose.yml" exec -T homarr sh -c 'test -
   console.log("homarr seed: done");
 })();
 SEEDJS
-  )
+  } | docker compose -f "$STACKDIR/docker-compose.yml" exec -T \
+    homarr sh -c 'cat > /appdata/seed.in && sed -n "/^__SEED_JS__\$/q;p" /appdata/seed.in > /appdata/seed.env && sed -n "/^__SEED_JS__\$/,\$p" /appdata/seed.in | tail -n +2 > /appdata/seed.js && set -a && . /appdata/seed.env && set +a && node /appdata/seed.js; rc=$?; rm -f /appdata/seed.js /appdata/seed.env /appdata/seed.in; exit $rc' )
   if printf '%s' "$SEED_OUT" | grep -qE "homarr seed: done"; then
     dbg "OK: panel seeded (admin, tiles, branding)"
   else
@@ -4414,27 +5608,36 @@ fi
 # next kit run retries.
 fetch_icon_set() {
   _ICON_NAME=$1; _ICON_URL=$2; _ICON_SHA=$3; _ICON_DEST=$4; _ICON_MAX=$5
-  if [ -f "/etc/redoubt/icons-${_ICON_NAME}.done" ]; then
+  # the marker keys on the pinned sha: a bumped pin refreshes the set
+  # instead of the name-only marker lying about it being current
+  if [ -f "/etc/redoubt/icons-${_ICON_NAME}-${_ICON_SHA:0:16}.done" ]; then
     return 0
   fi
+  # a fixed /tmp path used by root is a symlink-attack gift: download
+  # and extract only inside a private mktemp dir
+  _ICON_TMP=$(mktemp -d /tmp/redoubt-icons.XXXXXX) || { dbg "WARN: no temp dir for ${_ICON_NAME}, skipping"; return 1; }
+  chmod 700 "$_ICON_TMP"
   _ICON_OK=0
   for _TRY in 1 2 3; do
-    if curl -fsSL --max-time "$_ICON_MAX" -o "/tmp/icons-${_ICON_NAME}.tar.gz" "$_ICON_URL" 2>/dev/null \
-       && [ "$(sha256sum "/tmp/icons-${_ICON_NAME}.tar.gz" 2>/dev/null | cut -d' ' -f1)" = "$_ICON_SHA" ]; then
+    if curl -fsSL --max-time "$_ICON_MAX" -o "$_ICON_TMP/set.tar.gz" "$_ICON_URL" 2>/dev/null \
+       && [ "$(sha256sum "$_ICON_TMP/set.tar.gz" 2>/dev/null | cut -d' ' -f1)" = "$_ICON_SHA" ]; then
       _ICON_OK=1; break
     fi
     sleep 5
   done
   if [ "$_ICON_OK" = "1" ]; then
     mkdir -p "$_ICON_DEST"
-    tar -xzf "/tmp/icons-${_ICON_NAME}.tar.gz" -C "$_ICON_DEST"
-    touch "/etc/redoubt/icons-${_ICON_NAME}.done"
-    chmod 600 "/etc/redoubt/icons-${_ICON_NAME}.done"
-    dbg "OK: ${_ICON_NAME} icon set ready (offline, from the release edge)"
+    if tar -xzf "$_ICON_TMP/set.tar.gz" -C "$_ICON_DEST"; then
+      touch "/etc/redoubt/icons-${_ICON_NAME}-${_ICON_SHA:0:16}.done"
+      chmod 600 "/etc/redoubt/icons-${_ICON_NAME}-${_ICON_SHA:0:16}.done"
+      dbg "OK: ${_ICON_NAME} icon set ready (offline, from the release edge)"
+    else
+      dbg "WARN: the ${_ICON_NAME} icon set failed to extract (re-run the kit to retry)"
+    fi
   else
     dbg "WARN: the ${_ICON_NAME} icon set did not download (re-run the kit to retry)"
   fi
-  rm -f "/tmp/icons-${_ICON_NAME}.tar.gz"
+  rm -rf "$_ICON_TMP"
 }
 
 
@@ -4469,7 +5672,7 @@ if [ "${REDOUBT_WELCOME:-1}" = "1" ]; then
     "/var/lib/redoubt/caddy-local/cdn/gh/PapirusDevelopmentTeam/papirus_icons" \
     "600"
   dbg "OK: icon mirror counts: $(find /var/lib/redoubt/caddy-local/cdn -type f -name '*.png' 2>/dev/null | wc -l) png, $(find /var/lib/redoubt/caddy-local/cdn -type f -name '*.svg' 2>/dev/null | wc -l) svg"
-  chmod 644 /var/lib/redoubt/caddy-local/logo.png /var/lib/redoubt/caddy-local/favicon.ico /var/lib/redoubt/caddy-local/icons/*.svg
+  chmod 644 /var/lib/redoubt/caddy-local/logo.png /var/lib/redoubt/caddy-local/favicon.ico /var/lib/redoubt/caddy-local/icons/*.svg 2>/dev/null || true
   chmod 755 /var/lib/redoubt/caddy-local /var/lib/redoubt/caddy-local/icons
   chmod 755 /var/lib/redoubt
 
@@ -4534,6 +5737,9 @@ WantedBy=timers.target
 ICNTMR
   chmod 644 /etc/systemd/system/redoubt-icon-fix.service /etc/systemd/system/redoubt-icon-fix.timer
   systemctl daemon-reload >/dev/null 2>&1 || true
+  # a fresh arming gets a fresh budget: the counter below caps the
+  # timer's runs, and a re-run must not inherit a nearly-spent one
+  rm -f /etc/redoubt/.icon-fix-runs 2>/dev/null || true
   systemctl enable --now redoubt-icon-fix.timer >/dev/null 2>&1 || true
   if [ -f "/var/lib/docker/volumes/redoubt_homarr-data/_data/db/db.sqlite" ]; then
     N_ICONS=$(/etc/redoubt/redoubt-icon-fix.sh)
@@ -4547,18 +5753,55 @@ ICNTMR
   # pinned); the scan itself runs weekly through a systemd timer and
   # once shortly after the first boot. Read-only: it never touches the
   # running containers.
-  TRIVY_SHA="c7cbe3137fb8a48a17574bede3dd6beb16742d1e9772929940fc90082c39d9c0"
-  if [ ! -x /opt/redoubt/bin/trivy ]; then
+  TRIVY_SHA="d1dfca6ae10a1ad4540bb94e64f0510077c47008920a9b554986b39dca573d83"
+  # the pinned release is x86_64 only: skip other arches before the
+  # download instead of failing a checksum that can never match
+  [ "$(uname -m 2>/dev/null || true)" = "x86_64" ] || { dbg "WARN: no pinned trivy build for this arch, the weekly scan stays off"; return 1; }
+  # re-compare the installed binary on every pass: a bumped pin must
+  # replace the old scanner instead of riding it silently
+  if [ ! -x /opt/redoubt/bin/trivy ] \
+     || [ "$(sha256sum /opt/redoubt/bin/trivy 2>/dev/null | cut -d' ' -f1)" != "$TRIVY_SHA" ]; then
     mkdir -p /opt/redoubt/bin
-    if curl -fsSL --max-time 600 -o /tmp/trivy.tar.gz "https://github.com/aquasecurity/trivy/releases/download/v0.76.1/trivy_0.76.1_Linux-64bit.tar.gz" 2>/dev/null \
-       && [ "$(sha256sum /tmp/trivy.tar.gz 2>/dev/null | cut -d' ' -f1)" = "$TRIVY_SHA" ]; then
-      tar -xzf /tmp/trivy.tar.gz -C /opt/redoubt/bin trivy
-      chmod 755 /opt/redoubt/bin/trivy
-      dbg "OK: trivy scanner installed (sha verified, upstream release)"
+    # the tarball sha differs from the binary sha: the tarball is
+    # verified against the vendor's checksums file, and the extracted
+    # binary against the pin above. Downloads live in a private
+    # mktemp dir so nobody can plant a fixed /tmp file under root.
+    TRIVY_TMP=$(mktemp -d /tmp/redoubt-trivy.XXXXXX) || { dbg "WARN: trivy: no temp dir"; return 1; }
+    chmod 700 "$TRIVY_TMP"
+    # one step at a time with its exit code and curl stderr in the log:
+    # the old and-chain folded five different failures into one WARN
+    _TV_URL="https://github.com/aquasecurity/trivy/releases/download/v0.76.1"
+    _TV_TGZ="trivy_0.76.1_Linux-64bit.tar.gz"
+    _TV_OK=0
+    curl -fsSL --max-time 600 -o "$TRIVY_TMP/trivy.tar.gz" "$_TV_URL/$_TV_TGZ" 2>"$TRIVY_TMP/curl1.err"
+    _RC=$?; dbg "trivy: tarball curl rc=$_RC $(tr '\n' ' ' < "$TRIVY_TMP/curl1.err")"
+    if [ $_RC -eq 0 ]; then
+      curl -fsSL --max-time 60 -o "$TRIVY_TMP/checksums.txt" "$_TV_URL/trivy_0.76.1_checksums.txt" 2>"$TRIVY_TMP/curl2.err"
+      _RC=$?; dbg "trivy: checksums curl rc=$_RC $(tr '\n' ' ' < "$TRIVY_TMP/curl2.err")"
+    fi
+    if [ $_RC -eq 0 ]; then
+      # hash AND filename on the same line: a bare hash grep could match
+      # any asset of the release
+      _TV_HASH=$(sha256sum "$TRIVY_TMP/trivy.tar.gz" | cut -d' ' -f1)
+      grep -qE "^${_TV_HASH}[[:space:]]+\*?${_TV_TGZ}\$" "$TRIVY_TMP/checksums.txt"
+      _RC=$?; dbg "trivy: vendor checksum rc=$_RC (tarball sha $_TV_HASH)"
+    fi
+    if [ $_RC -eq 0 ]; then
+      tar -xzf "$TRIVY_TMP/trivy.tar.gz" -C "$TRIVY_TMP" trivy 2>"$TRIVY_TMP/tar.err"
+      _RC=$?; dbg "trivy: tar rc=$_RC $(tr '\n' ' ' < "$TRIVY_TMP/tar.err")"
+    fi
+    if [ $_RC -eq 0 ]; then
+      _TV_BIN=$(sha256sum "$TRIVY_TMP/trivy" | cut -d' ' -f1)
+      [ "$_TV_BIN" = "$TRIVY_SHA" ] && _TV_OK=1
+      dbg "trivy: binary sha $_TV_BIN pin $TRIVY_SHA match=$_TV_OK"
+    fi
+    if [ $_TV_OK -eq 1 ]; then
+      install -m 755 "$TRIVY_TMP/trivy" /opt/redoubt/bin/trivy
+      dbg "OK: trivy scanner installed (vendor checksum + pinned binary sha)"
     else
       dbg "WARN: trivy did not download (the weekly scan stays off; re-run the kit to retry)"
     fi
-    rm -f /tmp/trivy.tar.gz
+    rm -rf "$TRIVY_TMP"
   fi
   cat > /etc/redoubt/redoubt-scan.sh <<'SCAN'
 #!/usr/bin/env bash
@@ -4571,6 +5814,9 @@ CACHE=/var/lib/redoubt/trivy-cache
 SUMMARY="$OUT/last-scan.txt"
 RAW="$OUT/last-scan-full.txt"
 mkdir -p "$OUT" "$CACHE"
+# the reports name every vulnerable image and version: root and owner
+# only, never other local users
+chmod 700 "$OUT" 2>/dev/null || true
 [ -x "$TRIVY" ] || exit 0
 IMAGES=$(docker ps --format '{{.Image}}' 2>/dev/null | sort -u)
 [ -n "$IMAGES" ] || exit 0
@@ -4581,12 +5827,17 @@ TOTAL_H=0
   echo "Redoubt stack scan - $DATE"
   echo "------------------------------------"
   for IMG in $IMAGES; do
-    REPORT=$("$TRIVY" image --severity CRITICAL,HIGH --no-progress --cache-dir "$CACHE" --format json "$IMG" 2>/dev/null)
-    C=$(printf '%s' "$REPORT" | grep -oE '"Severity": ?"CRITICAL"' | wc -l)
-    H=$(printf '%s' "$REPORT" | grep -oE '"Severity": ?"HIGH"' | wc -l)
-    TOTAL_C=$((TOTAL_C + C))
-    TOTAL_H=$((TOTAL_H + H))
-    printf '%-36s %s CRITICAL / %s HIGH\n' "$IMG" "$C" "$H"
+    # a failed scan (offline DB download, bad image) must never read as
+    # "0 CRITICAL / 0 HIGH": only a trivy exit 0 counts as a result
+    if REPORT=$("$TRIVY" image --severity CRITICAL,HIGH --no-progress --cache-dir "$CACHE" --format json "$IMG" 2>/dev/null); then
+      C=$(printf '%s' "$REPORT" | grep -oE '"Severity": ?"CRITICAL"' | wc -l)
+      H=$(printf '%s' "$REPORT" | grep -oE '"Severity": ?"HIGH"' | wc -l)
+      TOTAL_C=$((TOTAL_C + C))
+      TOTAL_H=$((TOTAL_H + H))
+      printf '%-36s %s CRITICAL / %s HIGH\n' "$IMG" "$C" "$H"
+    else
+      printf '%-36s SCAN FAILED (no result)\n' "$IMG"
+    fi
   done
   echo "------------------------------------"
   echo "TOTALS: $TOTAL_C CRITICAL / $TOTAL_H HIGH across $(echo "$IMAGES" | wc -l) images"
@@ -4627,9 +5878,15 @@ Persistent=true
 WantedBy=timers.target
 SCANTMR
   systemctl daemon-reload >/dev/null 2>&1 || true
-  systemctl enable redoubt-scan.timer >/dev/null 2>&1 || true
-  systemctl start redoubt-scan.timer >/dev/null 2>&1 || true
-  dbg "OK: weekly stack scan armed (trivy, Sundays 03:00 + once after boot)"
+  # an armed timer without the scanner reported OK while scanning nothing
+  if [ -x /opt/redoubt/bin/trivy ]; then
+    systemctl enable redoubt-scan.timer >/dev/null 2>&1 || true
+    systemctl start redoubt-scan.timer >/dev/null 2>&1 || true
+    dbg "OK: weekly stack scan armed (trivy, Sundays 03:00 + once after boot)"
+  else
+    systemctl disable --now redoubt-scan.timer >/dev/null 2>&1 || true
+    dbg "WARN: weekly stack scan not armed (no trivy binary; re-run the kit to retry)"
+  fi
   case "$PKG_FAMILY" in
     pacman) pacman -S --noconfirm --needed qrencode >/dev/null 2>&1 ;;
     dnf)    dnf -y install qrencode >/dev/null 2>&1 ;;
@@ -4800,6 +6057,7 @@ CERT_URL="https://$REMOTE_HOST:$PORT_EDGE1/root-ca.crt"
           # the padlock is green before the owner ever touches it.
           for BASE in /home/*/.config/mozilla/firefox /home/*/.mozilla/firefox; do
             [ -d "$(dirname "$BASE")" ] || continue
+            _FF_OWN=$(stat -c %U "$(dirname "$(dirname "$BASE")")" 2>/dev/null || true)
             NEWPROF="$BASE/redoubt.default"
             mkdir -p "$NEWPROF"
             certutil -N -d "sql:$NEWPROF" --empty-password >/dev/null 2>&1
@@ -4818,6 +6076,12 @@ IsRelative=1
 Path=redoubt.default
 Default=1
 PROFILES
+            fi
+            # the profile must belong to the home's owner: Firefox runs
+            # as them, and a root-owned profile cannot be written
+            if [ -n "$_FF_OWN" ] && [ "$_FF_OWN" != "root" ]; then
+              chown -R "$_FF_OWN" "$NEWPROF" 2>/dev/null || true
+              [ -f "$INI" ] && chown "$_FF_OWN" "$INI" 2>/dev/null || true
             fi
           done
           [ "$FF_NAILED" -gt 0 ] && \
@@ -5002,12 +6266,32 @@ SCANNOTE
     OWNER_HOME=$(getent passwd "$SUDO_USER" 2>/dev/null | cut -d: -f6)
   fi
   [ -z "$OWNER_HOME" ] && OWNER_HOME=$(getent passwd | awk -F: '$3>=1000 && $3<65534 {print $6; exit}' 2>/dev/null)
+  # the Linux account that owns the vault. OWNER_USER is the panel login
+  # and need not exist on the box; mixing the two chgrp'ed the key to root.
+  OWNER_SYS_USER=""
+  if [ -n "${SUDO_USER:-}" ] && [ "$SUDO_USER" != "root" ] && id -u "$SUDO_USER" >/dev/null 2>&1; then
+    OWNER_SYS_USER="$SUDO_USER"
+  elif [ -n "$OWNER_HOME" ] && [ -d "$OWNER_HOME" ]; then
+    OWNER_SYS_USER=$(stat -c %U "$OWNER_HOME" 2>/dev/null || true)
+    case "$OWNER_SYS_USER" in root|UNKNOWN) OWNER_SYS_USER="" ;; esac
+  fi
+  dbg "vault owner: ${OWNER_SYS_USER:-unresolved} (home ${OWNER_HOME:-none})"
   if [ -n "$OWNER_HOME" ] && [ -d "$OWNER_HOME" ]; then
     MYREDOUBT="$OWNER_HOME/Documents/My Redoubt"
     vault_crypt
-    if [ -n "${VAULT_RECOVERY:-}" ]; then
-      printf '\n  vault recovery phrase (print it and keep it safe - it opens your vault on any machine):\n  %s\n\n' "$VAULT_RECOVERY" >&3 2>/dev/null || true
-      dbg "vault recovery phrase: $VAULT_RECOVERY (print it, do not store it anywhere else)"
+    # a fuse that is still not root's (the owner's own mount, no
+    # allow_other) denies every root write: stage the welcome in a
+    # root-only park and let the next root mount fold it in, instead
+    # of a stream of Permission denied under OK labels
+    WELCOME_STAGED=0
+    _MESC=$(printf '%s' "$MYREDOUBT" | sed 's/ /\\040/g')
+    if grep -F -- " $_MESC " /proc/self/mountinfo 2>/dev/null | grep -F ' - fuse' | grep -Eqv 'user_id=0(,|$)'; then
+      MYREDOUBT_REAL="$MYREDOUBT"
+      MYREDOUBT=/var/lib/redoubt/welcome-pending
+      rm -rf "$MYREDOUBT"
+      install -d -m 700 "$MYREDOUBT"
+      WELCOME_STAGED=1
+      dbg "WARNING: the owner's own vault mount holds My Redoubt - the welcome is staged and lands on the next pass"
     fi
     mkdir -p "$MYREDOUBT/Only for Thinkers"
     # A .directory file is the XFCE/Thunar-native way to pin the folder
@@ -5034,7 +6318,15 @@ SCANNOTE
       DLINE="$(grep '^XDG_DESKTOP_DIR=' "$OWNER_HOME/.config/user-dirs.dirs" 2>/dev/null | head -1 | cut -d= -f2- | tr -d '"')"
       [ -n "$DLINE" ] && DESKTOP_DIR="$(printf '%s' "$DLINE" | sed "s|\$HOME|$OWNER_HOME|")"
     fi
-    if [ -d "$DESKTOP_DIR" ] || mkdir -p "$DESKTOP_DIR" 2>/dev/null; then
+    # a Desktop that resolves outside the owner home (a planted symlink
+    # or an XDG override) must never receive root writes: resolve the
+    # real path and walk away when it leaves the home
+    _RDIR=$(readlink -f "$DESKTOP_DIR" 2>/dev/null || true)
+    case "$_RDIR" in
+      "$OWNER_HOME"/*) ;;
+      *) DESKTOP_DIR=""; dbg "WARNING: Desktop resolves outside the home, the shortcut was skipped" ;;
+    esac
+    if [ -n "$DESKTOP_DIR" ] && { [ -d "$DESKTOP_DIR" ] || mkdir -p "$DESKTOP_DIR" 2>/dev/null; }; then
       # The dir may be born under umask 077 as root-only, and a
       # root-owned Desktop hides the shortcut from the desktop shell
       # entirely (seen on Rocky: the shortcut never appeared).
@@ -5100,8 +6392,11 @@ DESKSHRT
     # The iPhone profile: same CA, in the format iOS installs with one
     # tap from the Files app.
     CAPEM=$(openssl x509 -in "$WELCOME/Redoubt Root CA.crt" -outform DER 2>/dev/null | base64 -w0 2>/dev/null)
-    CFGUUID=$(cat /proc/sys/kernel/random/uuid 2>/dev/null || echo "redoubt-ca")
-    cat > "$MYREDOUBT/Redoubt Root CA.mobileconfig" <<MOBILECONFIG
+    # an empty payload installs a broken profile on the phone: only
+    # generate the file when the DER actually encoded
+    if [ -n "$CAPEM" ]; then
+      CFGUUID=$(cat /proc/sys/kernel/random/uuid 2>/dev/null || echo "redoubt-ca")
+      cat > "$MYREDOUBT/Redoubt Root CA.mobileconfig" <<MOBILECONFIG
 <?xml version="1.0" encoding="UTF-8"?>
 <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
 <plist version="1.0">
@@ -5144,11 +6439,14 @@ DESKSHRT
 </dict>
 </plist>
 MOBILECONFIG
+    else
+      dbg "WARN: the iPhone CA profile was not generated (openssl missing or the CA did not encode)"
+    fi
     # Clickable shortcuts, the Linux twin of the exe .url files: small
     # html pages that hand the browser straight to the app. Double-click
     # and the app opens; no launcher trust issues, ever.
     rm -f "$MYREDOUBT"/*.desktop 2>/dev/null || true
-    for APP in "Open Photos:$PHOTOS_URL" "Open Files:$FILES_URL" "Open Search:$SEARCH_URL" "Open Panel:$PANEL_URL" "Open Stack Manager:http://127.0.0.1:$PORT_DOCKGE"; do
+    for APP in "Open Photos:$PHOTOS_URL_MESH" "Open Files:$FILES_URL_MESH" "Open Search:$SEARCH_URL_MESH" "Open Panel:$PANEL_URL_MESH" "Open Stack Manager:http://127.0.0.1:$PORT_DOCKGE"; do
       APPNAME=${APP%%:*}; APPURL=${APP#*:}
       cat > "$MYREDOUBT/$APPNAME.html" <<SHORTCUT
 <!doctype html>
@@ -5181,26 +6479,15 @@ inject_ca_to_desktop() {
   local _OH="$OWNER_HOME" _OU=""
   [ -f "$_CA" ] || return 0
   _OU=$(stat -c '%U' "$_OH" 2>/dev/null || true)
+  # No system-store CA by design: the local CA is unconstrained, so it
+  # must never ride where every tool and every user would honor it (one
+  # leaked key would MITM the whole machine). The browsers get it into
+  # their own stores below, and nothing else.
   case "$PKG_FAMILY" in
-    dnf)
-      cp -f "$_CA" /etc/pki/ca-trust/source/anchors/redoubt-root-ca.crt 2>/dev/null || true
-      update-ca-trust >/dev/null 2>&1 || true
-      command -v certutil >/dev/null 2>&1 || dnf install -y -q nss-tools >/dev/null 2>&1 || true
-      ;;
-    apt)
-      cp -f "$_CA" /usr/local/share/ca-certificates/redoubt-root-ca.crt 2>/dev/null || true
-      update-ca-certificates >/dev/null 2>&1 || true
-      command -v certutil >/dev/null 2>&1 || apt-get install -y -qq libnss3-tools >/dev/null 2>&1 || true
-      ;;
-    pacman)
-      trust anchor "$_CA" >/dev/null 2>&1 || true
-      command -v certutil >/dev/null 2>&1 || pacman -S --noconfirm --needed nss >/dev/null 2>&1 || true
-      ;;
-    zypper)
-      cp -f "$_CA" /etc/pki/trust/anchors/redoubt-root-ca.crt 2>/dev/null || true
-      update-ca-certificates >/dev/null 2>&1 || true
-      command -v certutil >/dev/null 2>&1 || zypper --non-interactive install mozilla-nss-tools >/dev/null 2>&1 || true
-      ;;
+    dnf) command -v certutil >/dev/null 2>&1 || dnf install -y -q nss-tools >/dev/null 2>&1 || true ;;
+    apt) command -v certutil >/dev/null 2>&1 || apt-get install -y -qq libnss3-tools >/dev/null 2>&1 || true ;;
+    pacman) command -v certutil >/dev/null 2>&1 || pacman -S --noconfirm --needed nss >/dev/null 2>&1 || true ;;
+    zypper) command -v certutil >/dev/null 2>&1 || zypper --non-interactive install mozilla-nss-tools >/dev/null 2>&1 || true ;;
   esac
   if ! command -v certutil >/dev/null 2>&1; then
     return 0
@@ -5212,19 +6499,29 @@ inject_ca_to_desktop() {
     certutil -d "sql:$_OH/.pki/nssdb" -N --empty-password >/dev/null 2>&1 || true
   fi
   certutil -d "sql:$_OH/.pki/nssdb" -A -t "C,," -n "Redoubt Root CA" -i "$_CA" >/dev/null 2>&1 || true
+  # merge into an existing policies.json: a clobber would wipe the
+  # distro's own Firefox policies
   mkdir -p /etc/firefox/policies 2>/dev/null
-  cat > /etc/firefox/policies/policies.json <<FXPOL
-{
-  "policies": {
-    "Certificates": {
-      "Install": ["$_CA"]
-    }
-  }
-}
-FXPOL
+  python3 - "$_CA" <<'FXPOLMERGE'
+import json, sys
+ca = sys.argv[1]
+p = "/etc/firefox/policies/policies.json"
+data = {}
+try:
+    with open(p) as f:
+        data = json.load(f)
+except Exception:
+    pass
+certs = data.setdefault("policies", {}).setdefault("Certificates", {})
+inst = certs.setdefault("Install", [])
+if ca not in inst:
+    inst.append(ca)
+with open(p, "w") as f:
+    json.dump(data, f, indent=2)
+FXPOLMERGE
   [ -n "$_OU" ] && chown -R "$_OU": "$_OH/.pki/nssdb" 2>/dev/null || true
   CA_AUTO=1
-  dbg "OK: desktop browsers trust the Redoubt root CA (system, Chromium, Firefox)"
+  dbg "OK: desktop browsers trust the Redoubt root CA (Chromium NSS, Firefox)"
 }
 
     CA_AUTO=0
@@ -5363,14 +6660,15 @@ Photos:   https://${APPS_HOST}:$PORT_EDGE1
 Files:    https://${APPS_HOST}:$PORT_EDGE2
 Search:   https://${APPS_HOST}:$PORT_EDGE3
 Panel:    $PANEL_LINE
-Ad shield: https://redoubt.lan:$PORT_EDGE5/admin
+Ad shield: https://${REMOTE_HOST}:$PORT_EDGE5/admin
+Ad shield (home): https://${LAN_HOST}:$PORT_EDGE5/admin
 
 $ACCESS_LAN_LINES$ACCESS_WIFI
 $ACCESS_MESH
 
 Ads off everywhere: set your devices' DNS to $LAN_IP (router or wifi settings) and the whole home network blocks ads and trackers.
 
-Phone cert: http://${MESH_IP:-$LAN_IP}:8086/ca (open it on the phone and install it)
+Phone cert: http://${REMOTE_HOST}:8086/ca (open it on the phone and install it)
 
 user: $OWNER_USER
 email: $IMMICH_EMAIL
@@ -5384,7 +6682,7 @@ ACCESS
     cat > /etc/redoubt/qr-payloads.txt <<QRPAY
 panel (mesh)|$PANEL_URL_MESH
 panel (home wifi)|https://$LAN_HOST:$PORT_EDGE4
-mobile cert|http://${NETBIRD_IP:-$LAN_IP}:8086/ca
+mobile cert|http://${REMOTE_HOST}:8086/ca
 QRPAY
     if [ "$MESH_MODE" = "selfhost" ]; then
       printf 'mesh management|%s\n' "$MESH_BASE" >> /etc/redoubt/qr-payloads.txt
@@ -5725,7 +7023,11 @@ code { background:var(--line); padding:2px 7px; border-radius:5px; font-size:.9e
 
 WELCOMEHTML
     chown -R "$(stat -c '%u:%g' "$OWNER_HOME")" "$MYREDOUBT" 2>/dev/null || true
-    dbg "OK: the My Redoubt folder is in your Documents"
+    if [ "${WELCOME_STAGED:-0}" = "1" ]; then
+      dbg "WARNING: the My Redoubt files are staged (the owner's vault was open) - they land on the next pass"
+    else
+      dbg "OK: the My Redoubt folder is in your Documents"
+    fi
   fi
   # These milestones live outside the welcome conditional. On a repatch
   # the work is skipped but the bar still walks to 100, never stopping at 50.
@@ -5761,8 +7063,24 @@ WELCOMEHTML
     # scripted install. Ask occ for the truth and, when the instance
     # is still empty, run the install by CLI with the same admin and
     # database the compose declares.
-    NC_OK=$(docker exec redoubt-nextcloud-1 php occ status 2>/dev/null | grep -c "installed: true" || true)
+    NC_OK=$(docker exec -u www-data redoubt-nextcloud-1 php occ status 2>/dev/null | grep -c "installed: true" || true)
     if [ "${NC_OK:-0}" -lt 1 ]; then
+      # secrets ride stdin, never argv (same rule as the homarr seed)
+      nc_install() {  # $1 = db password; admin user/pass from OWNER_USER/OWNER_PASS
+        { printf '%s\n%s\n%s\n' "$OWNER_USER" "$OWNER_PASS" "$1"; cat <<'NCPHP'
+<?php
+$_SERVER['argv'] = $argv = ['occ', 'maintenance:install',
+  '--admin-user=' . getenv('NCU'), '--admin-pass=' . getenv('NCP'),
+  '--database=pgsql', '--database-name=nextcloud', '--database-user=nextcloud',
+  '--database-pass=' . getenv('NCD'), '--database-host=redoubt-nextcloud-db-1'];
+chdir('/var/www/html');
+require '/var/www/html/occ';
+NCPHP
+        } | docker exec -i -u www-data redoubt-nextcloud-1 sh -c 'IFS= read -r NCU; IFS= read -r NCP; IFS= read -r NCD; export NCU NCP NCD; exec php'
+      }
+      nc_psql() {  # password on stdin; $@ = psql args (no secrets)
+        printf '%s\n' "$NC_DBPASS_LIVE" | docker exec -i redoubt-nextcloud-db-1 sh -c 'IFS= read -r PGPASSWORD; export PGPASSWORD; exec psql -U nextcloud -h 127.0.0.1 "$@"' sh "$@"
+      }
       NC_DBPASS=""
       for i in $(seq 1 6); do
         NC_DBPASS=$(docker exec redoubt-nextcloud-1 php -r 'include "/var/www/html/config/config.php"; echo $CONFIG["dbpassword"] ?? "";' 2>/dev/null || true)
@@ -5770,8 +7088,8 @@ WELCOMEHTML
         sleep 10
       done
       if [ -n "$NC_DBPASS" ]; then
-        docker exec -u www-data redoubt-nextcloud-1 php occ maintenance:install --admin-user "$OWNER_USER" --admin-pass "$OWNER_PASS" --database pgsql --database-name nextcloud --database-user nextcloud --database-pass "$NC_DBPASS" --database-host redoubt-nextcloud-db-1 >/dev/null 2>&1 || true
-        NC_OK=$(docker exec redoubt-nextcloud-1 php occ status 2>/dev/null | grep -c "installed: true" || true)
+        nc_install "$NC_DBPASS" >/dev/null 2>&1 || true
+        NC_OK=$(docker exec -u www-data redoubt-nextcloud-1 php occ status 2>/dev/null | grep -c "installed: true" || true)
       fi
         if [ "${NC_OK:-0}" -lt 1 ]; then
           # the persisted config can carry a stale db password after a
@@ -5779,8 +7097,8 @@ WELCOMEHTML
           # container actually uses, and only warn if that fails too
           NC_DBPASS_LIVE=$(docker inspect redoubt-nextcloud-db-1 --format '{{range .Config.Env}}{{println .}}{{end}}' 2>/dev/null | grep POSTGRES_PASSWORD | cut -d= -f2)
           if [ -n "$NC_DBPASS_LIVE" ]; then
-            _NC_INSTALL_OUT=$(docker exec -u www-data redoubt-nextcloud-1 php occ maintenance:install --admin-user "$OWNER_USER" --admin-pass "$OWNER_PASS" --database pgsql --database-name nextcloud --database-user nextcloud --database-pass "$NC_DBPASS_LIVE" --database-host redoubt-nextcloud-db-1 2>&1 || true)
-            NC_OK=$(docker exec redoubt-nextcloud-1 php occ status 2>/dev/null | grep -c "installed: true" || true)
+            _NC_INSTALL_OUT=$(nc_install "$NC_DBPASS_LIVE" 2>&1 || true)
+            NC_OK=$(docker exec -u www-data redoubt-nextcloud-1 php occ status 2>/dev/null | grep -c "installed: true" || true)
           fi
           if [ "${NC_OK:-0}" -lt 1 ] && [ -n "$NC_DBPASS_LIVE" ]; then
             # the postgres role freezes the password of its first init:
@@ -5789,11 +7107,10 @@ WELCOMEHTML
             # generation while the compose and the env moved on. Align
             # the role to the live password and retry once: the install
             # then has exactly one truth.
-            docker exec -e PGPASSWORD="$NC_DBPASS_LIVE" redoubt-nextcloud-db-1 \
-              psql -U nextcloud -h 127.0.0.1 -d nextcloud \
-              -c "ALTER USER nextcloud WITH PASSWORD '$NC_DBPASS_LIVE'" >/dev/null 2>&1 || true
-            _NC_INSTALL_OUT=$(docker exec -u www-data redoubt-nextcloud-1 php occ maintenance:install --admin-user "$OWNER_USER" --admin-pass "$OWNER_PASS" --database pgsql --database-name nextcloud --database-user nextcloud --database-pass "$NC_DBPASS_LIVE" --database-host redoubt-nextcloud-db-1 2>&1 || true)
-            NC_OK=$(docker exec redoubt-nextcloud-1 php occ status 2>/dev/null | grep -c "installed: true" || true)
+            { printf '%s\n' "$NC_DBPASS_LIVE"; printf "ALTER USER nextcloud WITH PASSWORD '%s';\n" "$NC_DBPASS_LIVE"; } \
+              | docker exec -i redoubt-nextcloud-db-1 sh -c 'IFS= read -r PGPASSWORD; export PGPASSWORD; exec psql -q -U nextcloud -h 127.0.0.1 -d nextcloud' >/dev/null 2>&1 || true
+            _NC_INSTALL_OUT=$(nc_install "$NC_DBPASS_LIVE" 2>&1 || true)
+            NC_OK=$(docker exec -u www-data redoubt-nextcloud-1 php occ status 2>/dev/null | grep -c "installed: true" || true)
           fi
           if [ "${NC_OK:-0}" -lt 1 ] && [ -n "$NC_DBPASS_LIVE" ]; then
             # a half-finished install can leave partial tables owned by
@@ -5801,19 +7118,16 @@ WELCOMEHTML
             # "permission denied" even with the right password. No users
             # in the DB means the instance never carried data: drop and
             # recreate the database, then run the install on the clean
-            # slate. "unknown" (the users table does not exist yet) is
-            # safe too: a missing table cannot hold user data.
-            _NC_USERS=$(docker exec -e PGPASSWORD="$NC_DBPASS_LIVE" redoubt-nextcloud-db-1 \
-              psql -U nextcloud -h 127.0.0.1 -d nextcloud -tAc "SELECT count(*) FROM oc_users" 2>/dev/null || echo "unknown")
-            if [ "$_NC_USERS" = "0" ] || [ "$_NC_USERS" = "unknown" ]; then
-              docker exec -e PGPASSWORD="$NC_DBPASS_LIVE" redoubt-nextcloud-db-1 \
-                psql -U nextcloud -h 127.0.0.1 -d postgres -tAc "SELECT pg_terminate_backend(pid) FROM pg_stat_activity WHERE datname = 'nextcloud' AND pid <> pg_backend_pid()" >/dev/null 2>&1 || true
-              docker exec -e PGPASSWORD="$NC_DBPASS_LIVE" redoubt-nextcloud-db-1 \
-                psql -U nextcloud -h 127.0.0.1 -d postgres -c "DROP DATABASE nextcloud" >/dev/null 2>&1 || true
-              docker exec -e PGPASSWORD="$NC_DBPASS_LIVE" redoubt-nextcloud-db-1 \
-                psql -U nextcloud -h 127.0.0.1 -d postgres -c "CREATE DATABASE nextcloud OWNER nextcloud" >/dev/null 2>&1 || true
-              _NC_INSTALL_OUT=$(docker exec -u www-data redoubt-nextcloud-1 php occ maintenance:install --admin-user "$OWNER_USER" --admin-pass "$OWNER_PASS" --database pgsql --database-name nextcloud --database-user nextcloud --database-pass "$NC_DBPASS_LIVE" --database-host redoubt-nextcloud-db-1 2>&1 || true)
-              NC_OK=$(docker exec redoubt-nextcloud-1 php occ status 2>/dev/null | grep -c "installed: true" || true)
+            # slate. The drop runs ONLY on a proven count of zero: a
+            # failed query ("unknown") can mean the DB is still waking
+            # up, and a healthy instance behind it would be destroyed.
+            _NC_USERS=$(nc_psql -d nextcloud -tAc "SELECT count(*) FROM oc_users" 2>/dev/null || echo "unknown")
+            if [ "$_NC_USERS" = "0" ]; then
+              nc_psql -d postgres -tAc "SELECT pg_terminate_backend(pid) FROM pg_stat_activity WHERE datname = 'nextcloud' AND pid <> pg_backend_pid()" >/dev/null 2>&1 || true
+              nc_psql -d postgres -c "DROP DATABASE nextcloud" >/dev/null 2>&1 || true
+              nc_psql -d postgres -c "CREATE DATABASE nextcloud OWNER nextcloud" >/dev/null 2>&1 || true
+              _NC_INSTALL_OUT=$(nc_install "$NC_DBPASS_LIVE" 2>&1 || true)
+              NC_OK=$(docker exec -u www-data redoubt-nextcloud-1 php occ status 2>/dev/null | grep -c "installed: true" || true)
             fi
           fi
         fi
@@ -5859,7 +7173,7 @@ WELCOMEHTML
       DOCKGE_OK=0
       for i in $(seq 1 30); do
         if docker exec redoubt-dockge-1 node -e 'require("@louislam/sqlite3")' >/dev/null 2>&1; then
-          docker exec -e DP="$DOCKGE_PASS" redoubt-dockge-1 node -e '
+          printf '%s\n' "$DOCKGE_PASS" | docker exec -i redoubt-dockge-1 sh -c 'IFS= read -r DP; export DP; exec node -e "$1"' sh '
 const sqlite3 = require("@louislam/sqlite3").verbose();
 const bcrypt = require("bcryptjs");
 const db = new sqlite3.Database("/app/data/dockge.db");
@@ -5989,7 +7303,7 @@ $MESH_CARD_HTML
 </body>
 </html>
 WELCOME
-  dbg "OK: welcome guide generated"
+  [ "${WELCOME_STAGED:-0}" = "1" ] || dbg "OK: welcome guide generated"
 fi
 
 # ============ private DNS lockdown (Quad9 over TLS, leak-proof) ============
@@ -6213,7 +7527,10 @@ FAILSAFE
   chmod 644 /etc/systemd/system/redoubt-failsafe.service
   systemctl daemon-reload
   systemctl enable redoubt-failsafe >/dev/null 2>&1 || true
-  # arm the live watcher and mark the pass
+  # arm the live watcher and mark the pass. The old pass's completed
+  # marker must go first: the watcher exits on sight of it, so a stale
+  # marker would disarm the failsafe before this pass even moves.
+  rm -f /etc/redoubt/.install-complete
   : > /etc/redoubt/.pass-in-progress
   chmod 600 /etc/redoubt/.pass-in-progress
   setsid nohup /bin/bash /etc/redoubt/redoubt-emergency.sh live >/dev/null 2>&1 &
@@ -6228,31 +7545,56 @@ else
   dbg "WARN: could not snapshot the network state; this pass runs without the safety net"
 fi
 
-if [ ! -f /etc/redoubt/nb-dns-off ] && [ -x "$NBEXE" ]; then
-  # a down+up only makes sense on an agent that already joined: a
-  # NeedsLogin daemon has no config and a bare up hangs forever
-  # waiting for a sign-in that never comes (the kit is key-only)
-  if [ -f /var/lib/netbird/default.json ]; then
-    "$NBEXE" down >/dev/null 2>&1 || true
-    sleep 2
-    timeout -k 5 120 "$NBEXE" up --disable-dns >/dev/null 2>&1 || true
+if [ -x "$NBEXE" ] && [ -f /var/lib/netbird/default.json ]; then
+  # the daemon's dns proxy must live on loopback (127.0.0.1:5053),
+  # never on the mesh address: holding mesh-ip:53 forwards every phone
+  # query back to itself and blocks the pi-hole out of the port. The
+  # proxy only moves through a full down+up carrying the resolver
+  # flag; the flag alone is a no-op against a connected daemon. A down
+  # removes the agent's resolver, so the host resolver must answer on
+  # its own first: if the pi-hole is not there, skip and retry on the
+  # next pass.
+  _NB_HOLDS=$(ss -ulnp 2>/dev/null | grep netbird | grep -c ':53' || true)
+  if [ "${_NB_HOLDS:-0}" -gt 0 ]; then
+    if dig +short +time=3 +tries=1 api.netbird.io @127.0.0.53 >/dev/null 2>&1; then
+      "$NBEXE" down >/dev/null 2>&1 || true
+      sleep 2
+      timeout -k 5 120 "$NBEXE" up --disable-dns --dns-resolver-address 127.0.0.1:5053 >/dev/null 2>&1 || true
+      touch /etc/redoubt/nb-dns-off
+      chmod 600 /etc/redoubt/nb-dns-off
+      dbg "OK: the agent resolver moved to loopback (the ad shield owns the mesh 53)"
+    else
+      dbg "WARN: host resolver not answering - resolver move skipped (next pass retries)"
+    fi
   fi
-  touch /etc/redoubt/nb-dns-off
-  chmod 600 /etc/redoubt/nb-dns-off
+fi
+# the ad shield serves the mesh 53 through the nft mesh-dns-in chain
+# (wt0 -> dnat to the pi-hole bridge address), which is interface
+# based and survives every IP change. The compose therefore carries
+# only the stable binds: a mesh binding there would break the
+# container whenever the mesh address vanishes (the box died exactly
+# like this: the pi-hole refused to start without the transient IP,
+# the DNS fell, the mesh could not reconnect, and the IP never came
+# back). Any leftover mesh 53 line is stripped here on every pass.
+if [ -f "$STACKDIR/docker-compose.yml" ]; then
+  sed -i '/- "100\.125\.[0-9.]*:53:53\/udp"/d; /- "100\.125\.[0-9.]*:53:53\/tcp"/d' "$STACKDIR/docker-compose.yml"
+  dbg "OK: the ad shield mesh 53 lives in nft only (stable binds in the compose)"
 fi
 # Host resolver first. systemd-resolved (Debian/Ubuntu/Mint/Pop) points
 # at the local pi-hole, so this machine filters ads too; the pi-hole
 # forwards to the stack unbound, which keeps the encrypted Quad9 leg.
-# Before writing the pin, check that 127.0.0.1:53 answers: pinning a
-# dead nameserver takes the machine's DNS down with it, and the whole
-# point of this
-# section is that DNS never dies.
+# Before writing the pin, check that the LAN bind of the pi-hole
+# answers: pinning a dead nameserver takes the machine's DNS down with
+# it, and the whole point of this section is that DNS never dies.
+# Loopback is not checked: the agent's dns-resolver flag redirects
+# 127.0.0.1:53 into its own proxy, which refuses while it carries no
+# nameserver.
 SHIELD_UP=0
 _SHIELD_T=0
 while [ "$_SHIELD_T" -lt 6 ]; do
-  if (echo > /dev/tcp/127.0.0.1/53) 2>/dev/null; then
+  if (echo > /dev/tcp/${LAN_IP}/53) 2>/dev/null; then
     SHIELD_UP=1
-  elif python3 -c 'import socket; s=socket.create_connection(("127.0.0.1",53),2); s.close()' >/dev/null 2>&1; then
+  elif python3 -c 'import socket; s=socket.create_connection(("'"$LAN_IP"'",53),2); s.close()' >/dev/null 2>&1; then
     SHIELD_UP=1
   fi
   [ "$SHIELD_UP" = "1" ] && break
@@ -6267,11 +7609,13 @@ if [ "$SHIELD_UP" = "1" ]; then
     chmod 755 /etc/systemd/resolved.conf.d
     cat > /etc/systemd/resolved.conf.d/redoubt-quad9.conf <<RESOLVED
 [Resolve]
-# the plain leg stays on loopback (the pi-hole); only the pi-hole's
-# own upstream speaks to the outside, over unbound's encrypted Quad9
-# channel. DoT is off for the local leg only: nothing plain ever
-# leaves the machine
-DNS=127.0.0.1
+# the plain leg stays on the LAN bind of the pi-hole; only the
+# pi-hole's own upstream speaks to the outside, over unbound's
+# encrypted Quad9 channel. Loopback is NOT an option here: the agent's
+# dns-resolver flag redirects the host's own 127.0.0.1:53 into its
+# proxy, which refuses while it carries no nameserver. DoT is off for
+# the local leg only: nothing plain ever leaves the machine
+DNS=${LAN_IP}
 DNSOverTLS=no
 # DNSSEC validation lives in unbound behind the pi-hole: nothing here
 # needs to re-validate, and a mangled response is handled there
@@ -6281,7 +7625,13 @@ MulticastDNS=no
 RESOLVED
     chmod 644 /etc/systemd/resolved.conf.d/redoubt-quad9.conf
     systemctl restart systemd-resolved
-    dbg "OK: host DNS now the ad shield, Quad9 over TLS underneath (systemd-resolved)"
+    # verify the configured path really answers: a blind OK here once
+    # hid a dead resolver behind a redirection
+    if dig +short +time=5 +tries=2 api.netbird.io @127.0.0.53 >/dev/null 2>&1; then
+      dbg "OK: host DNS now the ad shield, Quad9 over TLS underneath (systemd-resolved)"
+    else
+      dbg "WARN: host DNS not answering through systemd-resolved (the shield path needs a look)"
+    fi
   else
     # No systemd-resolved here. Leave the system resolver alone
     # (NetworkManager, dhcpcd and friends keep regenerating resolv.conf
@@ -6298,8 +7648,8 @@ RESOLVED
       NM_CON=$(nmcli -t -f NAME connection show --active 2>/dev/null | head -1 | cut -d: -f1)
       if [ -n "$NM_CON" ]; then
         NM_DNS=$(nmcli -g ipv4.dns connection show "$NM_CON" 2>/dev/null)
-        if [ "$NM_DNS" != "127.0.0.1" ]; then
-          if nmcli con mod "$NM_CON" ipv4.dns "127.0.0.1" ipv4.ignore-auto-dns yes >/dev/null 2>&1; then
+        if [ "$NM_DNS" != "$LAN_IP" ]; then
+          if nmcli con mod "$NM_CON" ipv4.dns "$LAN_IP" ipv4.ignore-auto-dns yes >/dev/null 2>&1; then
             # reapply carries the new dns into the live connection
             # without re-establishing it: the link never drops, an ssh
             # session never dies, and the pass cannot be cut right here
@@ -6321,7 +7671,7 @@ RESOLVED
     fi
   fi
 else
-  dbg "WARN: the ad shield is not answering on 127.0.0.1:53; host DNS left untouched so the machine keeps resolving"
+  dbg "WARN: the ad shield is not answering on the LAN bind; host DNS left untouched so the machine keeps resolving"
 fi
 # The leak firewall: nothing on this machine may speak plain DNS (53) or
 # DoT (853) to the outside. Allowed outbound are the configured nameservers
@@ -6416,11 +7766,18 @@ GUARDIAN_USER="guardian"
 GUARDIAN_PORT=8642
 BRAIN_PORT=8686
 GATEWAY_SVC="hermes-gateway-cerberus"
-HERMES_INSTALL_URL="https://hermes-agent.nousresearch.com/install.sh"
-HERMES_INSTALL_SHA="abf338605dae6dd28d101673ac6aed7995c955745db46d47676bc591a7957209"
+HERMES_INSTALL_URL="https://install.tryredoubt.com/hermes-install.sh"
+HERMES_INSTALL_SHA="50348fcc95e934d2f92b493b40fa2a4f22d58237184ef88ed69ad395531f1ad4"
 GUARDIAN_PROFILE_URL="${REDOUBT_GUARDIAN_PROFILE_URL:-https://install.tryredoubt.com/install/guardian-profile.tar.gz}"
 GUARDIAN_PROFILE_SHA="246fbc95b66cefb26b06e9cca7cda4780bfff921ec3d0be2844a872718c54370"
 BRAIN_IMAGE="ghcr.io/ggml-org/llama.cpp:server@sha256:c77881bba21e863bc56391995511f361040952f7ed6033cf1589da7f77a04eff"
+# the Vulkan build for the Strix Halo APUs: same server, same API,
+# plus the iGPU offload through /dev/dri. Pinned like the CPU image.
+BRAIN_VULKAN_IMAGE="ghcr.io/ggml-org/llama.cpp:server-vulkan@sha256:28a56d03c5cc4abeb16b2a5422c5286d9e48020a3cb3416434bff5fbf847bfa6"
+# the CUDA image for NVIDIA boxes: the same multi-arch index pinning,
+# read from the registry (never from memory). It needs the
+# nvidia-container-toolkit on the host (Apache-2.0, distro repos).
+BRAIN_CUDA_IMAGE="ghcr.io/ggml-org/llama.cpp:server-cuda@sha256:a361e47e28e8801e290f3c855292e0f25047e5d8e998b0d101431f54db68e008"
 BRAIN_MODEL_URL="${REDOUBT_BRAIN_MODEL_URL:-https://huggingface.co/unsloth/Qwen3.5-4B-GGUF/resolve/main/Qwen3.5-4B-Q4_K_M.gguf}"
 BRAIN_MODEL_SHA="00fe7986ff5f6b463e62455821146049db6f9313603938a70800d1fb69ef11a4"
 BRAIN_MODEL_FILE="qwen35-4b-q4km.gguf"
@@ -6446,6 +7803,8 @@ set_tier_params() {
 # required). REDOUBT_TIER forces a tier for lab runs.
 detect_tier() {
   local ram_gb vram gpu_line avx2
+  BRAIN_GPU_ARGS=""
+  BRAIN_GPU_DEVICES=""
 
   if [ -n "${REDOUBT_TIER:-}" ]; then
     TIER="$REDOUBT_TIER"
@@ -6469,10 +7828,112 @@ detect_tier() {
     fi
   fi
 
+  # the Strix Halo APUs (Ryzen AI Max, Radeon 8060S, gfx1151) carry
+  # the GPU on the package and the system RAM is the VRAM: the Vulkan
+  # llama-server image offloads the whole model to the iGPU through
+  # /dev/dri. No ROCm stack needed on the host, and the CPU image
+  # stays the default for every other box.
+  STRIX=0
+  case "$gpu_line" in *8060S*|*Strix*) STRIX=1 ;; esac
+  [ "$STRIX" = "1" ] && [ ! -e /dev/dri/renderD128 ] && STRIX=0
+
+  # every other Radeon (discrete RX cards and the older APUs) rides
+  # the same Vulkan path: the dedicated VRAM comes straight from the
+  # amdgpu sysfs, no ROCm and no extra host packages.
+  AMDGPU_VRAM=""
+  if [ "$STRIX" = "0" ]; then
+    case "$gpu_line" in
+      *[Rr]adeon*)
+        if [ -e /dev/dri/renderD128 ]; then
+          for _CARD in /sys/class/drm/card*/device/mem_info_vram_total; do
+            [ -r "$_CARD" ] || continue
+            AMDGPU_VRAM=$(awk '{printf "%d", $1/1048576}' "$_CARD" 2>/dev/null)
+            [ -n "$AMDGPU_VRAM" ] && break
+          done
+        fi
+        ;;
+    esac
+  fi
+
+  # NVIDIA boxes ride the CUDA image through the container toolkit.
+  # The driver must be the distro's package, never the .run installer:
+  # the .run flow is the only NVIDIA path with an opt-in data
+  # collection, distro packages carry none, and the kit never installs
+  # DCGM or nvidia-persistenced. The kit's own egress lockdown is the
+  # backstop: even a rogue NVIDIA binary cannot reach home.
+  install_nvidia_toolkit() {
+    case "$PKG_FAMILY" in
+      apt)
+        if [ ! -f /usr/share/keyrings/nvidia-container-toolkit-keyring.gpg ]; then
+          curl -fsSL --max-time 20 https://nvidia.github.io/libnvidia-container/gpgkey \
+            | gpg --dearmor -o /usr/share/keyrings/nvidia-container-toolkit-keyring.gpg 2>/dev/null || return 1
+        fi
+        curl -fsSL --max-time 20 https://nvidia.github.io/libnvidia-container/stable/deb/nvidia-container-toolkit.list \
+          | sed "s#deb https://#deb [signed-by=/usr/share/keyrings/nvidia-container-toolkit-keyring.gpg] https://#g" \
+          > /etc/apt/sources.list.d/nvidia-container-toolkit.list || return 1
+        apt-get update -qq >/dev/null 2>&1 || true
+        DEBIAN_FRONTEND=noninteractive apt-get install -y -qq nvidia-container-toolkit >/dev/null 2>&1 || return 1
+        ;;
+      pacman)
+        pacman -Sy --noconfirm nvidia-container-toolkit >/dev/null 2>&1 || return 1
+        ;;
+      dnf)
+        curl -fsSL --max-time 20 https://nvidia.github.io/libnvidia-container/stable/rpm/nvidia-container-toolkit.repo \
+          > /etc/yum.repos.d/nvidia-container-toolkit.repo 2>/dev/null || return 1
+        dnf install -y -q nvidia-container-toolkit >/dev/null 2>&1 || return 1
+        ;;
+      zypper)
+        curl -fsSL --max-time 20 https://nvidia.github.io/libnvidia-container/stable/rpm/nvidia-container-toolkit.repo \
+          > /etc/zypp/repos.d/nvidia-container-toolkit.repo 2>/dev/null || return 1
+        zypper --non-interactive install nvidia-container-toolkit >/dev/null 2>&1 || return 1
+        ;;
+      *) return 1 ;;
+    esac
+    nvidia-ctk runtime configure --runtime=docker >/dev/null 2>&1 || return 1
+    systemctl restart docker >/dev/null 2>&1 || true
+    return 0
+  }
+  NVGPU=0
+  if [ "$STRIX" = "0" ] && [ -z "$AMDGPU_VRAM" ]; then
+    case "$gpu_line" in
+      *[Nn][Vv][Ii][Dd][Ii][Aa]*)
+        if command -v nvidia-smi >/dev/null 2>&1 && [ -n "$vram" ] && [ "$vram" -ge 6144 ]; then
+          NVGPU=1
+          if ! command -v nvidia-ctk >/dev/null 2>&1; then
+            install_nvidia_toolkit && NVGPU=2 || true
+          else
+            NVGPU=2
+          fi
+        fi
+        ;;
+    esac
+  fi
+
   avx2=0
   grep -q avx2 /proc/cpuinfo 2>/dev/null && avx2=1
 
-  if [ -n "$vram" ] && [ "$vram" -ge 6144 ]; then
+  if [ "$STRIX" = "1" ] && [ "$ram_gb" -ge 32 ]; then
+    TIER="full"
+    TIER_NOTE="strix halo igpu, vulkan offload"
+    BRAIN_IMAGE="$BRAIN_VULKAN_IMAGE"
+    BRAIN_GPU_ARGS=$(printf '      - -ngl\n      - "99"\n')
+    BRAIN_GPU_DEVICES=$(printf '    devices:\n      - /dev/dri:/dev/dri\n')
+  elif [ -n "$AMDGPU_VRAM" ] && [ "$AMDGPU_VRAM" -ge 6144 ]; then
+    TIER="full"
+    TIER_NOTE="radeon with $AMDGPU_VRAM MiB vram, vulkan offload"
+    BRAIN_IMAGE="$BRAIN_VULKAN_IMAGE"
+    BRAIN_GPU_ARGS=$(printf '      - -ngl\n      - "99"\n')
+    BRAIN_GPU_DEVICES=$(printf '    devices:\n      - /dev/dri:/dev/dri\n')
+  elif [ "$NVGPU" = "2" ]; then
+    TIER="full"
+    TIER_NOTE="nvidia gpu with $vram MiB vram, cuda offload"
+    BRAIN_IMAGE="$BRAIN_CUDA_IMAGE"
+    BRAIN_GPU_ARGS=$(printf '      - -ngl\n      - "99"\n')
+    # compose v2 wants the gpus key as a mapping (driver/count/
+    # capabilities), not the old list form: verified with docker
+    # compose config against a real daemon
+    BRAIN_GPU_DEVICES=$(printf '    gpus:\n      - driver: nvidia\n        count: all\n        capabilities: [gpu]\n')
+  elif [ -n "$vram" ] && [ "$vram" -ge 6144 ]; then
     TIER="full"
     TIER_NOTE="gpu with $vram MiB vram"
   elif [ "$ram_gb" -lt 10 ]; then
@@ -6582,24 +8043,40 @@ guardian_brain() {
   mkdir -p "$mdir"
   if [ ! -f "$mf" ]; then
     gbar "guardian: downloading the brain model ($BRAIN_MODEL_FILE) ..."
-    curl -fL --retry 3 -o "$mf" "$BRAIN_MODEL_URL" || return 1
-    local got
-    got=$(sha256sum "$mf" | cut -d' ' -f1)
-    if [ "$got" != "$BRAIN_MODEL_SHA" ]; then
-      rm -f "$mf"
-      gbar "guardian: model sha mismatch ($got) - refusing to run it"
-      return 1
-    fi
+    # http1.1 + resume: the HF CDN drops big HTTP/2 streams mid-flight
+    # (curl 92 CANCEL); a resumed download survives the drop
+    curl -fL --http1.1 -C - --retry 5 --retry-delay 5 -o "$mf" "$BRAIN_MODEL_URL" \
+      || { rm -f "$mf"; gbar "guardian: brain model download failed"; return 1; }
+  fi
+  # re-verify on every pass: a truncated download or a bumped pin must
+  # never ride along silently
+  local got
+  got=$(sha256sum "$mf" 2>/dev/null | cut -d' ' -f1)
+  if [ "$got" != "$BRAIN_MODEL_SHA" ]; then
+    rm -f "$mf"
+    gbar "guardian: brain model sha mismatch ($got) - re-downloading"
+    # http1.1 + resume: the HF CDN drops big HTTP/2 streams mid-flight
+    # (curl 92 CANCEL); a resumed download survives the drop
+    curl -fL --http1.1 -C - --retry 5 --retry-delay 5 -o "$mf" "$BRAIN_MODEL_URL" \
+      || { rm -f "$mf"; gbar "guardian: brain model re-download failed"; return 1; }
+    got=$(sha256sum "$mf" 2>/dev/null | cut -d' ' -f1)
+    [ "$got" = "$BRAIN_MODEL_SHA" ] \
+      || { rm -f "$mf"; gbar "guardian: brain model sha mismatch again ($got) - refusing to run it"; return 1; }
   fi
   local cores
   cores=$(nproc)
   cat > /opt/redoubt/brain-compose.yml <<BRAIN
-name: redoubt
+# a project of its own: sharing the main project name made every brain
+# up read the main stack's containers as its orphans (and vice versa),
+# one warning per pass. The container and network names are explicit
+# below, so the rename changes nothing else.
+name: redoubt-brain
 services:
   brain:
     image: $BRAIN_IMAGE
     container_name: redoubt-brain-1
     restart: always
+${BRAIN_GPU_DEVICES}
     command:
       - -m
       - /models/$BRAIN_MODEL_FILE
@@ -6620,6 +8097,7 @@ services:
       - "1"
       - -t
       - "$cores"
+${BRAIN_GPU_ARGS}
       - --chat-template-kwargs
       - '{"enable_thinking": false}'
     volumes:
@@ -6662,10 +8140,24 @@ guardian_gateway() {
     "~/.local/bin/hermes -p cerberus gateway install --force" \
     </dev/null >/dev/null 2>&1
   loginctl enable-linger "$GUARDIAN_USER" 2>/dev/null || true
-  su - "$GUARDIAN_USER" -c \
-    "systemctl --user enable $GATEWAY_SVC 2>/dev/null; systemctl --user restart $GATEWAY_SVC" \
-    >/dev/null 2>&1
-  gbar "guardian: gateway service up"
+  local _u _i
+  _u=$(id -u "$GUARDIAN_USER")
+  for _i in $(seq 1 20); do
+    [ -S "/run/user/$_u/bus" ] && break
+    sleep 1
+  done
+  systemctl --user -M "$GUARDIAN_USER"@ daemon-reload >/dev/null 2>&1 || true
+  systemctl --user -M "$GUARDIAN_USER"@ enable "$GATEWAY_SVC" >/dev/null 2>&1 || true
+  systemctl --user -M "$GUARDIAN_USER"@ restart "$GATEWAY_SVC" >/dev/null 2>&1 || true
+  sleep 3
+  if systemctl --user -M "$GUARDIAN_USER"@ is-active --quiet "$GATEWAY_SVC" 2>/dev/null; then
+    gbar "guardian: gateway service up"
+  else
+    gbar "guardian: gateway service NOT running"
+    systemctl --user -M "$GUARDIAN_USER"@ status "$GATEWAY_SVC" --no-pager >> "$LOG" 2>&1 || true
+    journalctl _UID="$_u" --no-pager -n 40 >> "$LOG" 2>&1 || true
+    return 1
+  fi
 }
 
 guardian_console() {
@@ -6681,12 +8173,14 @@ CONSOLE
   local su_file="/etc/sudoers.d/redoubt-hermes"
   : > "$su_file"
   local _cu
-  # the installer (sudo), the app owner, and every real login user of
-  # the box: the console is the one hermes they may open
-  for _cu in "${SUDO_USER:-}" "$OWNER_USER" \
-             $(getent passwd | awk -F: '$3>=1000 && $3<65534 && $7 ~ /\/(ba)?sh$/ {print $1}'); do
+  # the console grant is personal: the installer (sudo) and the app
+  # owner, nobody else. A box-wide grant to every login user would let
+  # any local account, guests included, drive the guardian agent as
+  # guardian, so the grant stays on the two names that own the box.
+  for _cu in "${SUDO_USER:-}" "$OWNER_USER"; do
     [ -n "$_cu" ] && [ "$_cu" != "root" ] \
       && getent passwd "$_cu" >/dev/null 2>&1 \
+      && ! grep -q "^$_cu " "$su_file" \
       && printf '%s ALL=(guardian) NOPASSWD: /home/guardian/.local/bin/hermes\n' "$_cu" >> "$su_file"
   done
   chmod 440 "$su_file"
@@ -6743,11 +8237,14 @@ guardian_wire_assistant() {
   ' "$cipher" 2>/dev/null)
   [ "$back" = "$key" ] || { gbar "guardian: encrypt roundtrip failed"; return 1; }
 
-  python3 - "$PANEL_DB_HOST" "$cipher" <<'WIRE'
+  if python3 - "$PANEL_DB_HOST" "$cipher" <<'WIRE'
 import sqlite3, sys
 db, cipher = sys.argv[1], sys.argv[2]
-c = sqlite3.connect(db)
-c.execute("""UPDATE assistant_configuration SET
+# the timeout keeps a busy panel (its own write) from making this a
+# silent no-op, and the rowcount turns a missing default row into a
+# real failure instead of a green log
+c = sqlite3.connect(db, timeout=15)
+cur = c.execute("""UPDATE assistant_configuration SET
              provider='custom',
              base_url='http://172.28.0.1:8642/v1',
              model_discovery_path='/models',
@@ -6756,74 +8253,151 @@ c.execute("""UPDATE assistant_configuration SET
              encrypted_headers=NULL,
              enabled=1
              WHERE id='default'""", (cipher,))
+if cur.rowcount != 1:
+    print('guardian: wiring failed, no default row to update', file=sys.stderr)
+    sys.exit(1)
 c.commit()
 row = c.execute("SELECT provider, model_id, enabled FROM assistant_configuration WHERE id='default'").fetchone()
 print('guardian: assistant wired', row)
 WIRE
-  gbar "guardian: panel assistant wired to Cerberus"
+  then
+    gbar "guardian: panel assistant wired to Cerberus"
+  else
+    gbar "guardian: panel assistant wiring failed"
+    return 1
+  fi
 }
 
 guardian_warmup() {
-  local key i code svc
+  local key i code svc w tries=1 t0
+  # no GPU: the model may still be paging in when the health ports
+  # answer, so a fast connection failure gets a bounded grace
+  case "$TIER" in standard|tiny) tries=6 ;; esac
   key=$(grep "^API_SERVER_KEY=" "/home/$GUARDIAN_USER/.hermes/profiles/cerberus/.env" | cut -d= -f2)
   # A panel stream opened while the pass runs can leave ghost runs in
   # both queues for minutes (each one re-pays the whole 13k prompt).
   # Clear both sides first so the warm-up pays the prompt exactly
   # once, in peace. The panel chat in flight is dropped: the pass is a
   # setup event and the bar says so.
-  gbar "guardian: clearing the panel queue for the warm-up"
+  gbar "guardian: clearing the queue"
+  # a silent wait reads as a frozen install: the heartbeat moves the bar
+  # and its elapsed label while the health loops and the warm request run
+  warm_beat_start "guardian: warming up"
   docker restart redoubt-brain-1 >/dev/null 2>&1 || true
-  svc=$(systemctl --user -M "$GUARDIAN_USER"@ list-units --type=service --no-legend 2>/dev/null \
-    | awk '/hermes-gateway/ && /running/ {print $1; exit}')
+  local up=0
+  for i in $(seq 1 60); do
+    curl -fsS -m 3 http://127.0.0.1:8686/health >/dev/null 2>&1 && { up=1; break; }
+    sleep 5
+  done
+  [ "$up" = "1" ] || { warm_beat_stop; gbar "guardian: brain did not come back"; return 1; }
+  svc=$(systemctl --user -M "$GUARDIAN_USER"@ list-units --all --type=service --no-legend 2>/dev/null \
+    | awk '/hermes-gateway/ {print $1; exit}')
   [ -n "$svc" ] && systemctl --user -M "$GUARDIAN_USER"@ restart "$svc" >/dev/null 2>&1 || true
+  up=0
   for i in $(seq 1 60); do
-    curl -fsS -m 3 http://127.0.0.1:8686/health >/dev/null 2>&1 && break
+    curl -fsS -m 3 http://127.0.0.1:8642/health >/dev/null 2>&1 && { up=1; break; }
     sleep 5
   done
-  for i in $(seq 1 60); do
-    curl -fsS -m 3 http://127.0.0.1:8642/health >/dev/null 2>&1 && break
-    sleep 5
-  done
+  [ "$up" = "1" ] || { warm_beat_stop; gbar "guardian: gateway not listening on 8642"; return 1; }
   # The gateway is idempotent per request body: a repeated "Stand by."
   # whose earlier attempt never settled gets a 409 forever. A per-pass
   # nonce keeps every warm-up a fresh admission.
-  code=$(curl -s -o /dev/null -w '%{http_code}' -m 900 \
-    http://127.0.0.1:8642/v1/chat/completions \
-    -H "Content-Type: application/json" \
-    -H "Authorization: Bearer $key" \
-    -d "{\"model\":\"Cerberus\",\"messages\":[{\"role\":\"user\",\"content\":\"Stand by (pass $(date +%s)).\"}],\"max_tokens\":32}")
+  for w in $(seq 1 "$tries"); do
+    t0=$SECONDS
+    code=$(curl -s -o /dev/null -w '%{http_code}' -m 900 \
+      http://127.0.0.1:8642/v1/chat/completions \
+      -H "Content-Type: application/json" \
+      -H "Authorization: Bearer $key" \
+      -d "{\"model\":\"Cerberus\",\"messages\":[{\"role\":\"user\",\"content\":\"Stand by (pass $(date +%s)-$w).\"}],\"max_tokens\":32}")
+    [ "$code" = "200" ] && break
+    # only a fast 000 is a model still loading; a slow one already paid
+    [ "$code" = "000" ] && [ $((SECONDS - t0)) -lt 60 ] && [ "$w" -lt "$tries" ] || break
+    sleep 20
+  done
+  warm_beat_stop
   if [ "$code" = "200" ]; then
-    gbar "guardian: warm-up request done (the system prompt is cached now)"
+    gbar "guardian: warm-up done"
   else
-    gbar "guardian: warm-up busy (gateway answered $code) - verify will retry"
+    gbar "guardian: warm-up busy ($code), verify retries"
   fi
 }
 
 guardian_verify() {
-  local key resp i
+  local key resp i t0 n=10 slow=0
+  case "$TIER" in standard|tiny) n=16; slow=1 ;; esac
   key=$(grep "^API_SERVER_KEY=" "/home/$GUARDIAN_USER/.hermes/profiles/cerberus/.env" | cut -d= -f2)
   # same busy-retry as the warm-up: the owner may be chatting with the
   # panel while the pass runs, and a 409 is a full gateway, not a dead
   # brain. Give the queue a chance before calling it.
-  for i in $(seq 1 10); do
+  warm_beat_start "guardian: verifying"
+  for i in $(seq 1 "$n"); do
+    t0=$SECONDS
     # same idempotency note as the warm-up: a per-pass nonce.
     resp=$(curl -s -m 900 http://127.0.0.1:8642/v1/chat/completions \
       -H "Content-Type: application/json" \
       -H "Authorization: Bearer $key" \
       -d "{\"model\":\"Cerberus\",\"messages\":[{\"role\":\"user\",\"content\":\"Are the gates closed (pass $(date +%s))?\"}],\"max_tokens\":64}")
     if printf '%s' "$resp" | grep -q '"content"'; then
+      warm_beat_stop
       gbar "guardian: VERIFIED - Cerberus answered (tier $TIER)"
       return 0
     fi
-    case "$resp" in *'"error"'*409*|*'"error"'*429*|*'"error"'*503*) sleep 15 ;; *) break ;; esac
+    case "$resp" in
+      *'"error"'*409*|*'"error"'*429*|*'"error"'*503*) sleep 15 ;;
+      '') # no GPU: an instant empty answer is a model still loading
+        [ "$slow" = "1" ] && [ $((SECONDS - t0)) -lt 60 ] && sleep 15 || break ;;
+      *) break ;;
+    esac
   done
+  warm_beat_stop
   gbar "guardian: verification FAILED - the guardian did not answer"
   return 1
 }
 
-gbar() {  # a guardian step: one line for the log, the same label on the bar
-  echo "$1"
+gbar() {  # a guardian step: the line on the terminal and in the log
+  anim_stop
+  printf '  %s%.74s%s\n' "$EM2" "$1" "$RESET" >&3
+  printf '%s\n' "$1" >> "$LOG"
   draw_bar 100 "$1"
+}
+
+# a long silent step (health loops, the 900s warm request, the verify
+# retries) leaves the bar frozen on one label and the owner thinks the
+# pass died. This keeps the animator fed with a short elapsed label.
+warm_beat_start() {  # $1 = base label
+  local _lbl=$1
+  [ -n "${BAR_STATE:-}" ] || return 0
+  ( _w=0
+    while :; do
+      sleep 1
+      _w=$((_w+1))
+      printf '100|%s (%d:%02d)\n' "$_lbl" "$((_w/60))" "$((_w%60))" > "${BAR_STATE}.beat" 2>/dev/null \
+        && mv -f "${BAR_STATE}.beat" "$BAR_STATE" 2>/dev/null
+    done ) &
+  WARM_BEAT_PID=$!
+}
+warm_beat_stop() {
+  [ -n "${WARM_BEAT_PID:-}" ] || return 0
+  kill "$WARM_BEAT_PID" 2>/dev/null || true
+  wait "$WARM_BEAT_PID" 2>/dev/null || true
+  WARM_BEAT_PID=""
+}
+
+guardian_bounce() {
+  # The gateway's first real request can wedge on a stale auth lock and
+  # then every request hangs without an answer, so the verify below
+  # would burn its long timeouts on a corpse. One clean bounce with the
+  # lock out costs seconds and cures it; the service comes back by
+  # itself (enabled earlier).
+  systemctl --user -M "$GUARDIAN_USER"@ stop "$GATEWAY_SVC" >/dev/null 2>&1 || true
+  sleep 4
+  rm -f "/home/$GUARDIAN_USER/.hermes/profiles/cerberus/auth.lock" 2>/dev/null || true
+  systemctl --user -M "$GUARDIAN_USER"@ start "$GATEWAY_SVC" >/dev/null 2>&1 || true
+  for _b in $(seq 1 30); do
+    curl -fsS -m 3 http://127.0.0.1:8642/health >/dev/null 2>&1 && break
+    sleep 2
+  done
+  gbar "guardian: gateway bounced clean before the check"
 }
 
 guardian() {
@@ -6839,22 +8413,16 @@ guardian() {
   guardian_ufw
   guardian_wire_assistant
   guardian_warmup
+  guardian_bounce
   guardian_verify || gbar "guardian: WARNING the end-to-end check failed"
 }
 
 guardian
 
-# Land the guardian bar cleanly before the firewall questions: stop the
-# painter and give the line its newline, so the ask below starts on its
-# own row.
-if [ -n "$ANIM_PID" ]; then
-  kill -9 "$ANIM_PID" 2>/dev/null
-  ANIM_PID=""
-fi
-CLEAN_BAR=1
-draw_line
-CLEAN_BAR=0
-echo "" >&3
+# Take the painter down before the firewall questions and leave the row
+# empty. The old landed line stayed on screen and the relaunched painter
+# then drew the same label again below it (a duplicate bar).
+anim_stop
 
 
 # Host firewall: the cloud's ports face the owner's wifi, and wifi has
@@ -6911,10 +8479,6 @@ FW_WHY_POOL=(
 FW_U_ESS_RULES=( "tcp --dport 22" "tcp --dport 8390" "udp --dport 8390" "udp --dport 40002" "tcp --dport 8086" )
 FW_U_APP_PORTS="443 8443 8444 8445 8446 8447 33073"
 FW_F_APP_PORTS="443/tcp 8443-8447/tcp 33073/tcp"
-FW_U_CLOUD_TCP="22 443 8390 8443 8444 8445 8446 8447 8086 33073"
-FW_U_CLOUD_RULES=( "tcp --dport 443" "tcp --dport 8390" "udp --dport 8390" "tcp --dport 33073" "tcp --dport 8443" "tcp --dport 8444" "tcp --dport 8445" "tcp --dport 8446" "tcp --dport 8447" "tcp --dport 8086" )
-FW_U_CLOUD_FULL=( "tcp --dport 22" "${FW_U_CLOUD_RULES[@]}" )
-FW_F_CLOUD_PORTS="8390/tcp 8390/udp 33073/tcp 443/tcp 8443-8447/tcp 8086/tcp"
 # the NetBird console door is selfhost-only: cloud has no local
 # dashboard, so its firewall story stays exactly as it was
 if [ "$MESH_MODE" = "selfhost" ]; then
@@ -6925,7 +8489,8 @@ fi
 # true when the rules for a firewall state are already in place.
 # states: on (essentials + apps on every interface), on-nas
 # (essentials + apps on the mesh interface only), on-nodoors
-# (essentials only). cloud never uses on-nas: its n is on-nodoors.
+# (essentials only). Both modes share the model: the apps answer
+# only to the mesh unless the owner opened them to plain wifi.
 fw_state_ok() {
   _FW_STATE=$1
   if [ "$FW_KIND" = "ufw" ]; then
@@ -7022,10 +8587,10 @@ fw_hints() {
     fi
   else
     if [ "$FW_KIND" = "ufw" ]; then
-      FW_HINT="sudo ufw allow 22/tcp && sudo ufw allow 443/tcp && sudo ufw allow 8390/tcp && sudo ufw allow 8390/udp && sudo ufw allow 8443/tcp && sudo ufw allow 8444/tcp && sudo ufw allow 8445/tcp && sudo ufw allow 8446/tcp && sudo ufw allow 8447/tcp && sudo ufw allow 8086/tcp && sudo ufw allow 33073/tcp"
+      FW_HINT="sudo ufw allow 22/tcp && sudo ufw allow 8390/tcp && sudo ufw allow 8390/udp && sudo ufw allow 40002/udp && sudo ufw allow 8086/tcp && for p in 443 8443 8444 8445 8446 8447 33073; do sudo ufw allow in on wt0 to any port \$p proto tcp; done"
       FW_ON_HINT="sudo ufw enable"
     else
-      FW_HINT="sudo firewall-cmd --permanent --add-service=ssh && sudo firewall-cmd --permanent --add-port=8390/tcp && sudo firewall-cmd --permanent --add-port=8390/udp && sudo firewall-cmd --permanent --add-port=443/tcp && sudo firewall-cmd --permanent --add-port=8443-8447/tcp && sudo firewall-cmd --permanent --add-port=8086/tcp && sudo firewall-cmd --permanent --add-port=33073/tcp && sudo firewall-cmd --reload"
+      FW_HINT="sudo firewall-cmd --permanent --add-service=ssh && sudo firewall-cmd --permanent --add-port=8390/tcp && sudo firewall-cmd --permanent --add-port=8390/udp && sudo firewall-cmd --permanent --add-port=40002/udp && sudo firewall-cmd --permanent --add-port=8086/tcp && sudo firewall-cmd --permanent --new-zone=redoubt-mesh && sudo firewall-cmd --permanent --zone=redoubt-mesh --add-interface=wt0 && sudo firewall-cmd --permanent --zone=redoubt-mesh --add-port=443/tcp && sudo firewall-cmd --permanent --zone=redoubt-mesh --add-port=8443-8447/tcp && sudo firewall-cmd --permanent --zone=redoubt-mesh --add-port=33073/tcp && sudo firewall-cmd --reload"
       FW_ON_HINT="sudo systemctl enable --now firewalld"
     fi
   fi
@@ -7034,17 +8599,28 @@ fw_hints() {
 ask_tty() {
   # one question on the TUI: stop the spinner, clear the line, ask,
   # read the answer back on fd 3 and drain whatever junk followed it
-  _ASK_VAR=$1; _ASK_PROMPT=$2; _ASK_TIMEOUT=${3:-120}
-  if [ -n "${ANIM_PID:-}" ]; then
-    kill -9 "$ANIM_PID" 2>/dev/null || true
-  fi
-  printf '\r\033[K' >&3 2>/dev/null || true
+  _ASK_VAR=$1; _ASK_PROMPT=$2
+  # anim_stop reaps the painter before the clear, so no late frame can
+  # leave spinner or bar remnants under the question
+  anim_stop
   echo "" >&3 2>/dev/null || true
-  printf "%s" "$_ASK_PROMPT" >&3 2>/dev/null || true
-  stty echo icanon <&3 2>/dev/null || true
-  # shellcheck disable=SC2229
-  # read takes the variable NAME here, not the value
-  read -r -t "$_ASK_TIMEOUT" "$_ASK_VAR" <&3 2>/dev/null || true
+  cursor_show
+  # no timeout on purpose: the owner started this pass, so the pass
+  # waits for the answer. A dead session (EOF) falls through empty and
+  # the callers take the safe side; a blank enter asks again instead
+  # of silently picking no.
+  while :; do
+    printf "%s" "$_ASK_PROMPT" >&3 2>/dev/null || true
+    stty echo icanon <&3 2>/dev/null || true
+    # shellcheck disable=SC2229
+    # read takes the variable NAME here, not the value
+    if read -r "$_ASK_VAR" <&3 2>/dev/null; then
+      [ -n "${!_ASK_VAR}" ] && break
+    else
+      break
+    fi
+  done
+  cursor_hide
   drain_tty
 }
 
@@ -7065,18 +8641,15 @@ if [ -t 3 ]; then
       on) FW_ON=y; FW_STATE=on ;;
       on-nas) FW_ON=y; FW_STATE=on-nas ;;
       on-nodoors) FW_ON=y; FW_STATE=on-nodoors ;;
-      *) FW_ON=y; FW_STATE=on-nodoors ;;
+      # a decision the owner declined must stay declined: the old
+      # default arm quietly enabled the firewall on the next quiet
+      # pass, the opposite of the answer that was saved. Unknown
+      # stored values get the same respect.
+      off|*) FW_ON=n; FW_STATE=off ;;
     esac
-    # a mode switch re-models the doors even when the story was saved:
-    # selfhost closes the apps to the mesh interface (the NAS model),
-    # cloud reopens its classic doors. Closed decisions stay closed:
-    # a switch never opens more than the owner had already opened.
-    if [ "${MESH_MODE_CHANGED:-0}" = "1" ]; then
-      case "$MESH_MODE" in
-        selfhost) [ "$FW_STATE" = "on" ] && FW_STATE=on-nas ;;
-        cloud) [ "$FW_STATE" = "on-nas" ] && FW_STATE=on ;;
-      esac
-    fi
+    # the door story belongs to the owner, not to the mode: a mode
+    # switch never re-models the doors, and a switch never opens
+    # more than the owner had already opened
   fi
   if [ "$FW_KIND" = "none" ]; then
     if [ "${FW_QUIET:-0}" != "1" ]; then
@@ -7176,7 +8749,10 @@ if [ -t 3 ]; then
     fi
     # a mode switch never trusts the old door layout: it re-applies
     # the new model even when the check would pass on leftovers
-    if [ "${MESH_MODE_CHANGED:-0}" != "1" ] && fw_state_ok "$FW_STATE"; then
+    # the skip only replays a saved story: a first pass whose leftover
+    # rules pass the default "on" check must still ask, or it saves
+    # "on" as a decision the owner never made
+    if [ "${FW_QUIET:-0}" = "1" ] && [ "${MESH_MODE_CHANGED:-0}" != "1" ] && fw_state_ok "$FW_STATE"; then
       FW_DONE=1
       # a dead firewall must never read as open
       if [ "$FW_KIND" = "ufw" ] && ! ufw_rules_live; then
@@ -7187,38 +8763,51 @@ if [ -t 3 ]; then
       dbg "OK: firewall doors already open ($FW_KIND, nothing to ask)"
     else
     if [ "${FW_QUIET:-0}" != "1" ]; then
-      if [ -n "${ANIM_PID:-}" ]; then
-        kill -9 "$ANIM_PID" 2>/dev/null || true
-      fi
-      printf '\r\033[K' >&3 2>/dev/null || true
+      anim_stop
       echo "" >&3 2>/dev/null || true
       echo "Your firewall ($FW_KIND) is active. I need to open a few doors:" >&3 2>/dev/null || true
       echo "  - mesh doors (8390, stun 40002, cert 8086): your phone enrolls on your home wifi" >&3 2>/dev/null || true
+      # both modes share the same model: the apps answer only to the
+      # mesh (the enrolled identity is the door, no password to brute
+      # force). Plain wifi access is the owner's explicit opt-in.
       if [ "$MESH_MODE" = "selfhost" ]; then
         echo "  - app doors (8443-8448, panel 443): they answer only to your mesh devices" >&3 2>/dev/null || true
-        echo "I will not touch any other rule." >&3 2>/dev/null || true
-        printf 'Open the apps to plain wifi too, without the mesh? (y/N): ' >&3 2>/dev/null || true
       else
-        echo "  - app doors (8443-8447), panel (443) and certificate (8086): your phone opens photos, files and search on wifi" >&3 2>/dev/null || true
-        echo "I will not touch any other rule." >&3 2>/dev/null || true
-        printf 'May I add these rules? (y/N): ' >&3 2>/dev/null || true
+        echo "  - app doors (8443-8447), panel (443): they answer only to your mesh devices" >&3 2>/dev/null || true
       fi
+      echo "I will not touch any other rule." >&3 2>/dev/null || true
+      printf 'Open the apps to plain wifi too, without the mesh? (y/N): ' >&3 2>/dev/null || true
       # strict gate like the mesh questions: junk must never fall
       # through to a silent 'no' and leave the run half-open (typing
-      # 'clear' means the customer wants out, not 'no')
+      # 'clear' means the customer wants out, not 'no'). No timeout:
+      # the answer is the owner's to give. A dead session (EOF) falls
+      # through empty to the safe side.
       while :; do
         stty echo icanon <&3 2>/dev/null || true
-        read -r -t 120 FW_OK <&3 2>/dev/null || true
-        drain_tty
-        case "$FW_OK" in
-          ""|[yY]|[yY][eE][sS]|[sS]|[sS][iI]|[nN]|[nN][oO]) break ;;
-          [cC]lear|[cC]ancel|[eE]xit|[qQ]uit|[aA]bort|[sS]top|[sS]alir)
-            printf 'Run cancelled - nothing was changed.\n' >&3 2>/dev/null || true
-            exit 0
-            ;;
-          *) printf 'Please answer y or n.\n' >&3 2>/dev/null || true ;;
-        esac
+        if read -r FW_OK <&3 2>/dev/null; then
+          drain_tty
+          case "$FW_OK" in
+            [yY]|[yY][eE][sS]|[sS]|[sS][iI]|[nN]|[nN][oO]) break ;;
+            [cC]lear|[cC]ancel|[eE]xit|[qQ]uit|[aA]bort|[sS]top|[sS]alir)
+              # the live watcher restores the network snapshot when this
+              # pass dies without a completion marker, which is exactly
+              # the honest story to tell here
+              printf 'Run cancelled - the safety net rolls the network back and the install stops.\n' >&3 2>/dev/null || true
+              exit 0
+              ;;
+            *) printf 'Please answer y or n.\n' >&3 2>/dev/null || true ;;
+          esac
+        else
+          FW_OK=""
+          break
+        fi
       done
+    fi
+    # an actually-asked question must not inherit the pre-check default
+    # above: that default only served fw_state_ok, so once the owner is
+    # really answering, the answer (or the safe empty) decides the state
+    if [ "$FW_DONE" != "1" ] && [ "${FW_QUIET:-0}" != "1" ]; then
+      FW_STATE=""
     fi
     # the quiet branch already carries the persisted state; a fresh
     # answer maps to its state here
@@ -7227,146 +8816,95 @@ if [ -t 3 ]; then
         [yY]*|[sS]*) FW_STATE=on ;;
         *) FW_STATE=on-nas ;;
       esac
-      [ "$MESH_MODE" != "selfhost" ] && [ "$FW_STATE" = "on-nas" ] && FW_STATE=on-nodoors
     fi
     FW_RULES_OK=0
-    if [ "$MESH_MODE" = "selfhost" ]; then
-      # the full-NAS apply: essentials always, apps on the mesh
-      # interface (or everywhere when the wifi answer was yes)
-      fw_apply_state "$FW_STATE"
-      # an allow on a firewall that just died writes nothing:
-      # verify the rules landed before claiming the doors open
-      if [ "$FW_KIND" = "ufw" ] && ! ufw_rules_live; then
-        FW_RULES_OK=0
+    # both modes share the same apply: essentials always, apps on the
+    # mesh interface (or everywhere when the wifi answer was yes). A
+    # declined firewall (off) is never applied: no doors, no rules.
+    if [ "$FW_STATE" = "off" ]; then
+        FW_RULES_OK=1
+        dbg "OK: firewall stays off ($FW_KIND, the saved story is off)"
       else
-        fw_state_ok "$FW_STATE" && FW_RULES_OK=1
-      fi
-      if [ "$FW_RULES_OK" = "1" ]; then
-        dbg "OK: firewall doors opened ($FW_KIND, apps on the mesh${FW_STATE:+ (state $FW_STATE)} )"
-      else
-        dbg "WARNING: firewall rules did not land ($FW_KIND)"
-        dbg "hint: $FW_HINT"
-        if [ "${FW_QUIET:-0}" != "1" ]; then
-          echo "WARNING: firewall rules did not land - the mesh works, the apps stay box-only." >&3 2>/dev/null || true
-        fi
-      fi
-    else
-      # cloud: the classic apply, one form only
-      if [ "$FW_STATE" = "on" ]; then
-        if [ "$FW_KIND" = "ufw" ]; then
-          for FW_P in $FW_U_CLOUD_TCP; do
-            ufw allow "$FW_P/tcp" >/dev/null 2>&1 || true
-          done
-          ufw allow 8390/udp >/dev/null 2>&1 || true
-          # an allow on a firewall that just died writes nothing:
-          # verify the rules landed before claiming the doors open
-          FW_RULES=$(cat /etc/ufw/user.rules 2>/dev/null || true)
-          FW_RULES_OK=1
-          for FW_P in "${FW_U_CLOUD_FULL[@]}"; do
-            case "$FW_RULES" in *"$FW_P"*) ;; *) FW_RULES_OK=0 ;; esac
-          done
-          # written rules mean nothing while nothing is loaded
-          ufw_rules_live || FW_RULES_OK=0
+        fw_apply_state "$FW_STATE"
+        # an allow on a firewall that just died writes nothing:
+        # verify the rules landed before claiming the doors open
+        if [ "$FW_KIND" = "ufw" ] && ! ufw_rules_live; then
+          FW_RULES_OK=0
         else
-          firewall-cmd --permanent --add-service=ssh >/dev/null 2>&1 || true
-          for FW_P in $FW_F_CLOUD_PORTS; do
-            firewall-cmd --permanent --add-port="$FW_P" >/dev/null 2>&1 || true
-          done
-          firewall-cmd --reload >/dev/null 2>&1 || true
-          FW_PORTS=$(firewall-cmd --list-ports 2>/dev/null || true)
-          FW_RULES_OK=1
-          # services live in a list of their own: --list-ports never
-          # shows the ssh service, so it gets its own query
-          firewall-cmd --query-service=ssh >/dev/null 2>&1 || FW_RULES_OK=0
-          for FW_P in $FW_F_CLOUD_PORTS; do
-            case " $FW_PORTS " in *" $FW_P "*) ;; *) FW_RULES_OK=0 ;; esac
-          done
+          fw_state_ok "$FW_STATE" && FW_RULES_OK=1
         fi
         if [ "$FW_RULES_OK" = "1" ]; then
-          dbg "OK: firewall doors opened for the mesh and the local apps ($FW_KIND, with your ok)"
+          case "$FW_STATE" in
+            on) _FW_WHERE="apps on every interface" ;;
+            on-nas) _FW_WHERE="apps on the mesh only" ;;
+            *) _FW_WHERE="mesh doors only" ;;
+          esac
+          dbg "OK: firewall doors opened ($FW_KIND, $_FW_WHERE, state $FW_STATE)"
         else
           dbg "WARNING: firewall rules did not land ($FW_KIND)"
           dbg "hint: $FW_HINT"
           if [ "${FW_QUIET:-0}" != "1" ]; then
-            echo "WARNING: firewall rules did not land - mesh works, wifi doors stay closed." >&3 2>/dev/null || true
+            echo "WARNING: firewall rules did not land - the mesh works, the apps stay box-only." >&3 2>/dev/null || true
           fi
         fi
-      else
-        dbg "hint: $FW_HINT"
-        if [ "${FW_QUIET:-0}" != "1" ]; then
-          echo "firewall untouched - the phone reaches the apps over the mesh." >&3 2>/dev/null || true
-        fi
       fi
-    fi
     fi
   fi
   # Persist the customer's firewall story: every later pass applies it
   # quietly (no questions, no notes on screen). The states map to the
   # quiet branch above: on = switch on + apps on every interface,
-  # on-nas = switch on + apps on the mesh only (selfhost), on-nodoors
+  # on-nas = switch on + apps on the mesh only, on-nodoors
   # = switch on + mesh doors only, off = untouched.
   if [ "$FW_ACTIVE" = "1" ]; then
-    if [ "${FW_RULES_OK:-0}" = "1" ] || [ "${FW_DONE:-0}" = "1" ]; then
+    if [ "$FW_STATE" = "off" ]; then
+      # a declined firewall stays declined: the quiet branch never
+      # touches it and the saved story must not drift to nodoors
+      FW_DECISION=off
+    elif [ "${FW_RULES_OK:-0}" = "1" ] || [ "${FW_DONE:-0}" = "1" ]; then
       FW_DECISION="${FW_STATE:-on}"
     else
-      FW_DECISION=on-nodoors
+      # the rules did not land this pass: a transient failure is not a
+      # decision, so the previous story stays and a first pass persists
+      # nothing, which makes the next run ask again
+      FW_DECISION="${FW_DECISION:-}"
+      dbg "firewall rules did not land, decision not persisted"
     fi
   else
     FW_DECISION=off
   fi
-  if grep -qs '^FW_DECISION=' /etc/redoubt/redoubt.env 2>/dev/null; then
-    sed -i "s|^FW_DECISION=.*|FW_DECISION=$FW_DECISION|" /etc/redoubt/redoubt.env
-  else
-    echo "FW_DECISION=$FW_DECISION" >> /etc/redoubt/redoubt.env
-  fi
-  bar_anim &
-  ANIM_PID=$!
-else
-  if [ "$FW_ACTIVE" = "1" ]; then
-    if [ "${MESH_MODE_CHANGED:-0}" = "1" ]; then
-      # nobody is at the terminal and the mesh mode changed: bring the
-      # firewall to the model of the new mode on its own. The NAS model
-      # on selfhost (apps on the mesh interface only), the classic doors
-      # on cloud. A closed decision (nodoors/off) stays closed: a mode
-      # switch never opens more than the owner had already opened.
-      FW_DECISION_OLD="${FW_DECISION:-}"
-      case "$MESH_MODE" in
-        selfhost)
-          if [ "$FW_DECISION" = "on" ]; then
-            fw_apply_state on-nas
-            fw_state_ok on-nas && FW_DECISION=on-nas
-          fi
-          ;;
-        cloud)
-          if [ "$FW_DECISION" = "on-nas" ]; then
-            if [ "$FW_KIND" = "ufw" ]; then
-              for FW_P in $FW_U_CLOUD_TCP; do
-                ufw allow "$FW_P/tcp" >/dev/null 2>&1 || true
-              done
-              ufw allow 8390/udp >/dev/null 2>&1 || true
-            else
-              firewall-cmd --permanent --add-service=ssh >/dev/null 2>&1 || true
-              for FW_P in $FW_F_CLOUD_PORTS; do
-                firewall-cmd --permanent --add-port="$FW_P" >/dev/null 2>&1 || true
-              done
-              firewall-cmd --reload >/dev/null 2>&1 || true
-            fi
-            FW_DECISION=on
-          fi
-          ;;
-      esac
-      if [ "$FW_DECISION" != "$FW_DECISION_OLD" ]; then
-        if grep -qs '^FW_DECISION=' /etc/redoubt/redoubt.env 2>/dev/null; then
-          sed -i "s|^FW_DECISION=.*|FW_DECISION=$FW_DECISION|" /etc/redoubt/redoubt.env
-        else
-          echo "FW_DECISION=$FW_DECISION" >> /etc/redoubt/redoubt.env
-        fi
-      fi
-      dbg "mesh mode changed ($FW_MODE_PREV -> $MESH_MODE): firewall moved to the $FW_DECISION model" >> "$LOG"
+  if [ -n "$FW_DECISION" ]; then
+    if grep -qs '^FW_DECISION=' "$_ENV_TMP" 2>/dev/null; then
+      sed -i "s|^FW_DECISION=.*|FW_DECISION=$FW_DECISION|" "$_ENV_TMP"
     else
-      dbg "$FW_KIND is active and this run has no terminal to ask. Firewall untouched: run again from a terminal to open the mesh doors." >> "$LOG"
+      echo "FW_DECISION=$FW_DECISION" >> "$_ENV_TMP"
     fi
   fi
+  # both arms persist: the sed arm edits the existing line and the
+  # changed story must reach the disk on this same pass
+  kit_env_commit
+  anim_start
+else
+  if [ "$FW_ACTIVE" = "1" ]; then
+    # nobody is at the terminal: the door story belongs to the owner
+    # and a mode switch never re-models it, so nothing moves here. A
+    # first-time install without a terminal opens the doors on the
+    # next interactive pass.
+    dbg "$FW_KIND is active and this run has no terminal to ask. Firewall untouched: run again from a terminal to open the mesh doors." >> "$LOG"
+  fi
+fi
+
+# the assistant wiring only proves homarr migrated its own db; the seed
+# writes the board serverSetting, so its absence means the panel was
+# never seeded. sqlite3 is optional on the host: no new dependency.
+_HOMARR_VOL=$(docker volume inspect -f '{{.Mountpoint}}' redoubt_homarr-data 2>/dev/null || true)
+if command -v sqlite3 >/dev/null 2>&1 && [ -f "$_HOMARR_VOL/db/db.sqlite" ]; then
+  if [ -n "$(sqlite3 "$_HOMARR_VOL/db/db.sqlite" "select value from serverSetting where setting_key='board'" 2>/dev/null)" ]; then
+    dbg "OK: panel seed present (board setting)"
+  else
+    log "FAIL: panel seed missing (no board setting) - re-run the kit"
+  fi
+else
+  dbg "NOTE: panel seed marker not checked (no sqlite3 on the host or no panel db)"
 fi
 
 # 9) Updates check, reports only, never blocks. Signed manifest from the key server.
@@ -7416,9 +8954,26 @@ MCowBQYDK2VwAyEAIkuck+5xb7kMv5c7JwcM3PpuOc4/W2ySl6wknsg5GnM=
 UPD_KEY_V2="-----BEGIN PUBLIC KEY-----
 MCowBQYDK2VwAyEAdxRgkHkxb2i0SZ9UvjOcdn51eM2pDvE4VZWBViOCurs=
 -----END PUBLIC KEY-----"
+# the apt hook fires on every dpkg run, including this updater's own
+# dpkg -i below: the flock turns concurrent runs into no-ops and the
+# lock dies with the process, so a SIGKILL can never leave a stale
+# marker that silently disables updates
+exec 8>/run/redoubt-update.lock
+flock -n 8 || exit 0
 UPD_TMP=$(mktemp -d /tmp/redoubt-update.XXXXXX) || exit 0
 trap 'rm -rf "$UPD_TMP"' EXIT
 chmod 700 "$UPD_TMP"
+# the netbird refresh below needs this helper: the updater is a
+# standalone script and cannot reach the main kit's functions
+nb_fetch_latest() {
+  # $1 = asset, $2 = checksums file, $3 = work dir. Download from the
+  # vendor release and verify the hash against the vendor checksum
+  # list before anything touches the file.
+  _NB_ASSET=$1; _NB_CKSUM=$2; _NB_DIR=$3
+  curl -fsSL -o "$_NB_DIR/$_NB_ASSET" "https://github.com/netbirdio/netbird/releases/download/v${NBLATEST}/$_NB_ASSET" \
+    && curl -fsSL -o "$_NB_DIR/nb-checksums.txt" "https://github.com/netbirdio/netbird/releases/download/v${NBLATEST}/$_NB_CKSUM" \
+    && grep -q "$(sha256sum "$_NB_DIR/$_NB_ASSET" | cut -d' ' -f1)" "$_NB_DIR/nb-checksums.txt"
+}
 LOCAL=$(cat /etc/redoubt/kit-sha.txt 2>/dev/null)
 [ -n "$LOCAL" ] || { echo "redoubt: no local kit record, re-run the installer"; exit 1; }
 echo "redoubt: checking for updates..."
@@ -7428,12 +8983,19 @@ printf '%s\n' "$UPD_KEY" > "$UPD_TMP/key.pem"
 printf '%s\n' "$UPD_KEY_V2" > "$UPD_TMP/key2.pem"
 # rotation window: the sha must verify with either release key. Once the
 # fleet carries this updater, releases move to the new key alone.
+# -rawin is OpenSSL 3 only: on older hosts the check would fail closed
+# silently forever, so detect the tool first and say it out loud
+if ! openssl pkeyutl -help 2>&1 | grep -q -- '-rawin'; then
+  echo "redoubt: openssl too old for the release signature, update skipped"
+  exit 0
+fi
 if ! openssl pkeyutl -verify -pubin -inkey "$UPD_TMP/key.pem" -rawin \
      -in "$UPD_TMP/kit-sha.txt" -sigfile "$UPD_TMP/kit-sha.txt.sig" 2>/dev/null \
      | grep -q "Signature Verified Successfully" \
    && ! openssl pkeyutl -verify -pubin -inkey "$UPD_TMP/key2.pem" -rawin \
      -in "$UPD_TMP/kit-sha.txt" -sigfile "$UPD_TMP/kit-sha.txt.sig" 2>/dev/null \
      | grep -q "Signature Verified Successfully"; then
+  echo "redoubt: release signature check failed, update skipped"
   exit 0
 fi
 # never fight a running install: the apt hook skips its turn when the
@@ -7483,7 +9045,7 @@ fi
 if [ -f /opt/redoubt/docker-compose.yml ] && command -v docker >/dev/null 2>&1; then
   IMG_IDS=$(mktemp)
   NEW_IDS=$(mktemp)
-  docker compose -f /opt/redoubt/docker-compose.yml config --images 2>/dev/null \
+  docker compose -f /opt/redoubt/docker-compose.yml --profile '*' config --images 2>/dev/null \
     | xargs -r -n1 docker image inspect --format '{{.Id}}' 2>/dev/null | sort > "$IMG_IDS" || true
   # the owner watches this run: one verdict line per image, so the
   # update never looks like a silent process
@@ -7491,17 +9053,29 @@ if [ -f /opt/redoubt/docker-compose.yml ] && command -v docker >/dev/null 2>&1; 
     echo "redoubt: checking $IMG ..."
     docker pull "$IMG" 2>&1 | grep -E "Pulling from|Downloaded newer image|Image is up to date" | tail -1
   done
-  docker compose -f /opt/redoubt/docker-compose.yml config --images 2>/dev/null \
+  docker compose -f /opt/redoubt/docker-compose.yml --profile '*' config --images 2>/dev/null \
     | xargs -r -n1 docker image inspect --format '{{.Id}}' 2>/dev/null | sort > "$NEW_IDS" || true
   if ! cmp -s "$IMG_IDS" "$NEW_IDS"; then
     SNAP_DIR=/var/lib/redoubt/snapshots
     SNAP="$SNAP_DIR/pre-update-$(date +%Y%m%d-%H%M%S)"
+    # the tarballs hold databases and configs with secrets: nothing in
+    # the snapshot tree may be readable by other local users
+    umask 077
     mkdir -p "$SNAP"
+    chmod 700 "$SNAP"
+    # a full disk would kill the tars silently and leave the stack
+    # stopped for nothing: refuse the update while there is room to
+    # re-create it, before anything goes down
+    SNAP_FREE=$(df -P -B1048576 "$SNAP_DIR" 2>/dev/null | awk 'NR==2{print $4}')
+    if [ -n "$SNAP_FREE" ] && [ "$SNAP_FREE" -lt 2048 ]; then
+      echo "redoubt: less than 2GB free for the snapshot, update skipped"
+      exit 0
+    fi
     echo "redoubt: new images arrived, snapshotting the stack data first..."
     # the mount map must be captured while the stack is up (a stopped
     # compose lists no containers), then the tars run cold on it
     MOUNTMAP=$(mktemp)
-    for CID in $(docker compose -f /opt/redoubt/docker-compose.yml ps -q 2>/dev/null); do
+    for CID in $(docker compose -f /opt/redoubt/docker-compose.yml --profile '*' ps -q 2>/dev/null); do
       CNAME=$(docker inspect "$CID" --format '{{.Name}}' 2>/dev/null | tr -d '/')
       # cover every data mount the stack owns: named volumes and host
       # binds (the photos and the databases live on host paths). System
@@ -7525,7 +9099,14 @@ if [ -f /opt/redoubt/docker-compose.yml ] && command -v docker >/dev/null 2>&1; 
       fi
       SAFE=$(printf '%s' "$MDEST" | tr '/' '_')
       echo "redoubt: snapshotting $CNAME ($MDEST) ..."
-      tar -czf "$SNAP/${CNAME}${SAFE}.tar.gz" -C "$MP" . 2>/dev/null || true
+      # a failed tar means no backup exists for that mount: recreate the
+      # stack and stop the update instead of upgrading without a net
+      if ! tar -czf "$SNAP/${CNAME}${SAFE}.tar.gz" -C "$MP" . 2>/dev/null; then
+        echo "redoubt: snapshot of $CNAME failed, the update was aborted"
+        rm -rf "$SNAP"
+        docker compose -f /opt/redoubt/docker-compose.yml --profile '*' up -d >/dev/null 2>&1 || true
+        exit 1
+      fi
     done < "$MOUNTMAP"
     rm -f "$MOUNTMAP"
     # keep the last two snapshots, the rest would just eat the disk
@@ -7652,7 +9233,7 @@ UPDATER
   if [ "$PKG_FAMILY" = "apt" ]; then
     cat > /etc/apt/apt.conf.d/99redoubt <<'APTHOOK'
 // Redoubt: check for a newer kit after every apt update
-DPkg::Post-Invoke "if [ -x /etc/redoubt/redoubt-update.sh ]; then /etc/redoubt/redoubt-update.sh; fi";
+DPkg::Post-Invoke "if [ -x /etc/redoubt/redoubt-update.sh ]; then nohup /etc/redoubt/redoubt-update.sh >/dev/null 2>&1 & fi";
 APTHOOK
     # The file has to stay world-readable. GUI tools (mintupdate,
     # synaptic, aptdaemon) init apt as the logged user, and a 600
@@ -7731,16 +9312,28 @@ fi
 case "${1:-}" in
   vault-open)
     # the vault mounts on demand (the login hook calls this too)
-    if [ -d "$HOME/Documents/.My Redoubt.cipher" ] && ! mountpoint -q "$HOME/Documents/My Redoubt" 2>/dev/null && [ -x /usr/local/bin/gocryptfs ]; then
-      (printf 'redoubt-vault:%s:%s' "$(cat /etc/machine-id 2>/dev/null)" "$(id -u)" | sha256sum | cut -d' ' -f1 | gocryptfs -quiet -config "$HOME/.local/share/redoubt/vault.gocryptfs.conf" -passfile /dev/stdin "$HOME/Documents/.My Redoubt.cipher" "$HOME/Documents/My Redoubt" 2>/dev/null) && echo "vault opened" || echo "vault mount failed"
+    if command -v fscrypt >/dev/null 2>&1 && fscrypt status "$HOME/Documents/My Redoubt" >/dev/null 2>&1; then
+  fscrypt unlock --key="$HOME/.local/share/redoubt/vault.key" "$HOME/Documents/My Redoubt" 2>/dev/null || true
+elif [ -d "$HOME/Documents/.My Redoubt.cipher" ] && ! mountpoint -q "$HOME/Documents/My Redoubt" 2>/dev/null && [ -x /usr/local/bin/gocryptfs ]; then
+      if [ -s "$HOME/.local/share/redoubt/vault-daily.key" ]; then
+        (gocryptfs -quiet -config "$HOME/.local/share/redoubt/vault.gocryptfs.conf" -passfile "$HOME/.local/share/redoubt/vault-daily.key" "$HOME/Documents/.My Redoubt.cipher" "$HOME/Documents/My Redoubt" 2>/dev/null) && echo "vault opened" || echo "vault mount failed"
+      else
+        (printf 'redoubt-vault:%s:%s' "$(cat /etc/machine-id 2>/dev/null)" "$(id -u)" | sha256sum | cut -d' ' -f1 | gocryptfs -quiet -config "$HOME/.local/share/redoubt/vault.gocryptfs.conf" -passfile /dev/stdin "$HOME/Documents/.My Redoubt.cipher" "$HOME/Documents/My Redoubt" 2>/dev/null) && echo "vault opened" || echo "vault mount failed"
+      fi
     else
       echo "no encrypted vault on this box"
     fi
     ;;
   creds)
     # the vault mounts on demand when the owner asks from a terminal
-    if [ -d "$HOME/Documents/.My Redoubt.cipher" ] && ! mountpoint -q "$HOME/Documents/My Redoubt" 2>/dev/null && [ -x /usr/local/bin/gocryptfs ]; then
-      (printf 'redoubt-vault:%s:%s' "$(cat /etc/machine-id 2>/dev/null)" "$(id -u)" | sha256sum | cut -d' ' -f1 | gocryptfs -quiet -config "$HOME/.local/share/redoubt/vault.gocryptfs.conf" -passfile /dev/stdin "$HOME/Documents/.My Redoubt.cipher" "$HOME/Documents/My Redoubt" 2>/dev/null) || true
+    if command -v fscrypt >/dev/null 2>&1 && fscrypt status "$HOME/Documents/My Redoubt" >/dev/null 2>&1; then
+  fscrypt unlock --key="$HOME/.local/share/redoubt/vault.key" "$HOME/Documents/My Redoubt" 2>/dev/null || true
+elif [ -d "$HOME/Documents/.My Redoubt.cipher" ] && ! mountpoint -q "$HOME/Documents/My Redoubt" 2>/dev/null && [ -x /usr/local/bin/gocryptfs ]; then
+      if [ -s "$HOME/.local/share/redoubt/vault-daily.key" ]; then
+        (gocryptfs -quiet -config "$HOME/.local/share/redoubt/vault.gocryptfs.conf" -passfile "$HOME/.local/share/redoubt/vault-daily.key" "$HOME/Documents/.My Redoubt.cipher" "$HOME/Documents/My Redoubt" 2>/dev/null) || true
+      else
+        (printf 'redoubt-vault:%s:%s' "$(cat /etc/machine-id 2>/dev/null)" "$(id -u)" | sha256sum | cut -d' ' -f1 | gocryptfs -quiet -config "$HOME/.local/share/redoubt/vault.gocryptfs.conf" -passfile /dev/stdin "$HOME/Documents/.My Redoubt.cipher" "$HOME/Documents/My Redoubt" 2>/dev/null) || true
+      fi
     fi
     if [ -r /etc/redoubt/credentials.txt ]; then
       cat /etc/redoubt/credentials.txt
@@ -7775,7 +9368,7 @@ case "${1:-}" in
       N="$2"
     else
       N=""
-      if [ "$TERM" = "linux" ]; then
+      if [ "${TERM:-dumb}" = "linux" ]; then
         # the bare console has no scrollback: list the codes and let
         # the caller pick one at a time
         I=1
@@ -7796,13 +9389,17 @@ case "${1:-}" in
         I=$((I+1))
         continue
       fi
-      if [ "$TERM" = "linux" ]; then
+      if [ "${TERM:-dumb}" = "linux" ]; then
         # glyph QRs detect but do not decode on VGA consoles (the font
         # leaves gaps between cells). draw the code as a real PNG and
         # show it fullscreen on the framebuffer: a pixel-perfect QR
         # with its quiet zone, which the phone always decodes. fbi
         # installs on demand, headless machines only
-        QRP=/tmp/redoubt-qr.png
+        # a fixed /tmp path owned by root is a symlink-attack gift and
+        # the PNG carries enrollment payloads: land it in a private
+        # mktemp file instead
+        QRP=$(mktemp -p /tmp redoubt-qr.XXXXXX) 2>/dev/null || QRP="/tmp/redoubt-qr-$$"
+        chmod 600 "$QRP" 2>/dev/null || true
         { command -v openvt >/dev/null 2>&1 && command -v chvt >/dev/null 2>&1; } || apt-get install -y -qq kbd >/dev/null 2>&1 || true
         if [ -e /dev/fb0 ] && command -v fbi >/dev/null 2>&1 && command -v openvt >/dev/null 2>&1 && command -v chvt >/dev/null 2>&1 && qrencode -o "$QRP" -s 8 -m 4 --foreground=34D399 --background=D4D4D8 "$URL" 2>/dev/null; then
           echo "scan the code, it closes on its own"
@@ -7847,28 +9444,54 @@ dbg "OK: the redoubt dashboard is installed (run: redoubt)"
 # so the snapshot's job is done: mark the pass complete, disarm the
 # watcher and the boot failsafe, and drop the snapshot. From here on
 # only the reveal is left, and the reveal changes nothing.
-if [ -n "${WATCH_PID:-}" ] && kill -0 "$WATCH_PID" 2>/dev/null; then
-  : > /etc/redoubt/.install-complete
-  chmod 600 /etc/redoubt/.install-complete
-  rm -f /etc/redoubt/.pass-in-progress
+# The disarm runs unconditionally: a watcher that already died must not
+# leave the pass looking unfinished to the next boot.
+: > /etc/redoubt/.install-complete
+chmod 600 /etc/redoubt/.install-complete
+rm -f /etc/redoubt/.pass-in-progress
+if [ -n "${WATCH_PID:-}" ]; then
   kill "$WATCH_PID" 2>/dev/null || true
-  dbg "OK: pass safety net disarmed (install complete)"
-  systemctl disable redoubt-failsafe >/dev/null 2>&1 || true
-  rm -f /etc/systemd/system/redoubt-failsafe.service
-  systemctl daemon-reload 2>/dev/null || true
-  rm -rf /etc/redoubt/.pass-snapshot
-  # the completed state must survive a cut right after the pass: sync
-  # so .install-complete and the disarmed failsafe reach the disk, or
-  # the next boot would roll back a finished install
-  sync
+fi
+dbg "OK: pass safety net disarmed (install complete)"
+systemctl disable redoubt-failsafe >/dev/null 2>&1 || true
+rm -f /etc/systemd/system/redoubt-failsafe.service
+systemctl daemon-reload 2>/dev/null || true
+rm -rf /etc/redoubt/.pass-snapshot
+# the completed state must survive a cut right after the pass: sync
+# so .install-complete and the disarmed failsafe reach the disk, or
+# the next boot would roll back a finished install
+sync
+
+# end-of-pass gate: the DNS chain must answer before the pass closes,
+# or the mesh cannot reconnect and the box reads as dead. If the
+# pi-hole fell, bring it back and re-verify; a pass that ends with a
+# dead resolver is a broken pass, and the reveal says so.
+_DNS_GATE=0
+for _GTRY in 1 2 3; do
+  if dig +short +time=4 +tries=1 api.netbird.io @127.0.0.53 >/dev/null 2>&1 \
+     || dig +short +time=4 +tries=1 api.netbird.io @${LAN_IP:-127.0.0.1} >/dev/null 2>&1; then
+    _DNS_GATE=1
+    break
+  fi
+  [ -f "$STACKDIR/docker-compose.yml" ] \
+    && docker compose -f "$STACKDIR/docker-compose.yml" up -d pihole >/dev/null 2>&1 || true
+  sleep 10
+done
+if [ "$_DNS_GATE" = "1" ]; then
+  dbg "OK: end-of-pass DNS gate green (the resolver answers)"
+  # the client reconnects on its own once the resolver answers; give
+  # the management link a beat and report where it landed
+  if [ -x "${NBEXE:-/usr/local/bin/netbird}" ]; then
+    _NB_MGMT=$("$NBEXE" status 2>/dev/null | sed -n 's/^Management: //p' | head -1)
+    dbg "OK: netbird management: ${_NB_MGMT:-unknown} (the phone reconnects on its own)"
+  fi
+else
+  dbg "WARN: end-of-pass DNS gate FAILED - the resolver is down (check the pi-hole and run me again)"
 fi
 
 # stop the painter before the final screen: a live background job can
 # hold the shell in wait at exit and leave the installer lock behind
-if [ -n "${ANIM_PID:-}" ]; then
-  kill -9 "$ANIM_PID" 2>/dev/null || true
-  ANIM_PID=""
-fi
+anim_stop
 
   # Hold the painter before the final draw so the done line lands exactly
   # once (a relaunched animator would race the draw_line below and print
@@ -7878,14 +9501,12 @@ fi
   HOLD_BAR=1
   draw_bar 100 "✓ your cloud, done"
   # Stop the painter and land the newline, so the finished line stays put.
-  if [ -n "$ANIM_PID" ]; then
-    kill -9 "$ANIM_PID" 2>/dev/null
-    ANIM_PID=""
-  fi
+  anim_stop
   # One last paint (the animator may have died mid-frame), then the
   # newline. CLEAN_BAR drops the dot: the done line is the last word.
   CLEAN_BAR=1
   draw_line
+  CLEAN_BAR=0
   echo "" >&3
   rm -f "$BAR_STATE" 2>/dev/null || true
 
@@ -7910,16 +9531,16 @@ fi
     printf "  search   ${EM3}https://${APPS_HOST}:%s\n" "$PORT_EDGE3" | "$GUM_BIN" style --no-strip-ansi --foreground "#6ee7b7"
     printf "  dockge   ${EM3}http://127.0.0.1:%s\n" "$PORT_DOCKGE" | "$GUM_BIN" style --no-strip-ansi --foreground "#6ee7b7"
     printf "  panel    ${EM3}https://${APPS_HOST}:%s\n" "$PORT_EDGE4" | "$GUM_BIN" style --no-strip-ansi --foreground "#6ee7b7"
-    printf "  ad shield ${EM3}https://redoubt.lan:%s/admin\n" "$PORT_EDGE5" | "$GUM_BIN" style --no-strip-ansi --foreground "#6ee7b7"
 if [ "$MESH_MODE" = "selfhost" ]; then
       "$GUM_BIN" style --foreground 240 --bold "your mesh"
-      printf '  console https://%s:%s (NetBird dashboard, your owner login)\n' "$REMOTE_HOST" "$PORT_DASH" | "$GUM_BIN" style --foreground 240
+      printf '  console https://%s:%s (NetBird dashboard)\n' "$REMOTE_HOST" "$PORT_DASH" | "$GUM_BIN" style --foreground 240
       if [ "${FW_DECISION:-}" = "on" ]; then
         "$GUM_BIN" style --foreground 240 --bold "home wifi"
         printf '  photos  https://%s:%s\n' "$LAN_HOST" "$PORT_EDGE1" | "$GUM_BIN" style --foreground 240
         printf '  files   https://%s:%s\n' "$LAN_HOST" "$PORT_EDGE2" | "$GUM_BIN" style --foreground 240
         printf '  search  https://%s:%s\n' "$LAN_HOST" "$PORT_EDGE3" | "$GUM_BIN" style --foreground 240
         printf '  panel   https://%s:%s\n' "$LAN_HOST" "$PORT_EDGE4" | "$GUM_BIN" style --foreground 240
+        printf '  ad shield (home) https://%s:%s/admin\\n' "$LAN_HOST" "$PORT_EDGE5" | "$GUM_BIN" style --foreground 240
       else
         "$GUM_BIN" style --foreground 240 "  the wifi sees nothing: your apps answer only to your mesh devices"
       fi
@@ -7929,24 +9550,27 @@ else
       printf '  files   https://%s:%s\n' "$LAN_HOST" "$PORT_EDGE2" | "$GUM_BIN" style --foreground 240
       printf '  search  https://%s:%s\n' "$LAN_HOST" "$PORT_EDGE3" | "$GUM_BIN" style --foreground 240
       printf '  panel   https://%s:%s\n' "$LAN_HOST" "$PORT_EDGE4" | "$GUM_BIN" style --foreground 240
+        printf '  ad shield (home) https://%s:%s/admin\\n' "$LAN_HOST" "$PORT_EDGE5" | "$GUM_BIN" style --foreground 240
       printf '  console https://app.netbird.io (your NetBird account)\n' | "$GUM_BIN" style --foreground 240
 fi
-    printf '  ad shield https://redoubt.lan:%s/admin\n' "$PORT_EDGE5" | "$GUM_BIN" style --foreground 240
+    if [ -n "${VAULT_RECOVERY:-}" ] && [ "${VAULT_FSTYPE:-}" != "ext4" ] && [ "${VAULT_FSTYPE:-}" != "f2fs" ]; then
+      # fresh installs only, same rule as the plain branch: the rewrap
+      # happened this pass, so the owner gets the key here too. The one
+      # section nobody may skim over: red on purpose.
+      printf '  YOUR VAULT\n' | "$GUM_BIN" style --foreground "#f87171" --bold
+      printf '  recovery key: %s\n' "$VAULT_RECOVERY" | "$GUM_BIN" style --no-strip-ansi --foreground "#6ee7b7"
+      printf '  write it down now - it never shows again\n' | "$GUM_BIN" style --foreground "#f87171" --bold
+    fi
     echo ""
     "$GUM_BIN" style --foreground "#34d399" --bold "YOUR DEVICES"
     printf '  %s\n' "${ACCESS_MESH#device mesh: }" | "$GUM_BIN" style --foreground "#6ee7b7"
     printf "  phone cert: ${EM3}http://%s:8086/ca${EM2}  (open on the device, install it)\n" "${MESH_IP:-$LAN_IP}" | "$GUM_BIN" style --no-strip-ansi --foreground "#6ee7b7"
     echo ""
-    if [ "$REINSTALL" != "1" ]; then
-      "$GUM_BIN" style --foreground "#34d399" --bold "CREDENTIALS"
-      sed 's/^/  /' /etc/redoubt/credentials.txt 2>/dev/null | "$GUM_BIN" style --foreground 255
-    else
-      "$GUM_BIN" style --foreground 240 "credentials: redoubt creds (kept from your first install)"
-    fi
+    "$GUM_BIN" style --foreground 240 "credentials kept (read them with: redoubt creds)"
     echo ""
     "$GUM_BIN" style --foreground 240 "Run: redoubt (status | creds | update | guide${QR_HINT})"
     if [ "${FF_RUNNING:-0}" = "1" ]; then
-      "$GUM_BIN" style --foreground 240 "Browser was open during the install: close and reopen it for the green padlock (or run: redoubt update)"
+      "$GUM_BIN" style --foreground 240 "Browser was open: reopen it for the green padlock"
     fi
   else
     print_bastion
@@ -7962,16 +9586,16 @@ fi
     printf "${EM2}  search:  ${EM3}https://${APPS_HOST}:%s${RESET}\n" "$PORT_EDGE3"
     printf "${EM2}  dockge:  ${EM3}http://127.0.0.1:%s${RESET}\n" "$PORT_DOCKGE"
     printf "${EM2}  panel:   ${EM3}https://${APPS_HOST}:%s${RESET}\n" "$PORT_EDGE4"
-    printf "${EM2}  ad shield: ${EM3}https://redoubt.lan:%s/admin${RESET}\n" "$PORT_EDGE5"
 if [ "$MESH_MODE" = "selfhost" ]; then
         printf "${EM1}  your mesh${RESET}\n"
-        printf "${EM2}    console https://${REMOTE_HOST}:%s (NetBird dashboard, your owner login)${RESET}\n" "$PORT_DASH"
+        printf "${EM2}    console https://${REMOTE_HOST}:%s (NetBird dashboard)${RESET}\n" "$PORT_DASH"
         if [ "${FW_DECISION:-}" = "on" ]; then
           printf "${EM1}  home wifi${RESET}\n"
           printf "${EM2}    photos  https://${LAN_HOST}:%s${RESET}\n" "$PORT_EDGE1"
           printf "${EM2}    files   https://${LAN_HOST}:%s${RESET}\n" "$PORT_EDGE2"
           printf "${EM2}    search  https://${LAN_HOST}:%s${RESET}\n" "$PORT_EDGE3"
           printf "${EM2}    panel   https://${LAN_HOST}:%s${RESET}\n" "$PORT_EDGE4"
+          printf "${EM2}    ad shield (home) https://${LAN_HOST}:%s/admin${RESET}\\n" "$PORT_EDGE5"
         else
           printf "${EM2}    the wifi sees nothing: your apps answer only to your mesh devices${RESET}\n"
         fi
@@ -7981,15 +9605,25 @@ else
         printf "${EM2}    files   https://${LAN_HOST}:%s${RESET}\n" "$PORT_EDGE2"
         printf "${EM2}    search  https://${LAN_HOST}:%s${RESET}\n" "$PORT_EDGE3"
         printf "${EM2}    panel   https://${LAN_HOST}:%s${RESET}\n" "$PORT_EDGE4"
+          printf "${EM2}    ad shield (home) https://${LAN_HOST}:%s/admin${RESET}\\n" "$PORT_EDGE5"
         printf "${EM2}    console https://app.netbird.io (your NetBird account)${RESET}\n"
 fi
-      printf "${EM2}    ad shield https://redoubt.lan:%s/admin${RESET}\n" "$PORT_EDGE5"
+    if [ -n "${VAULT_RECOVERY:-}" ] && [ "${VAULT_FSTYPE:-}" != "ext4" ] && [ "${VAULT_FSTYPE:-}" != "f2fs" ]; then
+      # fresh installs only: the rewrap happened this pass, so the
+      # owner gets the key here too (headless boxes never see the
+      # vault files). Re-runs carry no recovery value: it never
+      # shows again, on purpose. Red on purpose as well: this is
+      # the one section of the reveal nobody may skim over.
+      printf "${ERR}  YOUR VAULT${RESET}\n"
+      printf "${ERR}  recovery key: ${EM3}%s${RESET}\n" "$VAULT_RECOVERY"
+      printf "${ERR}  write it down now - it never shows again${RESET}\n"
+    fi
     printf "${EM1}  YOUR DEVICES${RESET}\n"
     printf "${EM2}  %s${RESET}\n" "${ACCESS_MESH#device mesh: }"
-    printf "${EM2}  phone cert: ${EM3}http://%s:8086/ca${EM2}  (open on the device, install it)${RESET}\n" "${MESH_IP:-$LAN_IP}"
+    printf "${EM2}  phone cert: ${EM3}http://${REMOTE_HOST}:8086/ca${EM2}  (open on the device, install it)${RESET}\n"
     echo "  run: redoubt (creds, guide, status, update${QR_HINT})"
     if [ "${FF_RUNNING:-0}" = "1" ]; then
-      echo "  Browser was open during the install: close and reopen it for the green padlock (or run: redoubt update)"
+      echo "  Browser was open: reopen it for the green padlock"
     fi
     if [ "$HAS_GUI" = "0" ]; then
       echo "  no screen here: redoubt guide prints the phone steps as text"
@@ -8004,6 +9638,32 @@ fi
 if mountpoint -q "${MYREDOUBT:-/nonexistent}" 2>/dev/null; then
   fusermount -u "$MYREDOUBT" 2>/dev/null || true
   dbg "OK: the owner vault unmounted after the pass (the login hook reopens it as the owner)"
+fi
+# a staged welcome wrote into the root-only park: the real folder
+# comes back for the hand-over and the reopen below
+[ "${WELCOME_STAGED:-0}" = "1" ] && MYREDOUBT="$MYREDOUBT_REAL"
+# the unmount reveals the underlying mountpoint dir, born root under
+# the pass umask: hand it and the key conf dir over, or the owner's
+# login hook cannot mount (a root 700 mountpoint blocks them) and the
+# folder reads empty
+_VAULT_UID=$(stat -c %u "${OWNER_HOME:-$HOME}" 2>/dev/null || echo 0)
+if [ "$_VAULT_UID" != "0" ]; then
+  [ -n "${MYREDOUBT:-}" ] && chown "$_VAULT_UID" "$MYREDOUBT" 2>/dev/null || true
+  [ -n "${VAULT_CONF:-}" ] && chown -R "$_VAULT_UID" "$(dirname "$VAULT_CONF")" 2>/dev/null || true
+fi
+# hand the vault back to the owner right away: the fresh files show
+# the moment the pass ends, not after the next login. The launcher
+# reads the key from the owner's home, so it must run as them. The
+# Linux owner is OWNER_SYS_USER: OWNER_USER is the panel login and need
+# not exist, so su to it failed silently and the folder stayed empty.
+if [ -n "${VAULT_CIPHER:-}" ] && [ -d "$VAULT_CIPHER" ] \
+   && [ -n "${MYREDOUBT:-}" ] && ! mountpoint -q "$MYREDOUBT" 2>/dev/null; then
+  if [ -n "${OWNER_SYS_USER:-}" ]; then
+    su "$OWNER_SYS_USER" -c "/usr/local/bin/redoubt-vault-open mount" 2>/dev/null || true
+  else
+    dbg "WARNING: vault owner unresolved - the vault stays closed until the owner logs in"
+  fi
+  mount | grep -q "$MYREDOUBT type fuse" && dbg "OK: the owner vault reopened for the owner (the files show now)"
 fi
 
 exit $RC
