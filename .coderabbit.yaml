@@ -1,0 +1,24 @@
+reviews:
+  profile: chill
+  path_filters:
+    - "!**/*.bak"
+    - "!**/*.tmp"
+  path_instructions:
+    - path: "kit/**"
+      instructions: |
+        The kit is the Redoubt self-host installer (bash, ~10k lines). It
+        runs as root on the owner's box and everything it downloads or
+        reads is attacker-controlled input. The pinned sha256 checks
+        (HERMES_INSTALL_SHA, image digests, VAULT_SHA) are the crown
+        jewels: flag any path that skips or weakens a pin check. Flag
+        any sudoers grant that is broader than one fixed command, any
+        secret that would land in a log or an argv, and any firewall or
+        edge change that opens more than the declared doors. Dictate
+        fixes as OLD/NEW pairs with line numbers. English only, zero
+        em-dashes, comments explain the why.
+    - path: "kit/redoubt.sh"
+      instructions: |
+        Same as kit/**. Review the whole script for the fail-closed
+        invariants: a failed check must never open a door, a re-run must
+        be idempotent, and the guardian must never gain root outside
+        the redoubt-svc helper.
