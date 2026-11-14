@@ -353,6 +353,16 @@ KIT_BUILD="44"
 # saved env is sourced below (the file would overwrite them), so an
 # explicit REDOUBT_HA on a re-run still wins over the saved choice
 HA_FLAG="${REDOUBT_HA:-}"
+MAIL_FLAG="${REDOUBT_MAIL:-}"
+MAIL_DOMAIN_FLAG="${REDOUBT_MAIL_DOMAIN:-}"
+MAIL_DNS_FLAG="${REDOUBT_MAIL_DNS:-}"
+MAIL_EXPOSE_FLAG="${REDOUBT_MAIL_EXPOSE:-}"
+MAIL_SUBMIT_FLAG="${REDOUBT_MAIL_SUBMIT:-}"
+MAIL_IMAP_FLAG="${REDOUBT_MAIL_IMAP:-}"
+MAIL_RELAY_FLAG="${REDOUBT_MAIL_RELAY:-}"
+MAIL_MX_CUTOVER_FLAG="${REDOUBT_MAIL_MX_CUTOVER:-}"
+MAIL_PUB4_FLAG="${REDOUBT_MAIL_PUB4:-}"
+MAIL_PUB6_FLAG="${REDOUBT_MAIL_PUB6:-}"
 
 # Self-heal: a run that got killed can leave the DNS lockdown active while
 # the resolver chain never came up on 127.0.0.1:53 (pi-hole fronts
@@ -2824,6 +2834,13 @@ GM
 }
 GUAC_PROF=""
 [ "${REDOUBT_GUAC:-0}" = "1" ] && GUAC_PROF=" --profile guacamole"
+# the recovery paths below repeat exactly the profile set this pass
+# started with, never a wildcard: a '*' would resurrect profile-bound
+# services beyond the stack's own selection (the mail tier runs as a
+# separate compose project in its own directory, and a wildcard here
+# must never become its back door)
+STACK_PROF=""
+[ "$MESH_MODE" = "selfhost" ] && STACK_PROF=" --profile selfhost"
 
 # rolling tags pull fresh versions on every pass, and the old ones
 # linger eating the disk. Prune before pulling so the new images have
@@ -3537,8 +3554,12 @@ _STACK_DOWN=$(printf '%s' "$_STACK_PS" | awk '$2=="exited"||$2=="dead"{print $1}
 if [ -n "$_STACK_DOWN" ] && grep -q 'unexpectedly nil' "$COMP_OUT" 2>/dev/null; then
   docker rm -f "$_STACK_DOWN" >/dev/null 2>&1 || true
   # the profile flag matters here: without it the selfhost services
-  # (netbird-server, dashboard) never heal
-  docker compose --profile '*' up -d >> "$LOG" 2>&1 || true
+  # (netbird-server, dashboard) never heal. The heal repeats exactly
+  # the profile set this pass started with, never a wildcard: a '*'
+  # would resurrect profile-bound services beyond the stack's own
+  # selection (the mail tier is a separate compose project elsewhere,
+  # and a wildcard here must never sweep it back in)
+  docker compose$STACK_PROF$GUAC_PROF up -d >> "$LOG" 2>&1 || true
   log "OK: stack rebuilt ($_STACK_DOWN had a stale layer)"
   # the verdict must match what the owner sees: recount after the heal
   _STACK_PS2=$(stack_ps)
@@ -3554,7 +3575,7 @@ fi
 # pass: the wake checks never recover without this, they only wait.
 if grep -q 'failed to set up container networking' "$COMP_OUT" 2>/dev/null || bridge_dead; then
   bridge_heal
-  docker compose --profile '*' up -d >> "$LOG" 2>&1 || true
+  docker compose$STACK_PROF$GUAC_PROF up -d >> "$LOG" 2>&1 || true
   log "OK: docker network rebuilt (the old bridge died with a wipe); stack re-created"
   _STACK_PS3=$(stack_ps)
   _STACK_SUM3=$(printf '%s' "$_STACK_PS3" | awk -v c="$EM2" '$2=="running"{up++} END{printf "  %sstack: %d/%d containers running\033[0m", c, up, NR}')
@@ -5592,6 +5613,309 @@ else
   rm -f /etc/systemd/system/redoubt-ha-gate.service /usr/local/sbin/redoubt-ha-gate 2>/dev/null || true
 fi
 
+# 8c) Mail (optional: the installer flag REDOUBT_MAIL). The opt-in
+# persists in the env like every other owner choice, so an omitted
+# flag keeps the saved answer and a later REDOUBT_MAIL=0 walks the
+# tier back (the project stops, the edge site and the panel tile go,
+# the mail queues, accounts, dkim keys and config volumes stay). The
+# tier is a separate compose project (svc-mail) in its own directory,
+# outside the stack's profile wildcards, so a stack recovery never
+# sweeps it. This early pass only reconciles the choice, validates
+# the owner's domain and roster, and reserves the edge door so the
+# panel seed below can carry the tile link; the project itself is
+# built and its door gated after the firewall section, where the
+# owner's saved door story is known. Fail closed: unreviewed
+# releases, a missing or invalid domain, or a missing roster all
+# keep the tier off.
+MAIL_STALWART_VERSION=""
+MAIL_BULWARK_VERSION=""
+# the reviewed release pins for the two containers. Empty until the
+# release review fills them: an empty pin fails closed and the tier
+# never starts on an unreviewed image. Never guess a digest.
+MAIL_STALWART_DIGEST=""
+MAIL_BULWARK_DIGEST=""
+MAIL_IMAGE_STALWART="ghcr.io/stalwartlabs/mail-server"
+MAIL_IMAGE_BULWARK="ghcr.io/bulwark-project/bulwark"
+MAIL_SVC_DIR="/opt/redoubt/services/svc-mail"
+MAIL_CATALOG="/opt/redoubt/catalog/mail"
+MAIL_GATE_DIR="/etc/redoubt/svc-gates"
+MAIL_CREDS="/etc/redoubt/mail-credentials"
+MAIL_ROSTER="/etc/redoubt/mail-roster.txt"
+MAIL_KEYS="/var/lib/redoubt/mail-keys"
+# the explicit installer flag wins over the saved choice; a missing
+# flag keeps the one already sourced from the env
+[ -n "${MAIL_FLAG:-}" ] && REDOUBT_MAIL="$MAIL_FLAG"
+case "${REDOUBT_MAIL:-}" in 1|0) ;; *) REDOUBT_MAIL=0 ;; esac
+MAIL_ON="${REDOUBT_MAIL}"
+# persist the choice: every later pass reconciles to it even when the
+# installer flag is not repeated
+if grep -qs '^REDOUBT_MAIL=' "$_ENV_TMP" 2>/dev/null; then
+  sed -i "s|^REDOUBT_MAIL=.*|REDOUBT_MAIL=$REDOUBT_MAIL|" "$_ENV_TMP"
+else
+  echo "REDOUBT_MAIL=$REDOUBT_MAIL" >> "$_ENV_TMP"
+fi
+kit_env_commit
+
+# the owner's domain is the only source of mail addresses and of the
+# mail hostname: the kit never invents a domain and never infers
+# family addresses from the single owner account. A later explicit
+# flag still wins over a saved domain.
+[ -n "${MAIL_DOMAIN_FLAG:-}" ] && REDOUBT_MAIL_DOMAIN="$MAIL_DOMAIN_FLAG"
+MAIL_DOMAIN=$(printf '%s' "${REDOUBT_MAIL_DOMAIN:-}" | tr 'A-Z' 'a-z')
+# the mail hostname the owner's MX and A records must point at; the
+# kit derives it, prints it, and never touches DNS itself
+MAIL_HOST="mail.${MAIL_DOMAIN}"
+mail_domain_ok() {
+  # an owner-supplied fqdn: labels of letters, digits and hyphens, no
+  # leading or trailing hyphen per label, no empty labels, at least
+  # one dot. Punycode is the owner's own to supply; the kit never
+  # transliterates it.
+  local _d="$1"
+  case "$_d" in
+    *[!A-Za-z0-9.-]*|.|-*|*-|*..*|.*|*.|*-.*|*.-*) return 1 ;;
+  esac
+  case "$_d" in *.*) return 0 ;; *) return 1 ;; esac
+}
+# one local-part per line, # comments and blank lines skipped. The
+# full address is local-part@MAIL_DOMAIN and exists only when it is
+# written here: never inferred from the owner account. The file must
+# be root-owned and private, or any local user could order accounts.
+mail_roster_ok() {
+  [ -f "$MAIL_ROSTER" ] || return 1
+  [ "$(stat -c '%u %a' "$MAIL_ROSTER" 2>/dev/null)" = "0 600" ] || return 1
+  local l n=0
+  while IFS= read -r l; do
+    case "$l" in ''|\#*) continue ;; esac
+    l="${l#"${l%%[![:space:]]*}"}"
+    l="${l%"${l##*[![:space:]]}"}"
+    case "$l" in *[[:space:]]*) return 1 ;; esac
+    # RFC 5321 dot-atom: atom specials and dots, no leading, trailing
+    # or consecutive dots. The apostrophe special is rejected on
+    # purpose: no real roster needs it and leaving it out keeps the
+    # validator clear of shell quoting traps. grep does the atom
+    # class check because a case pattern cannot carry a literal &
+    case "$l" in .*|*.|*..*) return 1 ;; esac
+    printf '%s' "$l" | grep -Eq '^[A-Za-z0-9.!#$%&*+/=?^_`{|}~-]+$' || return 1
+    [ "${#l}" -le 64 ] || return 1
+    n=$((n+1))
+  done < "$MAIL_ROSTER"
+  [ "$n" -gt 0 ]
+}
+if [ -n "$MAIL_DOMAIN" ] && mail_domain_ok "$MAIL_DOMAIN"; then
+  # persist the validated domain so later passes keep it without the
+  # installer flag being repeated
+  if grep -qs '^REDOUBT_MAIL_DOMAIN=' "$_ENV_TMP" 2>/dev/null; then
+    sed -i "s|^REDOUBT_MAIL_DOMAIN=.*|REDOUBT_MAIL_DOMAIN=$MAIL_DOMAIN|" "$_ENV_TMP"
+  else
+    echo "REDOUBT_MAIL_DOMAIN=$MAIL_DOMAIN" >> "$_ENV_TMP"
+  fi
+  kit_env_commit
+elif [ -n "$MAIL_DOMAIN" ]; then
+  dbg "WARNING: REDOUBT_MAIL_DOMAIN is not a valid domain: the mail tier stays off"
+fi
+
+# the delivery plan: paste prints the records for the owner to apply
+# by hand (the honest default: nothing moves without the owner's own
+# act), managed reconciles through the owner's provider adapter in
+# the late pass, which alone holds the scoped provider credential.
+# The kit itself never calls a provider API.
+[ -n "${MAIL_DNS_FLAG:-}" ] && REDOUBT_MAIL_DNS="$MAIL_DNS_FLAG"
+case "${REDOUBT_MAIL_DNS:-}" in managed|paste) ;; *) REDOUBT_MAIL_DNS=paste ;; esac
+MAIL_DNS_MODE="${REDOUBT_MAIL_DNS}"
+if grep -qs '^REDOUBT_MAIL_DNS=' "$_ENV_TMP" 2>/dev/null; then
+  sed -i "s|^REDOUBT_MAIL_DNS=.*|REDOUBT_MAIL_DNS=$MAIL_DNS_MODE|" "$_ENV_TMP"
+else
+  echo "REDOUBT_MAIL_DNS=$MAIL_DNS_MODE" >> "$_ENV_TMP"
+fi
+kit_env_commit
+# the public exposure decision, default closed: off publishes no SMTP
+# door, relay sends outbound through the owner's relay only, on
+# publishes inbound 25 plus whatever the owner selected below
+[ -n "${MAIL_EXPOSE_FLAG:-}" ] && REDOUBT_MAIL_EXPOSE="$MAIL_EXPOSE_FLAG"
+case "${REDOUBT_MAIL_EXPOSE:-}" in on|relay|off) ;; *) REDOUBT_MAIL_EXPOSE=off ;; esac
+MAIL_EXPOSE="${REDOUBT_MAIL_EXPOSE}"
+if grep -qs '^REDOUBT_MAIL_EXPOSE=' "$_ENV_TMP" 2>/dev/null; then
+  sed -i "s|^REDOUBT_MAIL_EXPOSE=.*|REDOUBT_MAIL_EXPOSE=$MAIL_EXPOSE|" "$_ENV_TMP"
+else
+  echo "REDOUBT_MAIL_EXPOSE=$MAIL_EXPOSE" >> "$_ENV_TMP"
+fi
+kit_env_commit
+# submission and IMAP ride their own opt-ins, both default closed: a
+# public 587 or 993 door never opens just because inbound 25 did
+[ -n "${MAIL_SUBMIT_FLAG:-}" ] && REDOUBT_MAIL_SUBMIT="$MAIL_SUBMIT_FLAG"
+case "${REDOUBT_MAIL_SUBMIT:-}" in 1|0) ;; *) REDOUBT_MAIL_SUBMIT=0 ;; esac
+[ -n "${MAIL_IMAP_FLAG:-}" ] && REDOUBT_MAIL_IMAP="$MAIL_IMAP_FLAG"
+case "${REDOUBT_MAIL_IMAP:-}" in 1|0) ;; *) REDOUBT_MAIL_IMAP=0 ;; esac
+if grep -qs '^REDOUBT_MAIL_SUBMIT=' "$_ENV_TMP" 2>/dev/null; then
+  sed -i "s|^REDOUBT_MAIL_SUBMIT=.*|REDOUBT_MAIL_SUBMIT=$REDOUBT_MAIL_SUBMIT|" "$_ENV_TMP"
+else
+  echo "REDOUBT_MAIL_SUBMIT=$REDOUBT_MAIL_SUBMIT" >> "$_ENV_TMP"
+fi
+if grep -qs '^REDOUBT_MAIL_IMAP=' "$_ENV_TMP" 2>/dev/null; then
+  sed -i "s|^REDOUBT_MAIL_IMAP=.*|REDOUBT_MAIL_IMAP=$REDOUBT_MAIL_IMAP|" "$_ENV_TMP"
+else
+  echo "REDOUBT_MAIL_IMAP=$REDOUBT_MAIL_IMAP" >> "$_ENV_TMP"
+fi
+kit_env_commit
+# the cutover confirmation: MX records never move without it. Managed
+# mode hands the MX line to the provider adapter only when this is 1;
+# paste mode prints it flagged for the owner's own planned cutover
+[ -n "${MAIL_MX_CUTOVER_FLAG:-}" ] && REDOUBT_MAIL_MX_CUTOVER="$MAIL_MX_CUTOVER_FLAG"
+case "${REDOUBT_MAIL_MX_CUTOVER:-}" in 1|0) ;; *) REDOUBT_MAIL_MX_CUTOVER=0 ;; esac
+if grep -qs '^REDOUBT_MAIL_MX_CUTOVER=' "$_ENV_TMP" 2>/dev/null; then
+  sed -i "s|^REDOUBT_MAIL_MX_CUTOVER=.*|REDOUBT_MAIL_MX_CUTOVER=$REDOUBT_MAIL_MX_CUTOVER|" "$_ENV_TMP"
+else
+  echo "REDOUBT_MAIL_MX_CUTOVER=$REDOUBT_MAIL_MX_CUTOVER" >> "$_ENV_TMP"
+fi
+kit_env_commit
+# the outbound relay (host[:port]) and the owner-supplied public
+# addresses for the A/AAAA records. The kit never calls an ip echo
+# service: a box that keeps its public addresses to itself leaves
+# those records to the owner. Both persist validated, or not at all.
+[ -n "${MAIL_RELAY_FLAG:-}" ] && REDOUBT_MAIL_RELAY="$MAIL_RELAY_FLAG"
+MAIL_RELAY=$(printf '%s' "${REDOUBT_MAIL_RELAY:-}" | tr 'A-Z' 'a-z')
+case "$MAIL_RELAY" in
+  *[!a-z0-9.:-]*|-*|*-|*..*|.) MAIL_RELAY="" ;;
+  *:*)
+    _mail_rp="${MAIL_RELAY##*:}"
+    case "$_mail_rp" in ''|*[!0-9]*|0*) MAIL_RELAY="" ;; *) [ "$_mail_rp" -le 65535 ] || MAIL_RELAY="" ;; esac
+    ;;
+esac
+[ -n "$MAIL_RELAY" ] && {
+  if grep -qs '^REDOUBT_MAIL_RELAY=' "$_ENV_TMP" 2>/dev/null; then
+    sed -i "s|^REDOUBT_MAIL_RELAY=.*|REDOUBT_MAIL_RELAY=$MAIL_RELAY|" "$_ENV_TMP"
+  else
+    echo "REDOUBT_MAIL_RELAY=$MAIL_RELAY" >> "$_ENV_TMP"
+  fi
+  kit_env_commit
+}
+[ -n "${MAIL_PUB4_FLAG:-}" ] && REDOUBT_MAIL_PUB4="$MAIL_PUB4_FLAG"
+[ -n "${MAIL_PUB6_FLAG:-}" ] && REDOUBT_MAIL_PUB6="$MAIL_PUB6_FLAG"
+mail_ip_lit() {  # true when $1 is a plain ip literal (family $2)
+  case "$2" in
+    4) printf '%s' "$1" | grep -Eq '^([0-9]{1,3}\.){3}[0-9]{1,3}$' || return 1 ;;
+    6) printf '%s' "$1" | grep -Eq '^[0-9a-fA-F:]+$' || return 1 ;;
+    *) return 1 ;;
+  esac
+}
+MAIL_PUB4="${REDOUBT_MAIL_PUB4:-}"
+MAIL_PUB6="${REDOUBT_MAIL_PUB6:-}"
+mail_ip_lit "$MAIL_PUB4" 4 || MAIL_PUB4=""
+mail_ip_lit "$MAIL_PUB6" 6 || MAIL_PUB6=""
+if grep -qs '^REDOUBT_MAIL_PUB4=' "$_ENV_TMP" 2>/dev/null; then
+  sed -i "s|^REDOUBT_MAIL_PUB4=.*|REDOUBT_MAIL_PUB4=$MAIL_PUB4|" "$_ENV_TMP"
+else
+  echo "REDOUBT_MAIL_PUB4=$MAIL_PUB4" >> "$_ENV_TMP"
+fi
+if grep -qs '^REDOUBT_MAIL_PUB6=' "$_ENV_TMP" 2>/dev/null; then
+  sed -i "s|^REDOUBT_MAIL_PUB6=.*|REDOUBT_MAIL_PUB6=$MAIL_PUB6|" "$_ENV_TMP"
+else
+  echo "REDOUBT_MAIL_PUB6=$MAIL_PUB6" >> "$_ENV_TMP"
+fi
+kit_env_commit
+
+if [ "$MAIL_ON" = "1" ]; then
+  # fail closed: unpinned releases, an unverified domain and a missing
+  # roster all keep the tier off, whatever else this pass would like
+  if [ -z "$MAIL_STALWART_DIGEST" ] || [ -z "$MAIL_BULWARK_DIGEST" ] \
+     || [ -z "$MAIL_STALWART_VERSION" ] || [ -z "$MAIL_BULWARK_VERSION" ]; then
+    dbg "mail tier: stage pending (no reviewed release pins yet: MAIL_STALWART_DIGEST and MAIL_BULWARK_DIGEST are empty until the release review fills them; digests are never guessed)"
+    MAIL_ON=0
+  elif [ -z "$MAIL_DOMAIN" ] || ! mail_domain_ok "$MAIL_DOMAIN"; then
+    dbg "mail tier: stage pending (REDOUBT_MAIL_DOMAIN missing or invalid: the tier requires the owner's real domain, it never invents one)"
+    MAIL_ON=0
+  elif ! mail_roster_ok; then
+    dbg "mail tier: stage pending (no valid $MAIL_ROSTER: one local-part per line, root-owned 600; family accounts are never inferred from the owner account)"
+    MAIL_ON=0
+  fi
+fi
+if [ "$MAIL_ON" = "1" ]; then
+  # the edge door: one free port from the service block, chosen under
+  # the builder's own lock and saved in the env, so re-runs keep the
+  # same link and the builder re-checks it before use. The built
+  # project's own meta wins when it exists.
+  MAIL_DOOR="${MAIL_DOOR:-}"
+  if [ -f "$MAIL_SVC_DIR/meta" ]; then
+    _mail_meta_door=$(sed -n 's/^DOOR=//p' "$MAIL_SVC_DIR/meta" 2>/dev/null || true)
+    [ -n "$_mail_meta_door" ] && MAIL_DOOR="$_mail_meta_door"
+  fi
+  _mail_taken=0
+  if [ -n "$MAIL_DOOR" ]; then
+    for _mm in /opt/redoubt/services/*/meta; do
+      [ -f "$_mm" ] || continue
+      [ "$_mm" = "$MAIL_SVC_DIR/meta" ] && continue
+      [ "$(sed -n 's/^DOOR=//p' "$_mm" 2>/dev/null)" = "$MAIL_DOOR" ] && _mail_taken=1
+    done
+  fi
+  if [ -z "$MAIL_DOOR" ] || [ "$_mail_taken" = "1" ] || [ -z "${SVC_PORT_LO:-}" ]; then
+    MAIL_DOOR=""
+    if [ -n "${SVC_PORT_LO:-}" ]; then
+      # the same lock file redoubt-svc flocks: the two allocators
+      # cannot race each other for a door
+      exec 9>/run/redoubt-svc.lock
+      flock -w 120 9 || true
+      _mail_used=""
+      for _mm in /opt/redoubt/services/*/meta; do
+        [ -f "$_mm" ] || continue
+        _mail_used="$_mail_used $(sed -n 's/^DOOR=//p' "$_mm" 2>/dev/null)"
+      done
+      for _md in $(seq "$SVC_PORT_LO" $((SVC_PORT_LO + SVC_PORT_N - 1))); do
+        case " $_mail_used " in *" $_md "*) ;; *) MAIL_DOOR="$_md"; break ;; esac
+      done
+      flock -u 9 2>/dev/null || true
+    fi
+  fi
+  if [ -n "$MAIL_DOOR" ]; then
+    sed -i '/^MAIL_DOOR=/d' "$_ENV_TMP"
+    echo "MAIL_DOOR=$MAIL_DOOR" >> "$_ENV_TMP"
+    kit_env_commit
+    dbg "OK: mail door reserved ($MAIL_DOOR)"
+  else
+    dbg "WARNING: no free service door: the mail tier stays off on this box"
+    MAIL_ON=0
+  fi
+else
+  # walking it back: the project stops, the edge site and the panel
+  # tile go, and the mail queues, accounts, dkim keys and config
+  # volumes all stay (named volumes survive a compose down; the
+  # roster, credentials and keys are files the kit never deletes).
+  # Warn before disabling: delivery can fail or queue elsewhere, and
+  # the kit never silently changes the domain's MX records.
+  if [ -n "$MAIL_DOMAIN" ] && mail_domain_ok "$MAIL_DOMAIN"; then
+    dbg "mail tier off: mail for $MAIL_DOMAIN can fail or queue elsewhere; the kit never changes MX records (point them at $MAIL_HOST yourself, or at a fallback host you control)"
+  fi
+  mkdir -p "$MAIL_GATE_DIR"
+  printf 'off\n' > "$MAIL_GATE_DIR/svc-mail"
+  chmod 644 "$MAIL_GATE_DIR/svc-mail" 2>/dev/null || true
+  if [ -f "$MAIL_SVC_DIR/compose.yml" ]; then
+    docker compose -p svc-mail -f "$MAIL_SVC_DIR/compose.yml" down >/dev/null 2>&1 || true
+  fi
+  rm -f "$STACKDIR/caddy-services/svc-mail.caddy" 2>/dev/null || true
+  # the SMTP doors close with the tier: the kit-managed host rules for
+  # 25, 587 and 993 come out in both firewall forms, and the boot
+  # gate's SMTP story goes to off so a reboot never re-justifies them.
+  # 465 rides the cleanup too in case an older pass ever added it.
+  printf 'off\n' > "$MAIL_GATE_DIR/svc-mail-smtp"
+  chmod 644 "$MAIL_GATE_DIR/svc-mail-smtp" 2>/dev/null || true
+  for _msp in 25 587 465 993; do
+    if command -v ufw >/dev/null 2>&1; then
+      ufw delete allow "$_msp/tcp" >/dev/null 2>&1 || true
+      ufw delete allow in on wt0 to any port "$_msp" proto tcp >/dev/null 2>&1 || true
+    fi
+    if command -v firewall-cmd >/dev/null 2>&1; then
+      firewall-cmd --permanent --remove-port="$_msp/tcp" >/dev/null 2>&1 || true
+      firewall-cmd --permanent --zone=redoubt-mesh --remove-port="$_msp/tcp" >/dev/null 2>&1 || true
+    fi
+  done
+  command -v firewall-cmd >/dev/null 2>&1 && firewall-cmd --reload >/dev/null 2>&1 || true
+  if docker ps --format '{{.Names}}' 2>/dev/null | grep -qx redoubt-edge-local-1; then
+    docker exec redoubt-edge-local-1 caddy reload --config /etc/caddy/Caddyfile --adapter caddyfile >/dev/null 2>&1 \
+      || docker restart redoubt-edge-local-1 >/dev/null 2>&1 || true
+  fi
+  systemctl disable --now redoubt-mail-gate.service >/dev/null 2>&1 || true
+  rm -f /etc/systemd/system/redoubt-mail-gate.service /usr/local/sbin/redoubt-mail-gate 2>/dev/null || true
+fi
+
 SEED_SECTIONS="full"
 [ "$MESH_MODE" = "selfhost" ] && SEED_SECTIONS="minimal"
 # the remote desktop tile seeds only when the owner asked for the
@@ -5602,6 +5926,11 @@ SEED_GUAC=""
 # door was reserved for it this pass
 SEED_HA=""
 [ "${REDOUBT_HA:-0}" = "1" ] && [ -n "${HA_DOOR:-}" ] && SEED_HA="https://${SEED_HOST}:${HA_DOOR}"
+# the mail tile seeds only when the tier reconciled on this pass (a
+# reviewed pin, a valid domain and roster, and a reserved door); the
+# fail-closed states above leave MAIL_ON=0, so no dead tile survives
+SEED_MAIL=""
+[ "$MAIL_ON" = "1" ] && [ -n "${MAIL_DOOR:-}" ] && SEED_MAIL="https://${SEED_HOST}:${MAIL_DOOR}"
 # the guardian's panel MCP key: only the id rides into the seed (it is
 # not secret), so the seed can keep a key that still exists instead of
 # minting a new one every pass. The tr keeps a damaged file from
@@ -5661,6 +5990,7 @@ SEED_CONSOLE=$SEED_CONSOLE
 SEED_CONSOLE_PING=$SEED_CONSOLE_PING
 SEED_GUAC=$SEED_GUAC
 SEED_HA=$SEED_HA
+SEED_MAIL=$SEED_MAIL
 SEED_MCP_ID=$SEED_MCP_ID
 __SEED_JS__
 SEEDENV
@@ -5750,6 +6080,26 @@ SEEDENV
       db.prepare("DELETE FROM item WHERE id = ?").run(haRows[h].id);
     }
     db.prepare("DELETE FROM app WHERE id = 'redoubt-app-homeassistant'").run();
+  }
+  if (process.env.SEED_MAIL) {
+    // the ping targets the Bulwark webmail container, the door's own
+    // backend: the edge door answers browsers with the local CA,
+    // while the panel's server-side ping reaches the mail project
+    // directly. The store keeps its admin listener on its own alias.
+    APPS.push({ id: "redoubt-app-mail", name: "Mail",
+      icon: "/icons/mail.svg",
+      href: process.env.SEED_MAIL,
+      ping: "http://svc-mail-web:8080" });
+  } else {
+    // a disabled mail tier removes its kit-owned tile on every pass:
+    // the app row and every item that references it go, so a later
+    // REDOUBT_MAIL=0 never leaves a dead tile on the board
+    var mailRows = db.prepare("SELECT id FROM item WHERE kind = 'app' AND options LIKE '%redoubt-app-mail%'").all();
+    for (var m = 0; m < mailRows.length; m++) {
+      db.prepare("DELETE FROM item_layout WHERE item_id = ?").run(mailRows[m].id);
+      db.prepare("DELETE FROM item WHERE id = ?").run(mailRows[m].id);
+    }
+    db.prepare("DELETE FROM app WHERE id = 'redoubt-app-mail'").run();
   }
 
   var uuid = function () {
@@ -6111,6 +6461,9 @@ if [ "${REDOUBT_WELCOME:-1}" = "1" ]; then
   cp "/var/lib/redoubt/caddy-local/cdn/gh/homarr-labs/dashboard-icons/svg/netbird.svg" "/var/lib/redoubt/caddy-local/icons/netbird.svg" 2>/dev/null || true
   cp "/var/lib/redoubt/caddy-local/cdn/gh/homarr-labs/dashboard-icons/svg/guacamole.svg" "/var/lib/redoubt/caddy-local/icons/guacamole.svg" 2>/dev/null || true
   cp "/var/lib/redoubt/caddy-local/cdn/gh/homarr-labs/dashboard-icons/svg/home-assistant.svg" "/var/lib/redoubt/caddy-local/icons/home-assistant.svg" 2>/dev/null || true
+  # the review confirms this slug once the mail tile goes live; a miss
+  # here only leaves the tile iconless, never breaks the board
+  cp "/var/lib/redoubt/caddy-local/cdn/gh/homarr-labs/dashboard-icons/svg/mail.svg" "/var/lib/redoubt/caddy-local/icons/mail.svg" 2>/dev/null || true
   fetch_icon_set "png" \
     "https://install.tryredoubt.com/install/icons-png.tar.gz" \
     "62fe3de3c0063620439024de5eab6b3e3351a21e248cf780e49c21dd42252b18" \
@@ -9068,13 +9421,24 @@ panel_tls() {
     f && /^}/ {exit}' "$CADDYFILE"
 }
 render_site() {  # $1 = name
-  local door port site tls
+  local door port site tls proxy
   door=$(meta "$1" DOOR); port=$(meta "$1" PORT)
+  proxy=$(meta "$1" PROXY)
   site=$(panel_site); tls=$(panel_tls)
   [ -n "$site" ] && [ -n "$tls" ] || die "panel site not found in the Caddyfile: refusing to guess"
   site=$(printf '%s' "$site" | sed -E "s/:${PORT_EDGE4}([, {])/:${door}\1/g")
-  printf '# service %s, written by redoubt-svc (refresh rewrites it)\n%s\n\t%s\n\treverse_proxy svc-%s:%s\n}\n' \
-    "$1" "$site" "$tls" "$1" "$port"
+  if [ -n "$proxy" ]; then
+    # the mail project routes its door to the webmail container and
+    # keeps the store's admin path to private ranges only: the mesh
+    # cgnat block keeps the owner's tailnet working while the public
+    # internet still aborts on it. The X-Forwarded headers ride only
+    # this one verified hop, never the admin hop.
+    printf '# service %s, written by redoubt-svc (refresh rewrites it)\n%s\n\t%s\n\t@admin path /admin /admin/*\n\t@admins remote_ip 192.168.0.0/16 10.0.0.0/8 172.16.0.0/12 100.64.0.0/10 127.0.0.0/8 ::1 fc00::/7 fe80::/10\n\thandle @admin {\n\t\treverse_proxy @admins %s:8080\n\t\tabort 403\n\t}\n\thandle {\n\t\treverse_proxy %s:%s {\n\t\t\theader_up X-Forwarded-For {remote_host}\n\t\t\theader_up X-Forwarded-Proto https\n\t\t}\n\t}\n}\n' \
+      "$1" "$site" "$tls" "$1" "$proxy" "$port"
+  else
+    printf '# service %s, written by redoubt-svc (refresh rewrites it)\n%s\n\t%s\n\treverse_proxy svc-%s:%s\n}\n' \
+      "$1" "$site" "$tls" "$1" "$port"
+  fi
 }
 edge_apply() {
   # validate inside the running edge first: a bad block must never take
@@ -9330,7 +9694,7 @@ cmd_verify() {
 }
 
 cmd_refresh() {  # the kit calls this every pass: site files follow its rewrites
-  local m n changed=0 new
+  local m n changed=0 new prev
   for m in "$ROOT"/*/meta; do
     n=$(sed -n 's/^NAME=//p' "$m")
     if gate_off "$n"; then
@@ -9341,7 +9705,33 @@ cmd_refresh() {  # the kit calls this every pass: site files follow its rewrites
     fi
     new=$(render_site "$n" | sha256sum | cut -d' ' -f1)
     if [ "$new" != "$(cat "$ROOT/$n/site.sha256" 2>/dev/null)" ] || [ ! -f "$SNIP/$n.caddy" ]; then
-      render_site "$n" | put "$SNIP/$n.caddy" 644 > "$ROOT/$n/site.sha256"; changed=1
+      prev=""
+      if [ -n "$(meta "$n" PROXY)" ] && [ -f "$SNIP/$n.caddy" ]; then
+        cp -p "$SNIP/$n.caddy" "$SNIP/.$n.caddy.prev"; prev=1
+      fi
+      render_site "$n" | put "$SNIP/$n.caddy" 644 > "$ROOT/$n/site.sha256"
+      if [ "$prev" = "1" ]; then
+        # mail-style sites carry route blocks the generic render never
+        # did: validate inside the edge before keeping the new bytes,
+        # and roll back to the last good file (or to the closed door)
+        # when the edge rejects them
+        if ! docker exec "$EDGE" caddy validate --config /etc/caddy/Caddyfile --adapter caddyfile >/dev/null 2>&1; then
+          if [ -f "$SNIP/.$n.caddy.prev" ]; then
+            mv -f "$SNIP/.$n.caddy.prev" "$SNIP/$n.caddy"
+            sha "$SNIP/$n.caddy" > "$ROOT/$n/site.sha256"
+            echo "WARNING $n: the edge rejected the new site: rolled back to the last good one"
+          else
+            rm -f "$SNIP/$n.caddy"
+            : > "$ROOT/$n/site.sha256"
+            printf 'off\n' > "$GATES/$n"
+            chmod 644 "$GATES/$n" 2>/dev/null || true
+            echo "WARNING $n: the edge rejected the new site: door closed until a kit pass fixes it"
+          fi
+        else
+          rm -f "$SNIP/.$n.caddy.prev"
+        fi
+      fi
+      changed=1
     fi
     [ "$(sha "$ROOT/$n/compose.yml")" = "$(cat "$ROOT/$n/compose.sha256")" ] \
       || echo "WARNING $n: compose.yml differs from what redoubt-svc wrote"
@@ -10513,6 +10903,955 @@ HAHTTP
   fi
 }
 ha_reconcile
+
+# 8d) Mail reconcile: the early pass reserved the door and seeded the
+# tile; this late pass builds the two-service project (Stalwart, the
+# store, fronted by Bulwark, the filter and dkim signer) strictly
+# from the reviewed catalog, provisions the administrator and the
+# family roster, and opens or closes the edge door to match the
+# owner's saved firewall story and the rules that are actually
+# loaded. Runs on every pass with or without the guardian. Anything
+# unverified leaves the site file absent, and an absent site file
+# means the edge aborts on the door. Every request that carries a
+# credential rides stdin or a protected file, never argv, logs, tile
+# urls or DNS output.
+
+# render to a tmp in the same dir, move it in, then prove the final
+# file is byte for byte what was rendered (the same discipline the
+# service builder applies, kit side)
+mail_put() {  # stdin -> $1 with mode $2
+  local _t _w _g
+  _t=$(mktemp "$(dirname "$1")/.mailput.XXXXXX")
+  cat > "$_t"; chmod "$2" "$_t"
+  _w=$(sha256sum "$_t" | cut -d' ' -f1); mv -f "$_t" "$1"; _g=$(sha256sum "$1" | cut -d' ' -f1)
+  [ "$_w" = "$_g" ] || { rm -f "$1"; return 1; }
+}
+
+mail_catalog_install() {  # $1 = space list of permitted smtp ports (empty = none), $2 = jmap url (empty = omit)
+  # the root-owned recipe the builder may deploy: the env and the
+  # two-service compose are fixed here and their shas are pinned
+  # inside the recipe, so the whole package verifies from the single
+  # recipe.sha256 pin. Fails closed: an unpinned or mismatched recipe
+  # never reaches a start. Only the SMTP ports the saved story and
+  # the loaded rules permitted may ride in as published ports.
+  [ -n "$MAIL_STALWART_DIGEST" ] && [ -n "$MAIL_BULWARK_DIGEST" ] \
+    && [ -n "$MAIL_STALWART_VERSION" ] && [ -n "$MAIL_BULWARK_VERSION" ] || return 1
+  local pin_s pin_b smtp="${1:-}" jmap="${2:-}" p envsha composesha t tw w g
+  pin_s="${MAIL_IMAGE_STALWART}:${MAIL_STALWART_VERSION}@${MAIL_STALWART_DIGEST}"
+  pin_b="${MAIL_IMAGE_BULWARK}:${MAIL_BULWARK_VERSION}@${MAIL_BULWARK_DIGEST}"
+  # the published set is whitelisted hard: docker published ports
+  # bypass the host firewall chains, so anything else would be a
+  # public door the decision never approved
+  for p in $smtp; do
+    case "$p" in 25|465|587|993) ;; *) return 1 ;; esac
+  done
+  envsha=$(printf '%s\n' '# Mail env, fixed by the kit recipe' | sha256sum | cut -d' ' -f1)
+  mkdir -p /opt/redoubt/catalog/mail
+  t=$(mktemp /opt/redoubt/catalog/.mailrecipe.XXXXXX)
+  tw=$(mktemp /opt/redoubt/catalog/.mailcompose.XXXXXX)
+  # the two-service project: its own name (a separate compose project
+  # the stack wildcards never see), its own internal bridge for the
+  # stalwart to bulwark hop, and only the stack's own external
+  # network for the edge door. No host network, no docker socket, no
+  # privileged flag, no bind mounts: the named volumes hold all
+  # state. The review confirms the bulwark state path and the
+  # stalwart http port against the pinned release docs before the
+  # first deployment. The door routes to the bulwark container, so it
+  # sits on the external network under its own alias; the store keeps
+  # its own alias for the private-range admin path only.
+  {
+    printf '%s\n' \
+      'name: svc-mail' \
+      'services:' \
+      '  stalwart:' \
+      "    image: $pin_s" \
+      '    container_name: svc-mail-stalwart' \
+      '    restart: unless-stopped' \
+      '    dns: [172.28.0.53, 127.0.0.11]' \
+      '    security_opt:' \
+      '      - no-new-privileges:true' \
+      '    environment:' \
+      '      TZ: UTC' \
+      '    volumes:' \
+      '      - stalwart-data:/opt/stalwart-mail'
+    if [ -n "$smtp" ]; then
+      # the published SMTP doors, only for the permitted set: each
+      # port is a public door by itself, and the docker forwarding
+      # rules are re-verified after every build and every boot
+      printf '    ports:\n'
+      for p in $smtp; do
+        printf '      - "%s:%s"\n' "$p" "$p"
+      done
+    fi
+    printf '%s\n' \
+      '    networks:' \
+      '      default:' \
+      '        aliases: [svc-mail]' \
+      '      mail-internal:' \
+      '  bulwark:' \
+      "    image: $pin_b" \
+      '    container_name: svc-mail-bulwark' \
+      '    restart: unless-stopped' \
+      '    dns: [172.28.0.53, 127.0.0.11]' \
+      '    security_opt:' \
+      '      - no-new-privileges:true' \
+      '    environment:' \
+      '      TZ: UTC'
+    if [ -n "$jmap" ]; then
+      # set before the first start so Bulwark skips its connection
+      # wizard: the door origin the owner's browser already trusts
+      # with the local CA
+      printf '      JMAP_SERVER_URL: %s\n' "$jmap"
+    fi
+    printf '%s\n' \
+      '    volumes:' \
+      '      - bulwark-state:/var/lib/bulwark' \
+      '    networks:' \
+      '      - mail-internal' \
+      '      default:' \
+      '        aliases: [svc-mail-web]' \
+      'networks:' \
+      '  default:' \
+      '    external: true' \
+      '    name: redoubt_default' \
+      '  mail-internal:' \
+      '    driver: bridge' \
+      'volumes:' \
+      '  stalwart-data:' \
+      '  bulwark-state:'
+  } > "$tw"
+  composesha=$(sha256sum "$tw" | cut -d' ' -f1)
+  {
+    printf 'NAME=svc-mail\nIMAGE=%s\nPORT=8080\nTILE=Mail\nICON=/icons/mail.svg\n' "$pin_s"
+    printf 'ENV_SHA=%s\nCOMPOSE_SHA=%s\n' "$envsha" "$composesha"
+    printf '%s\n' '__APP_ENV__'
+    printf '%s\n' '# Mail env, fixed by the kit recipe'
+    printf '%s\n' '__COMPOSE__'
+    cat "$tw"
+  } > "$t"
+  rm -f "$tw"
+  chmod 644 "$t"; chown root:root "$t"
+  w=$(sha256sum "$t" | cut -d' ' -f1)
+  mv -f "$t" /opt/redoubt/catalog/mail/recipe
+  g=$(sha256sum /opt/redoubt/catalog/mail/recipe | cut -d' ' -f1)
+  [ "$w" = "$g" ] || { rm -f /opt/redoubt/catalog/mail/recipe; return 1; }
+  printf '%s\n' "$g" > /opt/redoubt/catalog/mail/recipe.sha256
+  chmod 644 /opt/redoubt/catalog/mail/recipe.sha256
+  return 0
+}
+
+# the dkim selector the kit generates and signs with. Fixed per box:
+# rotating it would orphan the published DNS record
+MAIL_SELECTOR="redoubt"
+# delivery readiness is public DNS: 1 only when the authoritative
+# zone carries exactly the generated set (verified this pass)
+MAIL_DNS_READY=0
+# the release review confirms the Bulwark web login and JMAP API
+# paths and the saved-state config layout before any of the real
+# login and session checks below may pass. Until then the tier
+# reports the pending stage honestly and never fakes a passing check.
+MAIL_WEB_LOGIN_DOC=0
+MAIL_BULWARK_STATE_DOC=0
+
+mail_panel_host() {
+  # the panel's site host is the truth for host names: the mail door
+  # and the jmap url ride the same name the owner's browser already
+  # trusts with the local CA
+  awk -v p=":$PORT_EDGE4" 'index($0,"https://")==1 && index($0,p) && /[{][[:space:]]*$/ {print; exit}' "$STACKDIR/local-caddy.Caddyfile" 2>/dev/null \
+    | grep -o 'https://[^:, ]*' | head -1 | sed 's|https://||'
+}
+
+mail_dkim_keys() {
+  # the signing key lives and stays on the box: only the public p=
+  # value may ever leave it. Generated once, 2048 bit rsa, root-only.
+  mkdir -p "$MAIL_KEYS"
+  chmod 700 "$MAIL_KEYS" 2>/dev/null || true
+  if [ ! -f "$MAIL_KEYS/$MAIL_SELECTOR.key" ]; then
+    openssl genrsa -out "$MAIL_KEYS/$MAIL_SELECTOR.key" 2048 2>/dev/null || return 1
+    chmod 600 "$MAIL_KEYS/$MAIL_SELECTOR.key"
+  fi
+  [ "$(stat -c '%u %a' "$MAIL_KEYS/$MAIL_SELECTOR.key" 2>/dev/null)" = "0 600" ] || return 1
+}
+
+mail_spf_value() {
+  # exactly one SPF record may exist: a published v=spf1 merges into
+  # the kit's single record (its mechanisms join the kit's mx, its
+  # all qualifier is kept), never a second TXT
+  local cur t all out
+  cur=$(dig +short TXT "$MAIL_DOMAIN" 2>/dev/null | tr -d '"' | grep '^v=spf1 ' | head -1 || true)
+  out="v=spf1 mx"
+  all="-all"
+  if [ -n "$cur" ]; then
+    for t in ${cur#v=spf1 }; do
+      case "$t" in all|+all|-all|~all|?all) all="$t" ;; *) out="$out $t" ;; esac
+    done
+  fi
+  printf '%s %s\n' "$out" "$all"
+}
+
+mail_dns_records() {
+  # the approved zone set: exactly the records the kit owns. MX and
+  # the A/AAAA pairs are the only lines that move delivery, so the
+  # cutover confirmation and the owner's public addresses gate them.
+  # One line per record: TYPE|NAME|TTL|VALUE. The dkim private key
+  # never leaves the box; only its public p= value is printed.
+  local spf dmarc dkim
+  [ -n "$MAIL_DOMAIN" ] && mail_domain_ok "$MAIL_DOMAIN" || return 1
+  mail_dkim_keys || return 1
+  dkim=$(openssl pkey -in "$MAIL_KEYS/$MAIL_SELECTOR.key" -pubout 2>/dev/null \
+    | grep -v -- '-----' | tr -d '\n' || true)
+  [ -n "$dkim" ] || return 1
+  spf=$(mail_spf_value)
+  dmarc="v=DMARC1; p=quarantine; adkim=s; aspf=s"
+  printf 'MX|%s|300|10 %s\n' "$MAIL_DOMAIN" "$MAIL_HOST"
+  printf 'TXT|%s|300|%s\n' "$MAIL_DOMAIN" "$spf"
+  printf 'TXT|%s._domainkey.%s|300|v=DKIM1; k=rsa; p=%s\n' "$MAIL_SELECTOR" "$MAIL_DOMAIN" "$dkim"
+  printf 'TXT|_dmarc.%s|300|%s\n' "$MAIL_DOMAIN" "$dmarc"
+  [ -n "$MAIL_PUB4" ] && printf 'A|%s|300|%s\n' "$MAIL_HOST" "$MAIL_PUB4"
+  [ -n "$MAIL_PUB6" ] && printf 'AAAA|%s|300|%s\n' "$MAIL_HOST" "$MAIL_PUB6"
+}
+
+mail_dns_provider_ok() {
+  # the owner's provider adapter, the only piece that holds a provider
+  # credential: root-owned, closed to others, a fixed path with no
+  # directory tricks. The kit feeds it only the approved records on
+  # stdin and never calls a provider API itself.
+  local f=/etc/redoubt/mail-dns-provider.sh
+  [ -f "$f" ] || return 1
+  case "$(stat -c '%u %a' "$f" 2>/dev/null)" in "0 700"|"0 750") : ;; *) return 1 ;; esac
+}
+
+mail_dns_verify() {
+  # the zone's own authoritative servers answer, never the resolver's
+  # cache: NS discovery first, then direct queries. MAIL_DNS_READY
+  # turns 1 only when every generated record is present and matching.
+  local ns mx spf dkim dmarc a4 a6 out
+  MAIL_DNS_READY=0
+  command -v dig >/dev/null 2>&1 || { dbg "mail dns: dig is missing: delivery readiness cannot be verified"; return 1; }
+  ns=$(dig +short NS "$MAIL_DOMAIN" 2>/dev/null | head -1 || true)
+  [ -n "$ns" ] || { dbg "mail dns: no authoritative NS for $MAIL_DOMAIN: nothing to verify against"; return 1; }
+  mx=$(dig +short MX "$MAIL_DOMAIN" @"$ns" 2>/dev/null | head -1 || true); mx="${mx%.}"
+  spf=$(dig +short TXT "$MAIL_DOMAIN" @"$ns" 2>/dev/null | tr -d '"' | grep '^v=spf1 ' | head -1 || true)
+  dkim=$(dig +short TXT "$MAIL_SELECTOR._domainkey.$MAIL_DOMAIN" @"$ns" 2>/dev/null | tr -d '"' | head -1 || true)
+  dmarc=$(dig +short TXT "_dmarc.$MAIL_DOMAIN" @"$ns" 2>/dev/null | tr -d '"' | head -1 || true)
+  a4=$(dig +short A "$MAIL_HOST" @"$ns" 2>/dev/null | head -1 || true)
+  a6=$(dig +short AAAA "$MAIL_HOST" @"$ns" 2>/dev/null | head -1 || true)
+  out=""
+  [ "$mx" = "10 $MAIL_HOST" ] || out="$out MX"
+  [ "$spf" = "$(mail_spf_value)" ] || out="$out SPF"
+  case "$dkim" in "v=DKIM1; k=rsa; p="*) : ;; *) out="$out DKIM" ;; esac
+  case "$dmarc" in v=DMARC1*) : ;; *) out="$out DMARC" ;; esac
+  if [ -n "$MAIL_PUB4" ] && [ "$a4" != "$MAIL_PUB4" ]; then out="$out A"; fi
+  if [ -n "$MAIL_PUB6" ] && [ "$a6" != "$MAIL_PUB6" ]; then out="$out AAAA"; fi
+  if [ -n "$out" ]; then
+    dbg "mail dns: the authoritative zone still differs ($out): delivery is not ready and the kit never claims it is"
+    return 1
+  fi
+  MAIL_DNS_READY=1
+  dbg "OK: mail dns: the authoritative zone for $MAIL_DOMAIN carries the kit's MX, SPF, DKIM and DMARC records"
+  return 0
+}
+
+mail_dns_reconcile() {
+  # delivery readiness is DNS: generate the approved set, reconcile it
+  # (managed: through the owner's adapter; paste: as a printed list
+  # the owner applies by hand), and verify against the authoritative
+  # zone. The MX line moves only at the confirmed cutover, in either
+  # mode. Propagation is the provider's: an immediate miss just means
+  # the next pass re-verifies.
+  local recs out
+  [ -n "$MAIL_DOMAIN" ] && mail_domain_ok "$MAIL_DOMAIN" || return 0
+  recs=$(mail_dns_records) || { dbg "WARNING: mail dns: the zone records could not be generated: delivery stays unready"; return 0; }
+  if [ "$MAIL_DNS_MODE" = "managed" ]; then
+    if ! mail_dns_provider_ok; then
+      dbg "mail dns: managed mode needs the owner's provider adapter at /etc/redoubt/mail-dns-provider.sh (root-owned 700): it alone holds the scoped provider credential; until it exists the zone is not reconciled"
+      return 0
+    fi
+    # the approved records only, one line each (TYPE|NAME|TTL|VALUE),
+    # and the MX line strictly at the confirmed cutover: the adapter
+    # must reconcile exactly this set with its narrowly scoped
+    # credential and touch nothing else in the zone
+    out=$(printf '%s\n' "$recs" | grep -v '^MX|')
+    if [ "$REDOUBT_MAIL_MX_CUTOVER" = "1" ]; then
+      out="$out
+$(printf '%s\n' "$recs" | grep '^MX|')"
+    else
+      dbg "mail dns: MX publication waits for the cutover confirmation (REDOUBT_MAIL_MX_CUTOVER=1): the adapter received the other records only"
+    fi
+    printf '%s\n' "$out" | /etc/redoubt/mail-dns-provider.sh >> "$LOG" 2>&1 \
+      || dbg "WARNING: mail dns: the provider adapter reported a failure: the zone may be unreconciled (see the log)"
+  else
+    # paste mode prints the set without private keys. This list is
+    # not applied automatically: pasting is the owner's own act, and
+    # the MX line is the owner's own planned cutover.
+    dbg "mail dns: paste these records into the $MAIL_DOMAIN zone (the printed list is not applied automatically):"
+    printf '%s\n' "$recs" | while IFS='|' read -r _mr _mn _mt _mv; do
+      [ -n "$_mr" ] || continue
+      if [ "$_mr" = "MX" ]; then
+        log "mail dns paste: $_mr $_mn -> $_mv (paste MX only at your planned cutover; set REDOUBT_MAIL_MX_CUTOVER=1 to record the confirmation)"
+      else
+        log "mail dns paste: $_mr $_mn -> $_mv"
+      fi
+    done
+  fi
+  mail_dns_verify || return 0
+  return 0
+}
+
+mail_smtp_ports() {
+  # the ports the saved exposure decision and the owner's selection
+  # permit: inbound 25 for on, submission 587 and IMAP 993 only when
+  # selected, 465 never (legacy implicit TLS; submission is the real
+  # door). relay means outbound through the owner's relay only: no
+  # published port at all.
+  local out=""
+  [ "$MAIL_EXPOSE" = "on" ] || return 0
+  out="25"
+  [ "$REDOUBT_MAIL_SUBMIT" = "1" ] && out="$out 587"
+  [ "$REDOUBT_MAIL_IMAP" = "1" ] && out="$out 993"
+  printf '%s\n' "$out"
+}
+
+mail_smtp_rules() {  # $1 = permitted port list (empty removes the kit's rules)
+  # the kit-managed host rules for the SMTP doors. Both forms are
+  # cleaned first so a flipped decision never leaves the old form
+  # behind, exactly like the app-door apply above. Public exposure
+  # needs the plain on story: a mesh-only story never gets SMTP.
+  local p
+  for p in 25 587 465 993; do
+    if [ "$FW_KIND" = "ufw" ]; then
+      ufw delete allow "$p/tcp" >/dev/null 2>&1 || true
+      ufw delete allow in on wt0 to any port "$p" proto tcp >/dev/null 2>&1 || true
+    elif [ "$FW_KIND" = "firewalld" ]; then
+      firewall-cmd --permanent --remove-port="$p/tcp" >/dev/null 2>&1 || true
+      firewall-cmd --permanent --zone=redoubt-mesh --remove-port="$p/tcp" >/dev/null 2>&1 || true
+    fi
+  done
+  for p in $1; do
+    case "$p" in 25|587|993) : ;; *) continue ;; esac
+    if [ "$FW_KIND" = "ufw" ]; then
+      ufw allow "$p/tcp" >/dev/null 2>&1 || true
+    elif [ "$FW_KIND" = "firewalld" ]; then
+      firewall-cmd --permanent --add-port="$p/tcp" >/dev/null 2>&1 || true
+    fi
+  done
+  [ "$FW_KIND" = "firewalld" ] && firewall-cmd --reload >/dev/null 2>&1 || true
+}
+
+mail_smtp_rules_live() {  # true when every port in $1 is open in the loaded rules
+  local p
+  for p in $1; do
+    if [ "$FW_KIND" = "ufw" ]; then
+      cat /etc/ufw/user.rules 2>/dev/null | grep -qE -- "--dport $p([[:space:]]|$)" || return 1
+      if grep -q '^IPV6=yes' /etc/ufw/ufw.conf 2>/dev/null; then
+        cat /etc/ufw/user6.rules 2>/dev/null | grep -qE -- "--dport $p([[:space:]]|$)" || return 1
+      fi
+    elif [ "$FW_KIND" = "firewalld" ]; then
+      fw_ports_cover "$(firewall-cmd --list-ports 2>/dev/null || true)" "$p" || return 1
+    else
+      return 1
+    fi
+  done
+  return 0
+}
+
+mail_docker_fwd() {  # true when docker forwards every port in $1 (v4, and v6 when docker manages it)
+  local p v4 v6
+  v4=$(iptables -t nat -S DOCKER 2>/dev/null || true)
+  v6=$(ip6tables -t nat -S DOCKER 2>/dev/null || true)
+  for p in $1; do
+    printf '%s\n' "$v4" | grep -qE -- "--dport $p -j DNAT" || return 1
+    # docker publishes to both families only when the daemon manages
+    # ipv6: an empty v6 chain means v4 is the whole story
+    if [ -n "$v6" ]; then
+      printf '%s\n' "$v6" | grep -qE -- "--dport $p -j DNAT" || return 1
+    fi
+  done
+  return 0
+}
+
+mail_expose_eval() {  # $1 = the permitted plan; proves docker forwarding, writes the boot story
+  local want="$1" story="off"
+  if [ -n "$want" ] && mail_docker_fwd "$want"; then
+    story="$want"
+  elif [ -n "$want" ]; then
+    dbg "mail smtp doors stay closed: the published ports ($want) lack the docker forwarding rules to prove them (the daemon's nat chains bypass the host firewall paths, so unproven ports never count as open)"
+  fi
+  printf '%s\n' "$story" > "$MAIL_GATE_DIR/svc-mail-smtp"
+  chmod 644 "$MAIL_GATE_DIR/svc-mail-smtp" 2>/dev/null || true
+  printf '%s\n' "$story"
+}
+
+mail_web_verify() {  # $1 = door, $2 = host; the strict door check, never the generic probe alone
+  local door=$1 host=$2 i code
+  code=""
+  for i in $(seq 1 20); do
+    code=$(curl -s -o /dev/null -w '%{http_code}' -m 5 --cacert /var/lib/redoubt/caddy-local/cert-share/root-ca.crt \
+      --resolve "$host:$door:127.0.0.1" "https://$host:$door/" 2>/dev/null || true)
+    case "$code" in [1-4]??) break ;; esac
+    sleep 3
+  done
+  case "$code" in [1-4]??) : ;; *) return 1 ;; esac
+  # the generic probe above proves only that something answers. The
+  # design requires a real login and a real JMAP session before the
+  # door opens: the exact Bulwark login and JMAP API paths belong to
+  # the pinned release, and the release review pins them here. Until
+  # then the tier honestly reports the pending stage and never fakes
+  # a passing check.
+  if [ "$MAIL_WEB_LOGIN_DOC" != "1" ]; then
+    dbg "mail tier: web door answers $code, but the real login and JMAP session check is stage pending (the release review pins the Bulwark login and JMAP paths first; an answering page is not readiness)"
+    return 1
+  fi
+  # the review lands the documented calls here: a login request with
+  # the administrator credential from $MAIL_CREDS riding stdin (never
+  # argv), the session token out of the response, then a JMAP
+  # Core/echo through the same door, and only a valid RFC 8620
+  # session passes. Bulwark's 1.18 OAuth auto-configure step stays
+  # with the owner's admin step either way: the kit never claims that
+  # automation.
+  return 1
+}
+
+mail_bulwark_state_check() {
+  # Bulwark persists its admin choices in its state volume, and a
+  # saved value overrides the environment values the recipe set. The
+  # deployment is only immutable after that persisted state is read
+  # and compared, so a conflict cannot ride silently.
+  [ "$MAIL_BULWARK_STATE_DOC" = "1" ] || {
+    dbg "mail tier: stage pending (the Bulwark saved-state path is not yet confirmed by the release review: the persisted admin config can override the environment values, and the kit will not call the deployment immutable until the conflict check is real)"
+    return 1
+  }
+  local mp
+  mp=$(docker volume inspect -f '{{.Mountpoint}}' svc-mail_bulwark-state 2>/dev/null || true)
+  [ -n "$mp" ] && [ -n "$(find "$mp" -mindepth 1 -maxdepth 1 2>/dev/null | head -1)" ] || return 0
+  # the review lands the config file and key names here: compare the
+  # saved JMAP server and admin choices against the recipe values and
+  # fail closed on any difference
+  return 1
+}
+
+# the release review flips this to 1 only after the pinned Stalwart
+# release's documented bootstrap path is confirmed. Until then the
+# tier reports the stage pending and never claims a zero-step setup:
+# Stalwart's first start prints a temporary admin password and a
+# wizard, and no unattended path may be invented.
+MAIL_BOOTSTRAP_DOC=0
+
+mail_digest_ok() {
+  # every running mail container carries its pinned digest
+  local cid iid
+  cid=$(docker compose -p svc-mail -f "$MAIL_SVC_DIR/compose.yml" ps -q stalwart 2>/dev/null)
+  [ -n "$cid" ] || return 1
+  iid=$(docker inspect -f '{{.Image}}' "$cid" 2>/dev/null)
+  docker image inspect -f '{{range .RepoDigests}}{{println .}}{{end}}' "$iid" 2>/dev/null | grep -q "@${MAIL_STALWART_DIGEST}$" || return 1
+  cid=$(docker compose -p svc-mail -f "$MAIL_SVC_DIR/compose.yml" ps -q bulwark 2>/dev/null)
+  [ -n "$cid" ] || return 1
+  iid=$(docker inspect -f '{{.Image}}' "$cid" 2>/dev/null)
+  docker image inspect -f '{{range .RepoDigests}}{{println .}}{{end}}' "$iid" 2>/dev/null | grep -q "@${MAIL_BULWARK_DIGEST}$" || return 1
+}
+
+mail_build() {  # $1 = the door; renders from the recipe with byte checks
+  local door=$1 pin_s dir="$MAIL_SVC_DIR" csha esha
+  pin_s="${MAIL_IMAGE_STALWART}:${MAIL_STALWART_VERSION}@${MAIL_STALWART_DIGEST}"
+  esha=$(sed -n 's/^ENV_SHA=//p' "$MAIL_CATALOG/recipe" | head -1)
+  csha=$(sed -n 's/^COMPOSE_SHA=//p' "$MAIL_CATALOG/recipe" | head -1)
+  mkdir -p "$dir"
+  # the door routes to the Bulwark webmail container, not the store:
+  # the PROXY key makes the site renderer target the svc-mail-web
+  # alias, while the store keeps its own alias for the private-range
+  # admin path only
+  printf 'NAME=%s\nIMAGE=%s\nPORT=8080\nDOOR=%s\nPROXY=svc-mail-web\nTILE=Mail\nICON=/icons/mail.svg\n' \
+    "svc-mail" "$pin_s" "$door" | mail_put "$dir/meta" 644 || return 1
+  # the fixed env and compose ride out of the recipe verbatim; the
+  # byte check runs on every file before anything starts
+  sed -n '/^__APP_ENV__$/,/^__COMPOSE__$/p' "$MAIL_CATALOG/recipe" | sed '1d;$d' | mail_put "$dir/app.env" 600 || return 1
+  sed -n '/^__COMPOSE__$/,$p' "$MAIL_CATALOG/recipe" | sed '1d' | mail_put "$dir/compose.yml" 644 || return 1
+  [ "$(sha256sum "$dir/app.env" | cut -d' ' -f1)" = "$esha" ] || { dbg "WARNING: mail app.env failed the byte check"; return 1; }
+  [ "$(sha256sum "$dir/compose.yml" | cut -d' ' -f1)" = "$csha" ] || { dbg "WARNING: mail compose failed the byte check"; return 1; }
+  cp "$MAIL_CATALOG/recipe.sha256" "$dir/recipe.sha256"
+  sha256sum "$dir/compose.yml" | cut -d' ' -f1 > "$dir/compose.sha256"
+  docker compose -p svc-mail -f "$dir/compose.yml" config -q || { dbg "WARNING: compose rejected the mail project"; return 1; }
+  docker pull -q "$pin_s" >/dev/null || { dbg "WARNING: pull failed for $pin_s"; return 1; }
+  docker pull -q "${MAIL_IMAGE_BULWARK}:${MAIL_BULWARK_VERSION}@${MAIL_BULWARK_DIGEST}" >/dev/null || { dbg "WARNING: pull failed for the Bulwark pin"; return 1; }
+  docker compose -p svc-mail -f "$dir/compose.yml" up -d >/dev/null 2>&1 || { dbg "WARNING: mail compose up failed"; return 1; }
+  mail_digest_ok || { dbg "WARNING: a mail container is not running its pinned image"; return 1; }
+  return 0
+}
+
+mail_verify() {
+  # recipe bytes, compose config, both running digests and the site
+  # file must all check out before the door may open
+  local esha csha
+  esha=$(sed -n 's/^ENV_SHA=//p' "$MAIL_CATALOG/recipe" | head -1)
+  csha=$(sed -n 's/^COMPOSE_SHA=//p' "$MAIL_CATALOG/recipe" | head -1)
+  [ -f "$MAIL_SVC_DIR/app.env" ] && [ "$(sha256sum "$MAIL_SVC_DIR/app.env" | cut -d' ' -f1)" = "$esha" ] || return 1
+  [ -f "$MAIL_SVC_DIR/compose.yml" ] && [ "$(sha256sum "$MAIL_SVC_DIR/compose.yml" | cut -d' ' -f1)" = "$csha" ] || return 1
+  [ "$(sha256sum "$MAIL_SVC_DIR/compose.yml" | cut -d' ' -f1)" = "$(cat "$MAIL_SVC_DIR/compose.sha256" 2>/dev/null)" ] || return 1
+  docker compose -p svc-mail -f "$MAIL_SVC_DIR/compose.yml" config -q 2>/dev/null || return 1
+  mail_digest_ok || return 1
+  [ -f "$STACKDIR/caddy-services/svc-mail.caddy" ] || return 1
+  [ "$(sha256sum "$STACKDIR/caddy-services/svc-mail.caddy" | cut -d' ' -f1)" = "$(cat "$MAIL_SVC_DIR/site.sha256" 2>/dev/null)" ] || return 1
+}
+
+mail_credentials() {
+  # distinct credentials for the administrator and every roster entry,
+  # minted here, written only to the protected file, never to argv,
+  # logs, tile urls or DNS output. Existing lines are kept, so a
+  # re-run never re-rolls a live mailbox password.
+  mkdir -p /etc/redoubt
+  [ -f "$MAIL_CREDS" ] || { : > "$MAIL_CREDS"; chmod 600 "$MAIL_CREDS"; }
+  [ "$(stat -c '%u %a' "$MAIL_CREDS" 2>/dev/null)" = "0 600" ] || { dbg "WARNING: $MAIL_CREDS must be root-owned 600"; return 1; }
+  local l pw
+  if ! grep -qs '^admin=' "$MAIL_CREDS"; then
+    pw=$(openssl rand -hex 24) || return 1
+    printf 'admin=%s\n' "$pw" >> "$MAIL_CREDS"
+  fi
+  while IFS= read -r l; do
+    case "$l" in ''|\#*) continue ;; esac
+    l="${l#"${l%%[![:space:]]*}"}"
+    l="${l%"${l##*[![:space:]]}"}"
+    [ -n "$l" ] || continue
+    grep -qsF -- "${l}@" "$MAIL_CREDS" || {
+      pw=$(openssl rand -hex 24) || return 1
+      printf '%s@%s=%s\n' "$l" "$MAIL_DOMAIN" "$pw" >> "$MAIL_CREDS"
+    }
+  done < "$MAIL_ROSTER"
+  chmod 600 "$MAIL_CREDS"
+  return 0
+}
+
+mail_bootstrap() {
+  # Stalwart's first start prints a temporary admin password and a
+  # wizard. The unattended path exists only where the pinned
+  # release's documentation describes it; the kit never fakes it.
+  [ "$MAIL_BOOTSTRAP_DOC" = "1" ] || {
+    dbg "mail tier: stage pending (the pinned release documents no unattended bootstrap: provision the Stalwart administrator and the roster accounts through its wizard; pre-minted credentials wait in $MAIL_CREDS, readable only as root)"
+    return 1
+  }
+  # the release review lands the documented bootstrap and management
+  # API calls here. Every request must ride stdin or a protected file
+  # (--data-binary @file or a here-doc pipe), never argv, and the
+  # responses never reach the log, tile urls or DNS output. The
+  # bootstrap listener stays on the internal networks only (the
+  # recipe publishes no host port) until ownership is verified.
+  return 1
+}
+
+mail_gate_install() {
+  # the boot gate: after a reboot the mail door may never be more open
+  # than the saved story and the loaded rules justify. The script only
+  # closes; re-opening always rides a kit pass that re-verifies first.
+  # The story the boot gate reads is the kit's own last evaluation
+  # (the svc-gates file): the encrypted env's passphrase is never
+  # repeated outside the kit's own heredocs, so the gate trusts the
+  # file the kit pass just wrote instead of re-decrypting.
+  kit_put_exec /usr/local/sbin/redoubt-mail-gate 755 <<'MAILGATE'
+#!/usr/bin/env bash
+# redoubt-mail-gate: re-applies the mail door gate at boot.
+# The kit's last evaluation plus the rules actually loaded decide; the
+# site file is the switch (absent means the edge aborts on the door).
+# This script only ever closes the door: re-opening needs a kit pass.
+# A mesh-only door (the on-nas story) reads as closed here: closing a
+# door the story allowed is safe, the next kit pass re-opens it.
+set -euo pipefail
+umask 022
+PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
+CONF=/etc/redoubt/services.conf
+[ -s "$CONF" ] || exit 0
+cv() { sed -n "s/^$1=//p" "$CONF" | head -1; }
+STACKDIR=$(cv STACKDIR)
+META=/opt/redoubt/services/svc-mail/meta
+[ -f "$META" ] || exit 0
+DOOR=$(sed -n 's/^DOOR=//p' "$META" | head -1)
+[ -n "$DOOR" ] || exit 0
+STORY=/etc/redoubt/svc-gates/svc-mail
+[ -f "$STORY" ] || exit 0
+FW=$(cat "$STORY")
+GATE=on
+case "$FW" in on|on-nas) ;; *) GATE=off ;; esac
+if [ "$GATE" = "on" ] && command -v ufw >/dev/null 2>&1; then
+  R4=$(cat /etc/ufw/user.rules 2>/dev/null || true)
+  R6=$(cat /etc/ufw/user6.rules 2>/dev/null || true)
+  NEED6=0
+  grep -q '^IPV6=yes' /etc/ufw/ufw.conf 2>/dev/null && NEED6=1
+  if [ "$FW" = "on" ]; then
+    echo "$R4" | grep -q -- "--dport $DOOR" || GATE=off
+    if [ "$NEED6" = "1" ] && ! echo "$R6" | grep -q -- "--dport $DOOR"; then GATE=off; fi
+  else
+    echo "$R4" | grep -- "-i wt0" | grep -q -- "--dport $DOOR" || GATE=off
+    if [ "$NEED6" = "1" ] && ! echo "$R6" | grep -- "-i wt0" | grep -q -- "--dport $DOOR"; then GATE=off; fi
+  fi
+elif [ "$GATE" = "on" ] && command -v firewall-cmd >/dev/null 2>&1; then
+  # the service block rides as one N-M/tcp range: a listed range
+  # covers the door just like an exact port entry would
+  cover() {
+    for _p in $1; do
+      _p="${_p%%/*}"
+      case "$_p" in
+        *-*) _lo="${_p%-*}"; _hi="${_p#*-}"
+             case "$_lo$_hi" in
+               ""|*[!0-9]*) ;;
+               *) [ "$DOOR" -ge "$_lo" ] && [ "$DOOR" -le "$_hi" ] && return 0 ;;
+             esac ;;
+        *) [ "$_p" = "$DOOR" ] && return 0 ;;
+      esac
+    done
+    return 1
+  }
+  PORTS=$(firewall-cmd --list-ports 2>/dev/null || true)
+  if [ "$FW" = "on" ]; then
+    cover "$PORTS" || GATE=off
+  else
+    ZP=$(firewall-cmd --zone=redoubt-mesh --list-ports 2>/dev/null || true)
+    cover "$ZP" || GATE=off
+  fi
+elif [ "$GATE" = "on" ]; then
+  # no firewall tool left to verify the saved story against: the door
+  # stays closed until a kit pass re-verifies the loaded rules
+  GATE=off
+fi
+if [ "$GATE" = "on" ]; then
+  exit 0
+fi
+# close the door: drop the site file and reload the edge. A door with
+# no site behind it aborts at the edge.
+SITE="$STACKDIR/caddy-services/svc-mail.caddy"
+if [ -f "$SITE" ]; then
+  rm -f "$SITE"
+  docker exec redoubt-edge-local-1 caddy reload --config /etc/caddy/Caddyfile --adapter caddyfile >/dev/null 2>&1 \
+    || docker restart redoubt-edge-local-1 >/dev/null 2>&1 || true
+fi
+# the SMTP doors recheck after reboot: the kit's last evaluation plus
+# the docker forwarding rules decide. Published ports ride the
+# daemon's nat chains and bypass the host firewall paths, so after a
+# reboot the story must match the rules actually loaded before docker
+# is trusted again. This gate only ever closes: it stops the project
+# or writes the story off, and a kit pass re-opens after
+# re-verification.
+SMTPS=/etc/redoubt/svc-gates/svc-mail-smtp
+SSTORY=$(cat "$SMTPS" 2>/dev/null || true)
+[ -n "$SSTORY" ] || SSTORY=off
+COMPOSE=/opt/redoubt/services/svc-mail/compose.yml
+# wait a bounded while for docker to bring the containers (and their
+# nat rules) back, so a slow boot is not read as an open door
+for _w in $(seq 1 12); do
+  [ -f "$COMPOSE" ] || break
+  [ "$(docker compose -p svc-mail -f "$COMPOSE" ps -q 2>/dev/null | wc -l)" -gt 0 ] && break
+  sleep 5
+done
+fwd() {  # true when docker forwards the port (v4, and v6 when docker manages it)
+  iptables -t nat -S DOCKER 2>/dev/null | grep -qE -- "--dport $1 -j DNAT" || return 1
+  if [ -n "$(ip6tables -t nat -S DOCKER 2>/dev/null || true)" ]; then
+    ip6tables -t nat -S DOCKER 2>/dev/null | grep -qE -- "--dport $1 -j DNAT" || return 1
+  fi
+  return 0
+}
+if [ "$SSTORY" = "off" ]; then
+  # the saved story says closed: a live forwarding rule for any SMTP
+  # port is a door the story never approved, and a compose file that
+  # still publishes one must not start either, so the project stops
+  # until a kit pass reconciles the truth
+  if [ -f "$COMPOSE" ] && grep -qE '^[[:space:]]*-[[:space:]]*"(25|587|465|993):' "$COMPOSE"; then
+    docker compose -p svc-mail -f "$COMPOSE" down >/dev/null 2>&1 || true
+  else
+    for _p in 25 587 465 993; do
+      if fwd "$_p"; then
+        docker compose -p svc-mail -f "$COMPOSE" down >/dev/null 2>&1 || true
+        printf 'off\n' > "$STORY"
+        break
+      fi
+    done
+  fi
+else
+  # the story says open: every port in it must show in the host rules
+  # and in the docker forwarding, both families, or everything closes
+  GATESMTP=on
+  for _p in $SSTORY; do
+    case "$_p" in 25|587|993) : ;; *) GATESMTP=off ;; esac
+    if [ "$GATESMTP" = "on" ]; then
+      if command -v ufw >/dev/null 2>&1; then
+        cat /etc/ufw/user.rules 2>/dev/null | grep -qE -- "--dport $_p([[:space:]]|$)" || GATESMTP=off
+        if [ "$GATESMTP" = "on" ] && grep -q '^IPV6=yes' /etc/ufw/ufw.conf 2>/dev/null; then
+          cat /etc/ufw/user6.rules 2>/dev/null | grep -qE -- "--dport $_p([[:space:]]|$)" || GATESMTP=off
+        fi
+      elif command -v firewall-cmd >/dev/null 2>&1; then
+        cover() {
+          for _z in $1; do
+            _z="${_z%%/*}"
+            case "$_z" in
+              *-*) _zl="${_z%-*}"; _zh="${_z#*-}"
+                   case "$_zl$_zh" in
+                     ""|*[!0-9]*) ;;
+                     *) [ "$2" -ge "$_zl" ] && [ "$2" -le "$_zh" ] && return 0 ;;
+                   esac ;;
+              *) [ "$_z" = "$2" ] && return 0 ;;
+            esac
+          done
+          return 1
+        }
+        cover "$(firewall-cmd --list-ports 2>/dev/null || true)" "$_p" || GATESMTP=off
+      else
+        GATESMTP=off
+      fi
+      [ "$GATESMTP" = "on" ] && fwd "$_p" || GATESMTP=off
+    fi
+  done
+  if [ "$GATESMTP" != "on" ]; then
+    docker compose -p svc-mail -f "$COMPOSE" down >/dev/null 2>&1 || true
+    printf 'off\n' > "$SMTPS"
+  fi
+fi
+exit 0
+MAILGATE
+  cat > /etc/systemd/system/redoubt-mail-gate.service <<'MAILUNIT'
+[Unit]
+Description=Redoubt mail door gate (closed unless verified)
+After=docker.service network-online.target
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+ExecStart=/usr/local/sbin/redoubt-mail-gate
+
+[Install]
+WantedBy=multi-user.target
+MAILUNIT
+  chmod 644 /etc/systemd/system/redoubt-mail-gate.service
+  systemctl daemon-reload >/dev/null 2>&1 || true
+  systemctl enable redoubt-mail-gate.service >/dev/null 2>&1 || true
+}
+
+mail_reconcile() {
+  [ "${REDOUBT_MAIL:-0}" = "1" ] || return 0
+  if [ -z "$MAIL_STALWART_DIGEST" ] || [ -z "$MAIL_BULWARK_DIGEST" ] \
+     || [ -z "$MAIL_STALWART_VERSION" ] || [ -z "$MAIL_BULWARK_VERSION" ]; then
+    # unreviewed releases: the tier stays off and says exactly why
+    dbg "mail tier: stage pending (no reviewed release pins yet: MAIL_STALWART_DIGEST and MAIL_BULWARK_DIGEST are empty until the release review fills them; digests are never guessed)"
+    return 0
+  fi
+  local door="${MAIL_DOOR:-}"
+  [ -n "$door" ] || { dbg "WARNING: the mail tier has no reserved door: the tier stays off"; return 0; }
+  # the SMTP door plan is decided before the recipe renders: docker
+  # published ports ride the daemon's own nat chains and bypass the
+  # host firewall paths, so only the plan that the saved story and
+  # the loaded rules actually permit may ride into the compose file
+  local smtp_plan
+  smtp_plan=$(mail_smtp_ports)
+  if [ -n "$smtp_plan" ] && [ "$FW_ACTIVE" = "1" ] && [ "${FW_DECISION:-}" = "on" ]; then
+    mail_smtp_rules "$smtp_plan"
+    if ! mail_smtp_rules_live "$smtp_plan"; then
+      dbg "mail smtp doors stay closed: the saved firewall story is on, but the loaded rules do not show $(printf '%s' "$smtp_plan") (both families)"
+      smtp_plan=""
+    fi
+  else
+    if [ -n "$smtp_plan" ]; then
+      dbg "mail smtp doors stay closed: public inbound mail needs the on firewall story and an active firewall (saved ${FW_DECISION:-none}, active $FW_ACTIVE)"
+      smtp_plan=""
+    fi
+    mail_smtp_rules ""
+  fi
+  local jmap_url="" mail_site_host
+  mail_site_host=$(mail_panel_host)
+  [ -n "$mail_site_host" ] && jmap_url="https://$mail_site_host:$door"
+  mail_catalog_install "$smtp_plan" "$jmap_url" || {
+    dbg "WARNING: mail catalog failed the byte check: the tier stays off"
+    mkdir -p "$MAIL_GATE_DIR"
+    printf 'off\n' > "$MAIL_GATE_DIR/svc-mail"
+    chmod 644 "$MAIL_GATE_DIR/svc-mail" 2>/dev/null || true
+    printf 'off\n' > "$MAIL_GATE_DIR/svc-mail-smtp"
+    chmod 644 "$MAIL_GATE_DIR/svc-mail-smtp" 2>/dev/null || true
+    if [ -x /usr/local/sbin/redoubt-svc ]; then
+      /usr/local/sbin/redoubt-svc refresh >> "$LOG" 2>&1 || true
+    else
+      rm -f "$STACKDIR/caddy-services/svc-mail.caddy" 2>/dev/null || true
+    fi
+    return 0
+  }
+  # the gate is decided before anything starts, so a first activation
+  # never renders a site for an unverified firewall story: the saved
+  # story plus the rules that are really loaded decide, never the
+  # app-door list alone
+  local gate
+  gate=$(ha_gate_eval "$door")
+  mkdir -p "$MAIL_GATE_DIR"
+  printf '%s\n' "$gate" > "$MAIL_GATE_DIR/svc-mail"
+  chmod 644 "$MAIL_GATE_DIR/svc-mail" 2>/dev/null || true
+  # the SMTP story starts closed: it flips on only after the build
+  # proved the docker forwarding rules for every published port, and
+  # a half-finished build never leaves a story the rules cannot back
+  printf 'off\n' > "$MAIL_GATE_DIR/svc-mail-smtp"
+  chmod 644 "$MAIL_GATE_DIR/svc-mail-smtp" 2>/dev/null || true
+  # the project lives outside the stack recovery wildcards: its own
+  # compose file in its own directory, its own project name, so the
+  # stack's profile-wide up and down never sees it
+  if [ ! -f "$MAIL_SVC_DIR/meta" ]; then
+    # first activation: build from the recipe under the builder's own
+    # byte checks, honor the gate above, and hold the door on any
+    # failure
+    if mail_build "$door" >> "$LOG" 2>&1; then
+      dbg "OK: mail project built from the approved recipe"
+    else
+      dbg "WARNING: mail build failed (see the log): the tier stays off"
+      printf 'off\n' > "$MAIL_GATE_DIR/svc-mail"
+      if [ -x /usr/local/sbin/redoubt-svc ]; then
+        /usr/local/sbin/redoubt-svc refresh >> "$LOG" 2>&1 || true
+      fi
+      return 0
+    fi
+  elif [ -f "$MAIL_CATALOG/recipe.sha256" ] && [ -f "$MAIL_SVC_DIR/recipe.sha256" ] \
+       && [ "$(cat "$MAIL_CATALOG/recipe.sha256" 2>/dev/null)" != "$(cat "$MAIL_SVC_DIR/recipe.sha256" 2>/dev/null)" ]; then
+    # the recipe pin moved: a new reviewed release rebuilds from the
+    # new recipe on the same door (the data volumes survive a down)
+    dbg "mail recipe pin moved: rebuilding from the reviewed release"
+    docker compose -p svc-mail -f "$MAIL_SVC_DIR/compose.yml" down >/dev/null 2>&1 || true
+    rm -rf "${MAIL_SVC_DIR:?}"
+    if mail_build "$door" >> "$LOG" 2>&1; then
+      dbg "OK: mail project rebuilt on the new pin"
+    else
+      dbg "WARNING: mail rebuild failed (see the log): the tier stays off"
+      printf 'off\n' > "$MAIL_GATE_DIR/svc-mail"
+      if [ -x /usr/local/sbin/redoubt-svc ]; then
+        /usr/local/sbin/redoubt-svc refresh >> "$LOG" 2>&1 || true
+      fi
+      return 0
+    fi
+  fi
+  # the builder may have re-picked a door when the reservation was
+  # taken: its meta is the truth, the env and the gate follow it
+  local _mail_act_door
+  _mail_act_door=$(sed -n 's/^DOOR=//p' "$MAIL_SVC_DIR/meta" 2>/dev/null || true)
+  if [ -n "$_mail_act_door" ] && [ "$_mail_act_door" != "$door" ]; then
+    sed -i '/^MAIL_DOOR=/d' "$_ENV_TMP"
+    echo "MAIL_DOOR=$_mail_act_door" >> "$_ENV_TMP"
+    kit_env_commit
+    door="$_mail_act_door"
+    gate=$(ha_gate_eval "$door")
+    printf '%s\n' "$gate" > "$MAIL_GATE_DIR/svc-mail"
+    # the door moved, so the recipe (and the jmap url baked into it)
+    # must follow: re-render and rebuild exactly like the pin-moved
+    # path above, or the containers would keep the old door's url
+    mail_site_host=$(mail_panel_host)
+    jmap_url=""
+    [ -n "$mail_site_host" ] && jmap_url="https://$mail_site_host:$door"
+    if mail_catalog_install "$smtp_plan" "$jmap_url" \
+       && [ "$(cat "$MAIL_CATALOG/recipe.sha256" 2>/dev/null)" != "$(cat "$MAIL_SVC_DIR/recipe.sha256" 2>/dev/null)" ]; then
+      dbg "mail door moved: rebuilding on the new door"
+      docker compose -p svc-mail -f "$MAIL_SVC_DIR/compose.yml" down >/dev/null 2>&1 || true
+      rm -rf "${MAIL_SVC_DIR:?}"
+      mail_build "$door" >> "$LOG" 2>&1 \
+        || dbg "WARNING: mail rebuild after the door move failed: the tier stays off"
+    fi
+  fi
+  if [ -x /usr/local/sbin/redoubt-svc ]; then
+    /usr/local/sbin/redoubt-svc refresh >> "$LOG" 2>&1 \
+      || dbg "WARNING: mail site refresh failed"
+  else
+    rm -f "$STACKDIR/caddy-services/svc-mail.caddy" 2>/dev/null || true
+  fi
+  # delivery readiness is public DNS: reconcile the zone (managed
+  # through the owner's adapter, paste as a printed list) and verify
+  # against the authoritative servers before any readiness claim
+  mail_dns_reconcile
+  # the SMTP doors: the story above is closed until the docker
+  # forwarding rules prove every published port on both families,
+  # because those rules are the real door and they bypass the host
+  # firewall paths
+  if [ "$(mail_expose_eval "$smtp_plan")" != "off" ]; then
+    dbg "OK: mail smtp doors open ($smtp_plan): host rules and docker forwarding verified"
+  fi
+  # what the kit can never verify: router forwarding, ISP port-25
+  # policy, public addressing and reverse DNS all live outside this
+  # box. The kit proves only what it controls: the host rules, the
+  # docker forwarding and the published ports. A relay or the owner's
+  # provider covers what the box cannot prove.
+  dbg "mail delivery boundary: router forwarding, ISP policy, public addressing and reverse DNS stay outside the kit's control"
+  if [ "$MAIL_EXPOSE" = "relay" ]; then
+    dbg "mail outbound: relay mode publishes no inbound SMTP door; the relay wiring rides the review-documented Stalwart config path (${MAIL_RELAY:-no relay host saved yet})"
+  elif [ "$MAIL_EXPOSE" = "on" ] && [ -z "$smtp_plan" ]; then
+    dbg "mail outbound: direct port 25 egress from this box is not verifiable here; a saved relay would be the provable path"
+  fi
+  case "$gate" in
+    on) ;;
+    *)
+      if [ "$FW_ACTIVE" = "1" ]; then
+        case "${FW_DECISION:-}" in
+          on|on-nas) dbg "mail door $door stays closed: the saved story says ${FW_DECISION}, but the loaded rules do not show the door (both families)" ;;
+          on-nodoors) dbg "mail door $door stays closed: the saved firewall story is on-nodoors (no service exposure)" ;;
+          off) dbg "mail door $door stays closed: the saved firewall story is off" ;;
+          *) dbg "mail door $door stays closed: no saved firewall story yet (answer the firewall questions, or keep it box-only)" ;;
+        esac
+      else
+        dbg "mail door $door stays closed: no active firewall story was verified"
+      fi
+      return 0
+      ;;
+  esac
+  # the door may open, so prove the build again first: recipe bytes,
+  # compose config, both running digests and the site file
+  mail_verify >> "$LOG" 2>&1 || {
+    dbg "WARNING: mail verification failed: the door stays closed"
+    printf 'off\n' > "$MAIL_GATE_DIR/svc-mail"
+    if [ -x /usr/local/sbin/redoubt-svc ]; then
+      /usr/local/sbin/redoubt-svc refresh >> "$LOG" 2>&1 || true
+    fi
+    return 0
+  }
+  # before anything opens: the served app answers on the door with
+  # the local CA, like the owner's browser, and the real login and
+  # JMAP session checks pass once the review pinned their paths
+  mail_site_host=$(mail_panel_host)
+  if [ -z "$mail_site_host" ] || ! mail_web_verify "$door" "$mail_site_host"; then
+    dbg "WARNING: mail door $door did not pass the web check: the door stays closed"
+    printf 'off\n' > "$MAIL_GATE_DIR/svc-mail"
+    if [ -x /usr/local/sbin/redoubt-svc ]; then
+      /usr/local/sbin/redoubt-svc refresh >> "$LOG" 2>&1 || true
+    fi
+    return 0
+  fi
+  # the bootstrap listener stays private until ownership is verified:
+  # the recipe publishes no host port, and the site above rendered
+  # only after the byte checks and digests passed
+  mail_credentials || {
+    dbg "WARNING: mail credentials could not be written: the door stays closed"
+    printf 'off\n' > "$MAIL_GATE_DIR/svc-mail"
+    if [ -x /usr/local/sbin/redoubt-svc ]; then
+      /usr/local/sbin/redoubt-svc refresh >> "$LOG" 2>&1 || true
+    fi
+    return 0
+  }
+  mail_bootstrap || {
+    dbg "mail tier: accounts left pending (see above): the door stays closed until the owner provisions through the wizard or the release review documents the unattended bootstrap"
+    dbg "mail tier: Bulwark 1.18 OAuth auto-configure and its connection wizard stay with the owner's admin step: the kit never claims full automation"
+    printf 'off\n' > "$MAIL_GATE_DIR/svc-mail"
+    if [ -x /usr/local/sbin/redoubt-svc ]; then
+      /usr/local/sbin/redoubt-svc refresh >> "$LOG" 2>&1 || true
+    fi
+    return 0
+  }
+  # Bulwark keeps its saved admin config in its state volume: a
+  # persisted choice overrides the environment values, so a conflict
+  # must be reported before the deployment counts as immutable
+  mail_bulwark_state_check || {
+    dbg "mail tier: the Bulwark saved state could not be cleared for conflicts: the door stays closed"
+    printf 'off\n' > "$MAIL_GATE_DIR/svc-mail"
+    if [ -x /usr/local/sbin/redoubt-svc ]; then
+      /usr/local/sbin/redoubt-svc refresh >> "$LOG" 2>&1 || true
+    fi
+    return 0
+  }
+  # the boot gate keeps the door honest across reboots: it can only
+  # ever close it, a kit pass re-opens after re-verification
+  mail_gate_install
+  dbg "OK: mail tier live on door $door for $MAIL_DOMAIN (the kit never changes MX records: point them at $MAIL_HOST)"
+  # the web door and the dns state are separate facts: report them
+  # separately, never one folded into the other
+  if [ "$MAIL_DNS_READY" = "1" ]; then
+    dbg "OK: mail delivery ready: the authoritative zone carries the kit's records"
+  else
+    dbg "mail delivery: not ready yet (see the dns lines above: the zone or the cutover is still pending, or paste mode awaits the owner)"
+  fi
+}
+mail_reconcile
 
 # the assistant wiring only proves homarr migrated its own db; the seed
 # writes the board serverSetting, so its absence means the panel was
