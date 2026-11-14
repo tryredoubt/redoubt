@@ -349,6 +349,11 @@ KIT_SELF_SHA=$(sha256sum "$KIT_SELF" 2>/dev/null | awk '{print $1}')
 # machine back to an older (even validly signed) kit
 KIT_BUILD="44"
 
+# the installer flags ride the process env: capture them before the
+# saved env is sourced below (the file would overwrite them), so an
+# explicit REDOUBT_HA on a re-run still wins over the saved choice
+HA_FLAG="${REDOUBT_HA:-}"
+
 # Self-heal: a run that got killed can leave the DNS lockdown active while
 # the resolver chain never came up on 127.0.0.1:53 (pi-hole fronts
 # unbound). The box is then DNS-dead and
@@ -5483,12 +5488,120 @@ VAULTHOOK
   if [ -n "${PAT:-}" ] && [ -n "${NETBIRD_IP:-}" ]; then
     publish_remote_zone "http://127.0.0.1:$PORT_NETBIRD" "Authorization: Bearer $PAT" "mesh"
   fi
+# 8a) Home Assistant (optional: the installer flag REDOUBT_HA). The
+# opt-in persists in the env like every other owner choice, so an
+# omitted flag keeps the saved answer and a later REDOUBT_HA=0 walks
+# it back (the service stops, the edge site and the tile go, the
+# /config volume stays). This early pass only reconciles the choice
+# and reserves the edge door so the panel seed below can carry the
+# tile link; the service itself is built and its door gated after the
+# firewall section, where the owner's saved door story is known.
+HA_VERSION="2026.10.3"
+# the reviewed Home Assistant Container release pin. Empty until the
+# release review fills it in: an empty pin fails closed and the
+# service never starts on an unreviewed image. Never guess a digest.
+HA_DIGEST=""
+HA_IMAGE="ghcr.io/home-assistant/home-assistant:${HA_VERSION}"
+HA_SVC_DIR="/opt/redoubt/services/svc-homeassistant"
+HA_CATALOG="/opt/redoubt/catalog/homeassistant"
+HA_GATE_DIR="/etc/redoubt/svc-gates"
+# the explicit installer flag wins over the saved choice; a missing
+# flag keeps the one already sourced from the env
+[ -n "${HA_FLAG:-}" ] && REDOUBT_HA="$HA_FLAG"
+case "${REDOUBT_HA:-}" in 1|0) ;; *) REDOUBT_HA=0 ;; esac
+HA_ON="${REDOUBT_HA}"
+# persist the choice: every later pass reconciles to it even when the
+# installer flag is not repeated
+if grep -qs '^REDOUBT_HA=' "$_ENV_TMP" 2>/dev/null; then
+  sed -i "s|^REDOUBT_HA=.*|REDOUBT_HA=$REDOUBT_HA|" "$_ENV_TMP"
+else
+  echo "REDOUBT_HA=$REDOUBT_HA" >> "$_ENV_TMP"
+fi
+kit_env_commit
+
+if [ "$HA_ON" = "1" ]; then
+  # an unpinned release is unreviewed: the service stays off until the
+  # review fills HA_DIGEST, whatever else this pass would like to do
+  [ -n "$HA_DIGEST" ] || {
+    dbg "WARNING: Home Assistant stays off: HA_DIGEST is empty (no reviewed release pin yet)"
+    HA_ON=0
+  }
+fi
+if [ "$HA_ON" = "1" ]; then
+  # the edge door: one free port from the service block, chosen under
+  # the builder's own lock and saved in the env, so re-runs keep the
+  # same link and the builder re-checks it before use. The built
+  # service's own meta wins when it exists (the builder may have
+  # re-picked after a later service grabbed the reservation).
+  HA_DOOR="${HA_DOOR:-}"
+  if [ -f "$HA_SVC_DIR/meta" ]; then
+    _ha_meta_door=$(sed -n 's/^DOOR=//p' "$HA_SVC_DIR/meta" 2>/dev/null || true)
+    [ -n "$_ha_meta_door" ] && HA_DOOR="$_ha_meta_door"
+  fi
+  _ha_taken=0
+  if [ -n "$HA_DOOR" ]; then
+    for _hm in /opt/redoubt/services/*/meta; do
+      [ -f "$_hm" ] || continue
+      [ "$_hm" = "$HA_SVC_DIR/meta" ] && continue
+      [ "$(sed -n 's/^DOOR=//p' "$_hm" 2>/dev/null)" = "$HA_DOOR" ] && _ha_taken=1
+    done
+  fi
+  if [ -z "$HA_DOOR" ] || [ "$_ha_taken" = "1" ] || [ -z "${SVC_PORT_LO:-}" ]; then
+    HA_DOOR=""
+    if [ -n "${SVC_PORT_LO:-}" ]; then
+      # the same lock file redoubt-svc flocks: the two allocators
+      # cannot race each other for a door
+      exec 9>/run/redoubt-svc.lock
+      flock -w 120 9 || true
+      _ha_used=""
+      for _hm in /opt/redoubt/services/*/meta; do
+        [ -f "$_hm" ] || continue
+        _ha_used="$_ha_used $(sed -n 's/^DOOR=//p' "$_hm" 2>/dev/null)"
+      done
+      for _hd in $(seq "$SVC_PORT_LO" $((SVC_PORT_LO + SVC_PORT_N - 1))); do
+        case " $_ha_used " in *" $_hd "*) ;; *) HA_DOOR="$_hd"; break ;; esac
+      done
+      flock -u 9 2>/dev/null || true
+    fi
+  fi
+  if [ -n "$HA_DOOR" ]; then
+    sed -i '/^HA_DOOR=/d' "$_ENV_TMP"
+    echo "HA_DOOR=$HA_DOOR" >> "$_ENV_TMP"
+    kit_env_commit
+    dbg "OK: Home Assistant door reserved ($HA_DOOR)"
+  else
+    dbg "WARNING: no free service door: Home Assistant stays off on this box"
+    HA_ON=0
+  fi
+else
+  # walking it back: the service stops, the edge site and the tile go,
+  # the /config volume stays (a named volume survives a compose down).
+  # The gate file keeps the builder from re-rendering the site too.
+  mkdir -p "$HA_GATE_DIR"
+  printf 'off\n' > "$HA_GATE_DIR/svc-homeassistant"
+  chmod 644 "$HA_GATE_DIR/svc-homeassistant" 2>/dev/null || true
+  if [ -f "$HA_SVC_DIR/compose.yml" ]; then
+    docker compose -f "$HA_SVC_DIR/compose.yml" down >/dev/null 2>&1 || true
+  fi
+  rm -f "$STACKDIR/caddy-services/svc-homeassistant.caddy" 2>/dev/null || true
+  if docker ps --format '{{.Names}}' 2>/dev/null | grep -qx redoubt-edge-local-1; then
+    docker exec redoubt-edge-local-1 caddy reload --config /etc/caddy/Caddyfile --adapter caddyfile >/dev/null 2>&1 \
+      || docker restart redoubt-edge-local-1 >/dev/null 2>&1 || true
+  fi
+  systemctl disable --now redoubt-ha-gate.service >/dev/null 2>&1 || true
+  rm -f /etc/systemd/system/redoubt-ha-gate.service /usr/local/sbin/redoubt-ha-gate 2>/dev/null || true
+fi
+
 SEED_SECTIONS="full"
 [ "$MESH_MODE" = "selfhost" ] && SEED_SECTIONS="minimal"
 # the remote desktop tile seeds only when the owner asked for the
 # gateway: a board without it keeps the clock row as it was
 SEED_GUAC=""
 [ "${REDOUBT_GUAC:-0}" = "1" ] && SEED_GUAC="https://${SEED_HOST}:$PORT_EDGE6"
+# the Home Assistant tile seeds only when the owner asked for it and a
+# door was reserved for it this pass
+SEED_HA=""
+[ "${REDOUBT_HA:-0}" = "1" ] && [ -n "${HA_DOOR:-}" ] && SEED_HA="https://${SEED_HOST}:${HA_DOOR}"
 # the guardian's panel MCP key: only the id rides into the seed (it is
 # not secret), so the seed can keep a key that still exists instead of
 # minting a new one every pass. The tr keeps a damaged file from
@@ -5547,6 +5660,7 @@ SEED_WHEREAMI=/whereami
 SEED_CONSOLE=$SEED_CONSOLE
 SEED_CONSOLE_PING=$SEED_CONSOLE_PING
 SEED_GUAC=$SEED_GUAC
+SEED_HA=$SEED_HA
 SEED_MCP_ID=$SEED_MCP_ID
 __SEED_JS__
 SEEDENV
@@ -5617,6 +5731,25 @@ SEEDENV
       icon: "/icons/guacamole.svg",
       href: process.env.SEED_GUAC + "/",
       ping: "http://guacamole:8080/guacamole/" });
+  }
+  if (process.env.SEED_HA) {
+    // the ping targets the container's own http port: the edge door
+    // answers browsers with the local CA, while the panel's
+    // server-side ping reaches the container on the stack network
+    APPS.push({ id: "redoubt-app-homeassistant", name: "Home Assistant",
+      icon: "/icons/home-assistant.svg",
+      href: process.env.SEED_HA,
+      ping: "http://svc-homeassistant:8123" });
+  } else {
+    // a disabled gateway removes its kit-owned tile on every pass: the
+    // app row and every item that references it go, so a later
+    // REDOUBT_HA=0 never leaves a dead tile on the board
+    var haRows = db.prepare("SELECT id FROM item WHERE kind = 'app' AND options LIKE '%redoubt-app-homeassistant%'").all();
+    for (var h = 0; h < haRows.length; h++) {
+      db.prepare("DELETE FROM item_layout WHERE item_id = ?").run(haRows[h].id);
+      db.prepare("DELETE FROM item WHERE id = ?").run(haRows[h].id);
+    }
+    db.prepare("DELETE FROM app WHERE id = 'redoubt-app-homeassistant'").run();
   }
 
   var uuid = function () {
@@ -5977,6 +6110,7 @@ if [ "${REDOUBT_WELCOME:-1}" = "1" ]; then
   # would hand it the cdn host's cert and drop a ghost on the lan)
   cp "/var/lib/redoubt/caddy-local/cdn/gh/homarr-labs/dashboard-icons/svg/netbird.svg" "/var/lib/redoubt/caddy-local/icons/netbird.svg" 2>/dev/null || true
   cp "/var/lib/redoubt/caddy-local/cdn/gh/homarr-labs/dashboard-icons/svg/guacamole.svg" "/var/lib/redoubt/caddy-local/icons/guacamole.svg" 2>/dev/null || true
+  cp "/var/lib/redoubt/caddy-local/cdn/gh/homarr-labs/dashboard-icons/svg/home-assistant.svg" "/var/lib/redoubt/caddy-local/icons/home-assistant.svg" 2>/dev/null || true
   fetch_icon_set "png" \
     "https://install.tryredoubt.com/install/icons-png.tar.gz" \
     "62fe3de3c0063620439024de5eab6b3e3351a21e248cf780e49c21dd42252b18" \
@@ -8894,6 +9028,8 @@ STACKDIR=$(cv STACKDIR); PORT_EDGE4=$(cv PORT_EDGE4); PANEL_BASE=$(cv PANEL_BASE
 LO=$(cv SVC_PORT_LO); N=$(cv SVC_PORT_N); GU=$(cv GUARDIAN_USER)
 for _v in STACKDIR PORT_EDGE4 PANEL_BASE GU; do [ -n "${!_v}" ] || die "$_v missing in $CONF"; done
 ROOT=/opt/redoubt/services
+CATALOG=/opt/redoubt/catalog
+GATES=/etc/redoubt/svc-gates
 SNIP="$STACKDIR/caddy-services"
 SPOOL=/var/lib/redoubt/cerberus-spool
 CADDYFILE="$STACKDIR/local-caddy.Caddyfile"
@@ -8907,6 +9043,8 @@ flock -w 120 9 || die "another redoubt-svc run holds the lock"
 sha() { sha256sum "$1" | cut -d' ' -f1; }
 valid_name() { [[ $1 =~ ^[a-z][a-z0-9-]{1,23}$ ]] || die "name must match ^[a-z][a-z0-9-]{1,23}\$"; }
 meta() { sed -n "s/^$2=//p" "$ROOT/$1/meta" | head -1; }
+rv() { sed -n "s/^$2=//p" "$1" | head -1; }
+gate_off() { [ -f "$GATES/$1" ] && [ "$(cat "$GATES/$1" 2>/dev/null)" = "off" ]; }
 
 # render to a tmp in the same dir, move it in, then prove the final file
 # is byte for byte what was rendered. Prints the sha for the record.
@@ -8998,6 +9136,16 @@ cmd_create() {
   local name=${1:-}; valid_name "$name"; shift
   [ -n "$LO" ] && [ -n "$N" ] || die "no service doors on this box"
   [ ! -e "$ROOT/$name" ] || die "$name exists (verify it, or remove it first)"
+  # the kit-approved catalog is the only source of recipes: a name that
+  # merely matches the regex proves nothing, so the root-owned entry
+  # itself must exist and byte-match its pin before anything is built
+  # (a compromised guardian could otherwise build anything at all)
+  [ -f "$CATALOG/$name/recipe" ] && [ -f "$CATALOG/$name/recipe.sha256" ] \
+    || die "$name is not in the kit-approved catalog (the kit owns the recipes)"
+  [ "$(sha "$CATALOG/$name/recipe")" = "$(cat "$CATALOG/$name/recipe.sha256")" ] \
+    || die "catalog entry for $name failed the byte check"
+  catimg=$(rv "$CATALOG/$name/recipe" IMAGE); catport=$(rv "$CATALOG/$name/recipe" PORT)
+  [ -n "$catimg" ] && [ -n "$catport" ] || die "catalog entry for $name is incomplete"
   local img="" port="" tile="" icon="" ou="" op="" vols=() envs=() secs=()
   while [ $# -gt 0 ]; do
     case "$1" in
@@ -9009,6 +9157,17 @@ cmd_create() {
       *) die "unknown flag $1" ;;
     esac
   done
+  # the catalog fixes the recipe: image, port, env and volumes come
+  # from it. A caller may only confirm them, never diverge from them,
+  # so the defaults land before the shape checks below run.
+  [ -n "$img" ] || img="$catimg"
+  [ "$img" = "$catimg" ] || die "image must match the catalog pin"
+  [ -n "$port" ] || port="$catport"
+  [ "$port" = "$catport" ] || die "port must match the catalog pin"
+  [ ${#vols[@]} -eq 0 ] || die "catalog recipes fix their volumes"
+  [ ${#envs[@]} -eq 0 ] || die "catalog recipes fix their env"
+  [ ${#secs[@]} -eq 0 ] || die "catalog recipes fix their secrets"
+  [ -z "$ou" ] && [ -z "$op" ] || die "catalog recipes fix their login"
   # the template has no slot for privileged, cap_add, devices, host
   # network or a bind mount: what cannot be written cannot be smuggled
   [[ $img =~ ^[a-z0-9][a-z0-9._/:-]*@sha256:[0-9a-f]{64}$ ]] && [[ $img != *..* ]] \
@@ -9025,6 +9184,11 @@ cmd_create() {
   for k in "${secs[@]}" $ou $op; do [[ $k =~ ^[A-Z_][A-Z0-9_]{0,63}$ ]] || die "bad key $k"; done
   [[ $tile =~ ^[A-Za-z0-9\ ._-]{0,40}$ ]] || die "tile title: letters, digits, space . _ - only"
   [[ -z $icon || $icon =~ ^https://[A-Za-z0-9./_%-]{1,200}$ ]] || die "icon must be a plain https url"
+  # the recipe supplies the tile and icon when the caller does not: the
+  # defaults land after the shape checks so the recipe's local icon
+  # path is not judged by the caller's https-only rule
+  tile="${tile:-$(rv "$CATALOG/$name/recipe" TILE)}"
+  icon="${icon:-$(rv "$CATALOG/$name/recipe" ICON)}"
 
   # the first free door in the kit's block
   local m used="" d door=""
@@ -9043,34 +9207,28 @@ cmd_create() {
   mkdir -m 755 "$dir"; ROLLBACK=$name
   printf 'NAME=%s\nIMAGE=%s\nPORT=%s\nDOOR=%s\nTILE=%s\nICON=%s\n' \
     "$name" "$img" "$port" "$door" "${tile:-$name}" "$icon" | put "$dir/meta" 644 >/dev/null
-  {
-    for kv in "${envs[@]}"; do printf '%s\n' "$kv"; done
-    if [ -n "$ou" ]; then printf '%s=%s\n' "$ou" "$ouv"; fi
-    if [ -n "$op" ]; then printf '%s=%s\n' "$op" "$opv"; fi
-    for kv in "${seclines[@]}"; do printf '%s\n' "$kv"; done
-  } | put "$dir/app.env" 600 >/dev/null
-  {
-    printf 'name: svc-%s\nservices:\n  app:\n    image: %s\n    container_name: svc-%s\n' "$name" "$img" "$name"
-    printf '    restart: unless-stopped\n    dns: [172.28.0.53, 127.0.0.11]\n'
-    printf '    security_opt:\n      - no-new-privileges:true\n    env_file:\n      - ./app.env\n'
-    if [ ${#vols[@]} -gt 0 ]; then
-      printf '    volumes:\n'; i=0
-      for p in "${vols[@]}"; do printf '      - data%d:%s\n' "$i" "$p"; i=$((i + 1)); done
-    fi
-    printf '    networks:\n      - default\nnetworks:\n  default:\n    external: true\n    name: redoubt_default\n'
-    if [ ${#vols[@]} -gt 0 ]; then
-      printf 'volumes:\n'; i=0
-      for p in "${vols[@]}"; do printf '  data%d:\n' "$i"; i=$((i + 1)); done
-    fi
-  } | put "$dir/compose.yml" 644 > "$dir/compose.sha256"
+  # the fixed env and compose ride out of the recipe verbatim, and the
+  # byte check runs on every file before anything starts: the pins sit
+  # inside the recipe, which already matched its own pin above
+  sed -n '/^__APP_ENV__$/,/^__COMPOSE__$/p' "$CATALOG/$name/recipe" | sed '1d;$d' | put "$dir/app.env" 600 >/dev/null
+  sed -n '/^__COMPOSE__$/,$p' "$CATALOG/$name/recipe" | sed '1d' | put "$dir/compose.yml" 644 > "$dir/compose.sha256"
+  [ "$(sha "$dir/app.env")" = "$(rv "$CATALOG/$name/recipe" ENV_SHA)" ] || die "app.env failed the byte check"
+  [ "$(sha "$dir/compose.yml")" = "$(rv "$CATALOG/$name/recipe" COMPOSE_SHA)" ] || die "compose failed the byte check"
 
   docker compose -f "$dir/compose.yml" config -q || die "compose rejected the file"
   docker pull -q "$img" >/dev/null || die "pull failed for $img"
   docker compose -f "$dir/compose.yml" up -d >/dev/null 2>&1 || die "compose up failed"
   digest_ok "$name" || die "the running image is not $img"
-  render_site "$name" | put "$SNIP/$name.caddy" 644 > "$dir/site.sha256"
-  edge_apply || die "the edge rejected the site block"
-  code=$(probe "$name") || die "no answer through the edge on door $door (last code $code)"
+  if gate_off "$name"; then
+    # the firewall story keeps this door closed: no site file, so the
+    # edge aborts on the door until the gate lifts and refresh renders
+    rm -f "$SNIP/$name.caddy"
+    : > "$dir/site.sha256"
+  else
+    render_site "$name" | put "$SNIP/$name.caddy" 644 > "$dir/site.sha256"
+    edge_apply || die "the edge rejected the site block"
+    code=$(probe "$name") || die "no answer through the edge on door $door (last code $code)"
+  fi
 
   # the generated secrets wait for the guardian's vault in a root-owned
   # spool: the guardian reads them, only this script deletes them
@@ -9079,9 +9237,77 @@ cmd_create() {
     chown root:"$GU" "$SPOOL/$name.env"
   fi
   ROLLBACK=""
-  printf 'OK %s on door %s (edge answered %s)\n' "$name" "$door" "$code"
+  if gate_off "$name"; then
+    printf 'OK %s on door %s (gated off: the edge aborts until the firewall story opens)\n' "$name" "$door"
+  else
+    printf 'OK %s on door %s (edge answered %s)\n' "$name" "$door" "$code"
+  fi
   printf 'TILE {"name":"%s","href":"%s:%s","iconUrl":"%s"}\n' "${tile:-$name}" "${PANEL_BASE%:*}" "$door" "$icon"
   [ ${#seclines[@]} -eq 0 ] || echo "SECRETS waiting: run cerberus-vault store $name"
+}
+
+cmd_activate() {  # kit-only: build a service strictly from the catalog
+  local name=${1:-}; valid_name "$name"; shift
+  [ -n "$LO" ] && [ -n "$N" ] || die "no service doors on this box"
+  local door=""
+  while [ $# -gt 0 ]; do
+    case "$1" in
+      --door) door=$2; shift 2 ;;
+      *) die "unknown flag $1" ;;
+    esac
+  done
+  local cat="$CATALOG/$name" dir="$ROOT/$name"
+  [ -f "$cat/recipe" ] && [ -f "$cat/recipe.sha256" ] || die "$name is not in the kit-approved catalog"
+  [ "$(sha "$cat/recipe")" = "$(cat "$cat/recipe.sha256")" ] || die "catalog recipe for $name failed the byte check"
+  local img port tile icon
+  img=$(rv "$cat/recipe" IMAGE); port=$(rv "$cat/recipe" PORT)
+  tile=$(rv "$cat/recipe" TILE); icon=$(rv "$cat/recipe" ICON)
+  [ -n "$img" ] && [ -n "$port" ] || die "catalog recipe for $name is incomplete"
+  [ ! -e "$dir" ] || die "$name exists (verify it, or remove it first)"
+  # the door: honor the kit's reservation when it is still free, else
+  # the first free door in the block wins (all under the builder lock)
+  local m used="" d doorp=""
+  for m in "$ROOT"/*/meta; do used="$used $(sed -n 's/^DOOR=//p' "$m")"; done
+  if [ -n "$door" ]; then
+    [[ $door =~ ^[0-9]{1,5}$ ]] || die "bad door"
+    [ "$door" -ge "$LO" ] && [ "$door" -le $((LO + N - 1)) ] || die "door $door is outside the service block"
+    [[ " $used " == *" $door "* ]] && die "door $door is taken"
+    doorp=$door
+  else
+    for d in $(seq "$LO" $((LO + N - 1))); do [[ " $used " == *" $d "* ]] || { doorp=$d; break; }; done
+    [ -n "$doorp" ] || die "all $N service doors are taken"
+  fi
+  mkdir -m 755 "$dir"; ROLLBACK=$name
+  printf 'NAME=%s\nIMAGE=%s\nPORT=%s\nDOOR=%s\nTILE=%s\nICON=%s\n' \
+    "$name" "$img" "$port" "$doorp" "${tile:-$name}" "$icon" | put "$dir/meta" 644 >/dev/null
+  # the fixed env and compose ride out of the recipe verbatim; the
+  # byte check runs on every file before any start
+  sed -n '/^__APP_ENV__$/,/^__COMPOSE__$/p' "$cat/recipe" | sed '1d;$d' | put "$dir/app.env" 600 >/dev/null
+  sed -n '/^__COMPOSE__$/,$p' "$cat/recipe" | sed '1d' | put "$dir/compose.yml" 644 > "$dir/compose.sha256"
+  [ "$(sha "$dir/app.env")" = "$(rv "$cat/recipe" ENV_SHA)" ] || die "app.env failed the byte check"
+  [ "$(sha "$dir/compose.yml")" = "$(rv "$cat/recipe" COMPOSE_SHA)" ] || die "compose failed the byte check"
+  docker compose -f "$dir/compose.yml" config -q || die "compose rejected the file"
+  docker pull -q "$img" >/dev/null || die "pull failed for $img"
+  docker compose -f "$dir/compose.yml" up -d >/dev/null 2>&1 || die "compose up failed"
+  digest_ok "$name" || die "the running image is not $img"
+  # remember which recipe this build came from: the kit compares it
+  # before the next pass and rebuilds when the pin moved
+  cp "$cat/recipe.sha256" "$dir/recipe.sha256"
+  if gate_off "$name"; then
+    # the firewall story keeps this door closed: no site file, so the
+    # edge aborts on it until the gate lifts and refresh renders
+    rm -f "$SNIP/$name.caddy"
+    : > "$dir/site.sha256"
+    printf 'OK %s on door %s (gated off: the edge aborts until the firewall story opens)\n' "$name" "$doorp"
+  else
+    render_site "$name" | put "$SNIP/$name.caddy" 644 > "$dir/site.sha256"
+    edge_apply || die "the edge rejected the site block"
+    local code
+    code=$(probe "$name") || die "no answer through the edge on door $doorp (last code $code)"
+    printf 'OK %s on door %s (edge answered %s)\n' "$name" "$doorp" "$code"
+  fi
+  ROLLBACK=""
+  printf 'DOOR %s\n' "$doorp"
 }
 
 cmd_verify() {
@@ -9090,13 +9316,15 @@ cmd_verify() {
   [ -f "$dir/meta" ] || die "no service $name"
   if [ "$(sha "$dir/compose.yml")" = "$(cat "$dir/compose.sha256")" ]; then echo "OK   compose byte check"
   else echo "FAIL compose.yml changed since redoubt-svc wrote it"; bad=1; fi
-  if [ -f "$SNIP/$name.caddy" ] && [ "$(sha "$SNIP/$name.caddy")" = "$(cat "$dir/site.sha256")" ]; then echo "OK   site byte check"
+  if gate_off "$name"; then echo "GATE site held off by the firewall story"
+  elif [ -f "$SNIP/$name.caddy" ] && [ "$(sha "$SNIP/$name.caddy")" = "$(cat "$dir/site.sha256")" ]; then echo "OK   site byte check"
   else echo "FAIL site block missing or changed (refresh rewrites it)"; bad=1; fi
   if docker compose -f "$dir/compose.yml" config -q 2>/dev/null; then echo "OK   compose config"
   else echo "FAIL compose config"; bad=1; fi
   if digest_ok "$name"; then echo "OK   image digest $(meta "$name" IMAGE | sed 's/.*@//')"
   else echo "FAIL image digest or container not running"; bad=1; fi
-  if code=$(probe "$name"); then echo "OK   edge door $(meta "$name" DOOR) answered $code"
+  if gate_off "$name"; then echo "GATE door closed by the firewall story"
+  elif code=$(probe "$name"); then echo "OK   edge door $(meta "$name" DOOR) answered $code"
   else echo "FAIL edge door $(meta "$name" DOOR) ($code)"; bad=1; fi
   return $bad
 }
@@ -9105,6 +9333,12 @@ cmd_refresh() {  # the kit calls this every pass: site files follow its rewrites
   local m n changed=0 new
   for m in "$ROOT"/*/meta; do
     n=$(sed -n 's/^NAME=//p' "$m")
+    if gate_off "$n"; then
+      # gated: the site file must not exist while the door is closed,
+      # so the edge keeps aborting on it until the gate lifts
+      if [ -f "$SNIP/$n.caddy" ]; then rm -f "$SNIP/$n.caddy"; changed=1; fi
+      continue
+    fi
     new=$(render_site "$n" | sha256sum | cut -d' ' -f1)
     if [ "$new" != "$(cat "$ROOT/$n/site.sha256" 2>/dev/null)" ] || [ ! -f "$SNIP/$n.caddy" ]; then
       render_site "$n" | put "$SNIP/$n.caddy" 644 > "$ROOT/$n/site.sha256"; changed=1
@@ -9131,6 +9365,7 @@ case "${1:-help}" in
   ping) echo ok ;;
   resolve) cmd_resolve "${2:-}" ;;
   create) shift; cmd_create "$@" ;;
+  activate) shift; cmd_activate "$@" ;;
   verify) cmd_verify "${2:-}" ;;
   refresh) cmd_refresh ;;
   remove) cmd_remove "${2:-}" ;;
@@ -9143,12 +9378,12 @@ case "${1:-help}" in
   help|*) cat <<'HELP'
 redoubt-svc: the service recipe Cerberus follows
   1. resolve IMAGE:TAG         pull once, print IMAGE@sha256:... (the pin)
-  2. create NAME --image IMAGE@sha256:... --port APP_PORT
-       [--data /path]... [--env KEY=VALUE]... [--secret KEY]...
-       [--owner-user KEY] [--owner-pass KEY] [--tile "Title"] [--icon https://...]
-     writes compose, env and edge site, byte-checks each file, validates
-     compose and caddy, checks the running digest, probes the door.
-     Any failure rolls the whole service back.
+  2. create NAME ...           build a kit-approved catalog service: the
+     root-owned catalog entry is the authority, the flags must match
+     its pin (image and port) or the build dies
+  2b. activate NAME [--door N] the kit builds its own service straight
+     from the catalog recipe: same checks as create, the reserved door
+     is honored when it is still free, the recipe is authoritative
   3. verify NAME               byte checks, compose config, digest, door
   4. cerberus-vault store NAME move generated secrets into the vault
   5. panel tile: call the homarr MCP app tools with the TILE line
@@ -9825,6 +10060,459 @@ else
     dbg "$FW_KIND is active and this run has no terminal to ask. Firewall untouched: run again from a terminal to open the mesh doors." >> "$LOG"
   fi
 fi
+
+# 8b) Home Assistant reconcile: the early pass reserved the door and
+# seeded the tile; this late pass builds the service and opens or
+# closes its door to match the owner's saved firewall story and the
+# rules that are actually loaded. Runs on every pass with or without
+# the guardian, and the boot gate below re-applies the door after a
+# reboot. Anything unverified leaves the site file absent, and an
+# absent site file means the edge aborts on the door.
+ha_catalog_install() {
+  # the root-owned recipe the builder may deploy: the env and compose
+  # are fixed here and their shas are pinned inside the recipe, so the
+  # whole package verifies from the single recipe.sha256 pin. Fails
+  # closed: an unpinned or mismatched recipe never reaches a start.
+  [ -n "$HA_DIGEST" ] || return 1
+  local pin envsha composesha t w g
+  pin="${HA_IMAGE}@${HA_DIGEST}"
+  envsha=$(printf '%s\n' '# Home Assistant env, fixed by the kit recipe' | sha256sum | cut -d' ' -f1)
+  composesha=$(printf '%s\n' \
+    'services:' \
+    '  app:' \
+    "    image: $pin" \
+    '    container_name: svc-homeassistant' \
+    '    restart: unless-stopped' \
+    '    dns: [172.28.0.53, 127.0.0.11]' \
+    '    security_opt:' \
+    '      - no-new-privileges:true' \
+    '    environment:' \
+    '      TZ: UTC' \
+    '    volumes:' \
+    '      - ha-config:/config' \
+    '    networks:' \
+    '      - default' \
+    'networks:' \
+    '  default:' \
+    '    external: true' \
+    '    name: redoubt_default' \
+    'volumes:' \
+    '  ha-config:' | sha256sum | cut -d' ' -f1)
+  mkdir -p /opt/redoubt/catalog/homeassistant
+  t=$(mktemp /opt/redoubt/catalog/.recipe.XXXXXX)
+  {
+    printf 'NAME=homeassistant\nIMAGE=%s\nPORT=8123\nTILE=Home Assistant\nICON=/icons/home-assistant.svg\n' "$pin"
+    printf 'ENV_SHA=%s\nCOMPOSE_SHA=%s\n' "$envsha" "$composesha"
+    printf '%s\n' '__APP_ENV__'
+    printf '%s\n' '# Home Assistant env, fixed by the kit recipe'
+    printf '%s\n' '__COMPOSE__'
+    printf '%s\n' \
+      'services:' \
+      '  app:' \
+      "    image: $pin" \
+      '    container_name: svc-homeassistant' \
+      '    restart: unless-stopped' \
+      '    dns: [172.28.0.53, 127.0.0.11]' \
+      '    security_opt:' \
+      '      - no-new-privileges:true' \
+      '    environment:' \
+      '      TZ: UTC' \
+      '    volumes:' \
+      '      - ha-config:/config' \
+      '    networks:' \
+      '      - default' \
+      'networks:' \
+      '  default:' \
+      '    external: true' \
+      '    name: redoubt_default' \
+      'volumes:' \
+      '  ha-config:'
+  } > "$t"
+  chmod 644 "$t"; chown root:root "$t"
+  w=$(sha256sum "$t" | cut -d' ' -f1)
+  mv -f "$t" /opt/redoubt/catalog/homeassistant/recipe
+  g=$(sha256sum /opt/redoubt/catalog/homeassistant/recipe | cut -d' ' -f1)
+  [ "$w" = "$g" ] || { rm -f /opt/redoubt/catalog/homeassistant/recipe; return 1; }
+  printf '%s\n' "$g" > /opt/redoubt/catalog/homeassistant/recipe.sha256
+  chmod 644 /opt/redoubt/catalog/homeassistant/recipe.sha256
+  return 0
+}
+
+# true when the firewall-cmd port list (single ports and ranges alike)
+# covers the given port: the kit adds the whole service block as one
+# N-M/tcp range, so an exact "door/tcp" match would never see it
+fw_ports_cover() {
+  local p lo hi
+  for p in $1; do
+    p="${p%%/*}"
+    case "$p" in
+      *-*)
+        lo="${p%-*}"; hi="${p#*-}"
+        case "$lo$hi" in
+          ""|*[!0-9]*) ;;
+          *) [ "$2" -ge "$lo" ] && [ "$2" -le "$hi" ] && return 0 ;;
+        esac
+        ;;
+      *)
+        [ "$p" = "$2" ] && return 0
+        ;;
+    esac
+  done
+  return 1
+}
+
+ha_gate_eval() {  # $1 = the door; prints on|off
+  local door=$1 state="${FW_DECISION:-}" out=off
+  case "$state" in
+    on|on-nas)
+      if [ "$FW_KIND" = "ufw" ]; then
+        local r4 r6 need6=0
+        r4=$(cat /etc/ufw/user.rules 2>/dev/null || true)
+        r6=$(cat /etc/ufw/user6.rules 2>/dev/null || true)
+        # ipv6 only counts when ufw actually manages it
+        grep -q '^IPV6=yes' /etc/ufw/ufw.conf 2>/dev/null && need6=1
+        if [ "$state" = "on" ]; then
+          echo "$r4" | grep -q -- "--dport $door" \
+            && { [ "$need6" = "0" ] || echo "$r6" | grep -q -- "--dport $door"; } \
+            && out=on
+        else
+          echo "$r4" | grep -- "-i wt0" | grep -q -- "--dport $door" \
+            && { [ "$need6" = "0" ] || echo "$r6" | grep -- "-i wt0" | grep -q -- "--dport $door"; } \
+            && out=on
+        fi
+      elif [ "$FW_KIND" = "firewalld" ]; then
+        # firewalld drives nftables for both families: one ports list
+        # is the truth for ipv4 and ipv6 alike
+        local ports zports
+        ports=$(firewall-cmd --list-ports 2>/dev/null || true)
+        if [ "$state" = "on" ]; then
+          fw_ports_cover "$ports" "$door" && out=on
+        else
+          zports=$(firewall-cmd --zone=redoubt-mesh --list-ports 2>/dev/null || true)
+          fw_ports_cover "$zports" "$door" && out=on
+        fi
+      fi
+      ;;
+  esac
+  printf '%s\n' "$out"
+}
+
+ha_gate_install() {
+  # the boot gate: after a reboot the door may never be more open than
+  # the saved story and the loaded rules justify. The script only
+  # closes; re-opening always rides a kit pass that re-verifies first.
+  kit_put_exec /usr/local/sbin/redoubt-ha-gate 755 <<'HAGATE'
+#!/usr/bin/env bash
+# redoubt-ha-gate: re-applies the Home Assistant door gate at boot.
+# The saved firewall story plus the rules actually loaded decide; the
+# site file is the switch (absent means the edge aborts on the door).
+# This script only ever closes the door: re-opening needs a kit pass.
+set -euo pipefail
+umask 022
+PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
+CONF=/etc/redoubt/services.conf
+[ -s "$CONF" ] || exit 0
+cv() { sed -n "s/^$1=//p" "$CONF" | head -1; }
+STACKDIR=$(cv STACKDIR)
+META=/opt/redoubt/services/svc-homeassistant/meta
+[ -f "$META" ] || exit 0
+DOOR=$(sed -n 's/^DOOR=//p' "$META" | head -1)
+[ -n "$DOOR" ] || exit 0
+# the saved story rides the encrypted env: same envelope as the kit
+dec() {
+  if head -c 8 /etc/redoubt/redoubt.env | grep -q 'Salted__'; then
+    openssl enc -d -aes-256-cbc -pbkdf2 -iter 200000 -pass pass:"$(cat /etc/machine-id 2>/dev/null | tr -d '\n')" -in /etc/redoubt/redoubt.env 2>/dev/null
+  else
+    cat /etc/redoubt/redoubt.env
+  fi
+}
+FW=$(dec | sed -n 's/^FW_DECISION=//p' | head -1)
+GATE=on
+case "$FW" in on|on-nas) ;; *) GATE=off ;; esac
+if [ "$GATE" = "on" ] && command -v ufw >/dev/null 2>&1; then
+  R4=$(cat /etc/ufw/user.rules 2>/dev/null || true)
+  R6=$(cat /etc/ufw/user6.rules 2>/dev/null || true)
+  NEED6=0
+  grep -q '^IPV6=yes' /etc/ufw/ufw.conf 2>/dev/null && NEED6=1
+  if [ "$FW" = "on" ]; then
+    echo "$R4" | grep -q -- "--dport $DOOR" || GATE=off
+    if [ "$NEED6" = "1" ] && ! echo "$R6" | grep -q -- "--dport $DOOR"; then GATE=off; fi
+  else
+    echo "$R4" | grep -- "-i wt0" | grep -q -- "--dport $DOOR" || GATE=off
+    if [ "$NEED6" = "1" ] && ! echo "$R6" | grep -- "-i wt0" | grep -q -- "--dport $DOOR"; then GATE=off; fi
+  fi
+elif [ "$GATE" = "on" ] && command -v firewall-cmd >/dev/null 2>&1; then
+  # the service block rides as one N-M/tcp range: a listed range
+  # covers the door just like an exact port entry would
+  cover() {
+    for _p in $1; do
+      _p="${_p%%/*}"
+      case "$_p" in
+        *-*) _lo="${_p%-*}"; _hi="${_p#*-}"
+             case "$_lo$_hi" in
+               ""|*[!0-9]*) ;;
+               *) [ "$DOOR" -ge "$_lo" ] && [ "$DOOR" -le "$_hi" ] && return 0 ;;
+             esac ;;
+        *) [ "$_p" = "$DOOR" ] && return 0 ;;
+      esac
+    done
+    return 1
+  }
+  PORTS=$(firewall-cmd --list-ports 2>/dev/null || true)
+  if [ "$FW" = "on" ]; then
+    cover "$PORTS" || GATE=off
+  else
+    ZP=$(firewall-cmd --zone=redoubt-mesh --list-ports 2>/dev/null || true)
+    cover "$ZP" || GATE=off
+  fi
+elif [ "$GATE" = "on" ]; then
+  # no firewall tool left to verify the saved story against: the door
+  # stays closed until a kit pass re-verifies the loaded rules
+  GATE=off
+fi
+if [ "$GATE" = "on" ]; then
+  exit 0
+fi
+# close the door: drop the site file and reload the edge. A door with
+# no site behind it aborts at the edge.
+SITE="$STACKDIR/caddy-services/svc-homeassistant.caddy"
+if [ -f "$SITE" ]; then
+  rm -f "$SITE"
+  docker exec redoubt-edge-local-1 caddy reload --config /etc/caddy/Caddyfile --adapter caddyfile >/dev/null 2>&1 \
+    || docker restart redoubt-edge-local-1 >/dev/null 2>&1 || true
+fi
+exit 0
+HAGATE
+  cat > /etc/systemd/system/redoubt-ha-gate.service <<'HAUNIT'
+[Unit]
+Description=Redoubt Home Assistant door gate (closed unless verified)
+After=docker.service network-online.target
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+ExecStart=/usr/local/sbin/redoubt-ha-gate
+
+[Install]
+WantedBy=multi-user.target
+HAUNIT
+  chmod 644 /etc/systemd/system/redoubt-ha-gate.service
+  systemctl daemon-reload >/dev/null 2>&1 || true
+  systemctl enable redoubt-ha-gate.service >/dev/null 2>&1 || true
+}
+
+ha_reconcile() {
+  [ "${REDOUBT_HA:-0}" = "1" ] || return 0
+  [ -n "$HA_DIGEST" ] || { dbg "WARNING: Home Assistant stays off: HA_DIGEST is empty (no reviewed release pin yet)"; return 0; }
+  # the root-owned catalog is the only authority: it must byte-match
+  # its pin before the service may start, on every pass. A failed
+  # check also closes a door a previous pass had opened: the gate
+  # flips off and the refresh drops the site file behind it.
+  ha_catalog_install || {
+    dbg "WARNING: Home Assistant catalog failed the byte check: the service stays off"
+    mkdir -p "$HA_GATE_DIR"
+    printf 'off\n' > "$HA_GATE_DIR/svc-homeassistant"
+    chmod 644 "$HA_GATE_DIR/svc-homeassistant" 2>/dev/null || true
+    if [ -x /usr/local/sbin/redoubt-svc ]; then
+      /usr/local/sbin/redoubt-svc refresh >> "$LOG" 2>&1 || true
+    else
+      rm -f "$STACKDIR/caddy-services/svc-homeassistant.caddy" 2>/dev/null || true
+    fi
+    return 0
+  }
+  local door="${HA_DOOR:-}"
+  [ -n "$door" ] || { dbg "WARNING: Home Assistant has no reserved door: the service stays off"; return 0; }
+  # the gate is decided before anything starts, so a first activation
+  # never renders a site for an unverified firewall story: the saved
+  # story plus the rules that are really loaded decide, never the
+  # app-door list alone
+  local gate
+  gate=$(ha_gate_eval "$door")
+  mkdir -p "$HA_GATE_DIR"
+  printf '%s\n' "$gate" > "$HA_GATE_DIR/svc-homeassistant"
+  chmod 644 "$HA_GATE_DIR/svc-homeassistant" 2>/dev/null || true
+  # the project lives outside the stack recovery wildcards: its own
+  # compose file in its own directory, so the stack's profile-wide
+  # up and down never sees it
+  if [ ! -f "$HA_SVC_DIR/meta" ]; then
+    if [ -x /usr/local/sbin/redoubt-svc ]; then
+      # first activation: the builder builds from the recipe under its
+      # lock, honors the gate above, and rolls the whole thing back on
+      # any failure
+      if /usr/local/sbin/redoubt-svc activate homeassistant --door "$door" >> "$LOG" 2>&1; then
+        dbg "OK: Home Assistant built from the approved recipe"
+      else
+        dbg "WARNING: Home Assistant activation failed (see the log): rolled back, the door stays closed"
+        return 0
+      fi
+    else
+      dbg "WARNING: no service builder on this box: Home Assistant stays off"
+      return 0
+    fi
+  elif [ -f "$HA_CATALOG/recipe.sha256" ] && [ -f "$HA_SVC_DIR/recipe.sha256" ] \
+       && [ "$(cat "$HA_CATALOG/recipe.sha256" 2>/dev/null)" != "$(cat "$HA_SVC_DIR/recipe.sha256" 2>/dev/null)" ]; then
+    # the recipe pin moved: a new reviewed release rebuilds from the
+    # new recipe on the same door (the /config volume survives)
+    dbg "Home Assistant recipe pin moved: rebuilding from the reviewed release"
+    docker compose -f "$HA_SVC_DIR/compose.yml" down >/dev/null 2>&1 || true
+    rm -rf "${HA_SVC_DIR:?}"
+    if /usr/local/sbin/redoubt-svc activate homeassistant --door "$door" >> "$LOG" 2>&1; then
+      dbg "OK: Home Assistant rebuilt on the new pin"
+    else
+      dbg "WARNING: Home Assistant rebuild failed (see the log): rolled back, the door stays closed"
+      return 0
+    fi
+  fi
+  # the builder may have re-picked a door when the reservation was
+  # taken: its meta is the truth, the env and the gate follow it
+  _ha_act_door=$(sed -n 's/^DOOR=//p' "$HA_SVC_DIR/meta" 2>/dev/null || true)
+  if [ -n "$_ha_act_door" ] && [ "$_ha_act_door" != "$door" ]; then
+    sed -i '/^HA_DOOR=/d' "$_ENV_TMP"
+    echo "HA_DOOR=$_ha_act_door" >> "$_ENV_TMP"
+    kit_env_commit
+    door="$_ha_act_door"
+    gate=$(ha_gate_eval "$door")
+    printf '%s\n' "$gate" > "$HA_GATE_DIR/svc-homeassistant"
+  fi
+  if [ -x /usr/local/sbin/redoubt-svc ]; then
+    /usr/local/sbin/redoubt-svc refresh >> "$LOG" 2>&1 \
+      || dbg "WARNING: Home Assistant site refresh failed"
+  else
+    rm -f "$STACKDIR/caddy-services/svc-homeassistant.caddy" 2>/dev/null || true
+  fi
+  case "$gate" in
+    on) ;;
+    *)
+      if [ "$FW_ACTIVE" = "1" ]; then
+        case "${FW_DECISION:-}" in
+          on|on-nas) dbg "Home Assistant door $door stays closed: the saved story says ${FW_DECISION}, but the loaded rules do not show the door (both families)" ;;
+          on-nodoors) dbg "Home Assistant door $door stays closed: the saved firewall story is on-nodoors (no service exposure)" ;;
+          off) dbg "Home Assistant door $door stays closed: the saved firewall story is off" ;;
+          *) dbg "Home Assistant door $door stays closed: no saved firewall story yet (answer the firewall questions, or keep it box-only)" ;;
+        esac
+      else
+        dbg "Home Assistant door $door stays closed: no active firewall story was verified"
+      fi
+      return 0
+      ;;
+  esac
+  # the door may open, so prove the build again first: compose, site
+  # and the running digest must all byte-match their pins
+  if [ -x /usr/local/sbin/redoubt-svc ]; then
+    if ! /usr/local/sbin/redoubt-svc verify homeassistant >> "$LOG" 2>&1; then
+      dbg "WARNING: Home Assistant failed verification: the door stays closed"
+      printf 'off\n' > "$HA_GATE_DIR/svc-homeassistant"
+      /usr/local/sbin/redoubt-svc refresh >> "$LOG" 2>&1 || true
+      return 0
+    fi
+  fi
+  # proxy trust: Home Assistant reads client addresses from forwarded
+  # headers only when the sender is the edge itself. Three states: a
+  # fresh volume gets the kit's minimal config, the factory default
+  # (first boot wrote it before this pass could) gets the http block
+  # appended, and an owner-edited file is never rewritten. No trust is
+  # the safe state either way: without trusted_proxies the edge is the
+  # only client address Home Assistant ever sees.
+  local ha_edge_ip
+  ha_edge_ip=$(docker inspect -f '{{(index .NetworkSettings.Networks "redoubt_default").IPAddress}}' redoubt-edge-local-1 2>/dev/null || true)
+  if [ -z "$ha_edge_ip" ]; then
+    dbg "WARNING: the edge proxy address is unknown: Home Assistant trust config not written, the door stays closed"
+    printf 'off\n' > "$HA_GATE_DIR/svc-homeassistant"
+    return 0
+  fi
+  if docker exec svc-homeassistant sh -c '[ -s /config/configuration.yaml ]' >/dev/null 2>&1; then
+    # the factory template carries the default_config marker and no
+    # http: key of its own: Home Assistant wrote it itself on first
+    # boot (usually while the door was still gated), the owner has not
+    # touched it yet, so the kit may add the trust block. An owner
+    # file with its own http: key is left alone.
+    if docker exec svc-homeassistant sh -c 'grep -q "^default_config:" /config/configuration.yaml && ! grep -q "^http:" /config/configuration.yaml' >/dev/null 2>&1; then
+      # keep a copy so a failed append can restore byte for byte; the
+      # blank first line keeps the block off the tail of a file that
+      # does not end in a newline
+      docker exec svc-homeassistant sh -c 'cp -f /config/configuration.yaml /config/configuration.yaml.redoubt-bak' >/dev/null 2>&1
+      docker exec -i svc-homeassistant sh -c 'cat >> /config/configuration.yaml' <<HAHTTP
+
+http:
+  use_x_forwarded_for: true
+  trusted_proxies:
+    - ${ha_edge_ip}
+HAHTTP
+      if docker exec svc-homeassistant sh -c 'grep -q "trusted_proxies" /config/configuration.yaml' >/dev/null 2>&1; then
+        docker exec svc-homeassistant sh -c 'rm -f /config/configuration.yaml.redoubt-bak' >/dev/null 2>&1 || true
+        dbg "OK: Home Assistant http trust pinned to the edge proxy (appended to the factory config)"
+      else
+        docker exec svc-homeassistant sh -c 'mv -f /config/configuration.yaml.redoubt-bak /config/configuration.yaml' >/dev/null 2>&1 || true
+        dbg "WARNING: Home Assistant trust config did not land: the door stays closed"
+        printf 'off\n' > "$HA_GATE_DIR/svc-homeassistant"
+        return 0
+      fi
+    else
+      dbg "OK: Home Assistant configuration exists (owner-owned: the kit leaves it alone)"
+    fi
+  else
+    docker exec -i svc-homeassistant sh -c 'cat > /config/configuration.yaml' <<HAHTTP
+http:
+  use_x_forwarded_for: true
+  trusted_proxies:
+    - ${ha_edge_ip}
+HAHTTP
+    docker exec svc-homeassistant grep -q trusted_proxies /config/configuration.yaml 2>/dev/null \
+      && dbg "OK: Home Assistant http trust pinned to the edge proxy" \
+      || { dbg "WARNING: Home Assistant trust config did not land: the door stays closed"; printf 'off\n' > "$HA_GATE_DIR/svc-homeassistant"; return 0; }
+  fi
+  # before reporting success: the real https route, the websocket
+  # upgrade and the HA readiness endpoint all answer. A door answer
+  # alone proves the proxy; only /api/ proves Home Assistant itself.
+  local ha_host ha_code ha_ip ha_body i
+  ha_host=$(awk -v p=":$PORT_EDGE4" 'index($0,"https://")==1 && index($0,p) && /[{][[:space:]]*$/ {print; exit}' "$STACKDIR/local-caddy.Caddyfile" 2>/dev/null \
+    | grep -o 'https://[^:, ]*' | head -1 | sed 's|https://||')
+  _HA_HTTPS=0 _HA_WS=0 _HA_READY=0
+  if [ -n "$ha_host" ]; then
+    for i in $(seq 1 20); do
+      ha_code=$(curl -s -o /dev/null -w '%{http_code}' -m 5 --cacert /var/lib/redoubt/caddy-local/cert-share/root-ca.crt \
+        --resolve "$ha_host:$door:127.0.0.1" "https://$ha_host:$door/" 2>/dev/null || true)
+      case "$ha_code" in [1-4]??) _HA_HTTPS=1; break ;; esac
+      sleep 3
+    done
+    ha_code=$(curl -s -o /dev/null -w '%{http_code}' -m 5 --cacert /var/lib/redoubt/caddy-local/cert-share/root-ca.crt \
+      --resolve "$ha_host:$door:127.0.0.1" -H 'Connection: Upgrade' -H 'Upgrade: websocket' \
+      -H 'Sec-WebSocket-Version: 13' -H 'Sec-WebSocket-Key: dGhlIHNhbXBsZSBub25jZQ==' \
+      "https://$ha_host:$door/api/websocket" 2>/dev/null || true)
+    case "$ha_code" in [1-4]??) _HA_WS=1 ;; esac
+  fi
+  ha_ip=$(docker inspect -f '{{range .NetworkSettings.Networks}}{{.IPAddress}} {{end}}' svc-homeassistant 2>/dev/null | awk '{print $1}')
+  if [ -n "$ha_ip" ]; then
+    for i in $(seq 1 20); do
+      ha_body=$(curl -s -m 3 "http://$ha_ip:8123/api/" 2>/dev/null || true)
+      case "$ha_body" in *"API running"*) _HA_READY=1; break ;; esac
+      sleep 3
+    done
+  fi
+  if [ "$_HA_HTTPS" = "1" ] && [ "$_HA_WS" = "1" ] && [ "$_HA_READY" = "1" ]; then
+    dbg "OK: Home Assistant live on door $door (https, websocket and the readiness api all answer)"
+    dbg "Home Assistant widget: left pending on purpose - add it in panel edit mode with http://svc-homeassistant:8123 and a long-lived token created in Home Assistant (Settings, People). The kit never mints, logs or stores that token."
+    # the boot gate keeps the door honest across reboots: it can only
+    # ever close it, a kit pass re-opens after re-verification
+    ha_gate_install
+    if [ -t 3 ]; then
+      echo "Home Assistant is live: https://${SEED_HOST:-$LAN_IP}:${door}" >&3 2>/dev/null || true
+      echo "  Panel: the tile points here. The widget is not seeded on purpose:" >&3 2>/dev/null || true
+      echo "  add it in panel edit mode with http://svc-homeassistant:8123 and a" >&3 2>/dev/null || true
+      echo "  long-lived token you create in Home Assistant (Settings, People)." >&3 2>/dev/null || true
+      echo "  The kit never mints, logs or stores that token." >&3 2>/dev/null || true
+    fi
+  else
+    dbg "WARNING: Home Assistant checks failed (https=$_HA_HTTPS websocket=$_HA_WS ready=$_HA_READY): the door stays closed"
+    printf 'off\n' > "$HA_GATE_DIR/svc-homeassistant"
+    if [ -x /usr/local/sbin/redoubt-svc ]; then
+      /usr/local/sbin/redoubt-svc refresh >> "$LOG" 2>&1 || true
+    else
+      rm -f "$STACKDIR/caddy-services/svc-homeassistant.caddy" 2>/dev/null || true
+    fi
+  fi
+}
+ha_reconcile
 
 # the assistant wiring only proves homarr migrated its own db; the seed
 # writes the board serverSetting, so its absence means the panel was
