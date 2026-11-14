@@ -6582,15 +6582,20 @@ SEEDENV
     // our keys carry a fixed id prefix: a re-mint revokes only what the
     // kit made and never touches keys the owner created by hand
     var keepId = /^redoubtmcp[0-9a-f]{14}$/.test(process.env.SEED_MCP_ID || "") ? process.env.SEED_MCP_ID : "";
-    if (!keepId || !db.prepare('SELECT 1 FROM "apiKey" WHERE id = ?').get(keepId)) {
+    var keyRow = keepId ? db.prepare('SELECT api_key FROM "apiKey" WHERE id = ?').get(keepId) : null;
+    // a 64-hex api_key is the kit's legacy sha256 row: it can never
+    // verify under the bcrypt scheme, so treat it as absent and re-mint
+    var legacySha = keyRow && /^[0-9a-f]{64}$/.test(keyRow.api_key);
+    if (!keepId || !keyRow || legacySha) {
       db.prepare('DELETE FROM "apiKey" WHERE id LIKE ?').run("redoubtmcp%");
       // 24 lowercase alnum chars, the shape of homarr's own ids. The
       // token is 64 hex: no "." to break the header split.
       var keyId = "redoubtmcp" + crypto.randomBytes(7).toString("hex");
       var token = crypto.randomBytes(32).toString("hex");
-      // 2.13.0 stores sha256(token) as hex and verifies it with a
-      // timing-safe compare; there is no salt column in this schema
-      var apiKey = crypto.createHash("sha256").update(token).digest("hex");
+      // homarr 2.13.0 verifies api tokens with bcrypt at cost 10 (the
+      // rabbit confirmed it in the tagged source); a sha256 digest can
+      // never pass that compare, so hash with the same algorithm
+      var apiKey = bcrypt.hashSync(token, 10);
       var names = ["id", "api_key", "user_id"];
       var vals = [keyId, apiKey, uid];
       // the guardian edits boards and apps: a read-only key would list
@@ -9413,34 +9418,63 @@ guardian_wire_mcp() {
     || { gbar "guardian: local CA not found - MCP wiring skipped"; return 1; }
 
   # probe before writing anything: the same url, CA and key Hermes will
-  # use. A failure here means a wrong hash scheme, a dead route or a bad
-  # cert, and in every case the guardian is better off without the server.
-  hdr=$(mktemp) && chmod 600 "$hdr"
-  printf 'ApiKey: %s\n' "$(cat "$keyf")" > "$hdr"
-  sid=$(curl -sS -m 20 --cacert "$ca" -D - -o /dev/null -X POST "$url" -H "@$hdr" \
-      -H 'Content-Type: application/json' -H 'Accept: application/json, text/event-stream' \
-      -d '{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2026-07-28","capabilities":{},"clientInfo":{"name":"redoubt-kit","version":"1"}}}' 2>/dev/null \
-    | tr -d '\r' | awk -F': ' 'tolower($1)=="mcp-session-id" {print $2; exit}')
-  # a stateful server hands out a session id and expects the initialized
-  # notice before any other call; a stateless one ignores both
-  if [ -n "$sid" ]; then
-    curl -sS -m 20 --cacert "$ca" -o /dev/null -X POST "$url" -H "@$hdr" -H "Mcp-Session-Id: $sid" \
-      -H 'Content-Type: application/json' -H 'Accept: application/json, text/event-stream' \
-      -d '{"jsonrpc":"2.0","method":"notifications/initialized"}' 2>/dev/null || true
-  fi
-  # the homarr 2.x MCP speaks the 2026-07-28 protocol; the older
-  # version string made the server refuse the session outright
-  body=$(curl -sS -m 30 --cacert "$ca" -X POST "$url" -H "@$hdr" ${sid:+-H "Mcp-Session-Id: $sid"} \
-      -H 'Content-Type: application/json' -H 'Accept: application/json, text/event-stream' \
-      -d '{"jsonrpc":"2.0","id":2,"method":"tools/list"}' 2>/dev/null || true)
-  rm -f "$hdr"
-  if ! printf '%s' "$body" | grep -q '"tools"'; then
-    # drop the key file so the next pass mints a fresh one instead of
-    # re-probing a key that can never verify
-    rm -f "$keyf"
-    gbar "guardian: panel MCP probe FAILED (tools/list) - not wired"
+  # use. The response and the curl evidence stay in a private dir so a
+  # failure can be told apart (transport, HTTP status, auth or route),
+  # and the key survives so the next pass does not re-mint for nothing.
+  probe_dir=$(mktemp -d) || { gbar "guardian: cannot create MCP probe directory"; return 1; }
+  hdr="$probe_dir/headers"
+  body="$probe_dir/body"
+  if ! printf 'ApiKey: %s\n' "$(cat "$keyf")" > "$hdr"; then
+    rm -rf -- "$probe_dir"
+    gbar "guardian: cannot prepare MCP probe"
     return 1
   fi
+  probe_rc=0
+  probe_http=$(curl -sS -m 30 --cacert "$ca" \
+    -o "$body" -w '%{http_code}' -X POST "$url" -H "@$hdr" \
+    -H 'Content-Type: application/json' -H 'Accept: application/json, text/event-stream' \
+    -d '{"jsonrpc":"2.0","id":2,"method":"tools/list"}' 2>/dev/null) || probe_rc=$?
+  # a JSON-RPC result with the tools array (plain json or SSE frames)
+  # is the only pass; anything else reports the evidence and keeps the
+  # key in place
+  if [ "$probe_rc" -ne 0 ] || \
+     [[ ! "$probe_http" =~ ^2[0-9][0-9]$ ]] || \
+     ! python3 - "$body" <<'MCP_CHECK'
+import json
+import re
+import sys
+
+text = open(sys.argv[1], encoding="utf-8").read()
+messages = []
+try:
+    messages.append(json.loads(text))
+except (ValueError, UnicodeError):
+    for event in re.split(r"\r?\n\r?\n", text):
+        data = [line[5:].lstrip(" ") for line in event.splitlines()
+                if line.startswith("data:")]
+        if data:
+            try:
+                messages.append(json.loads("\n".join(data)))
+            except ValueError:
+                pass
+
+ok = any(
+    isinstance(msg, dict)
+    and msg.get("jsonrpc") == "2.0"
+    and msg.get("id") == 2
+    and isinstance(msg.get("result"), dict)
+    and isinstance(msg["result"].get("tools"), list)
+    and "error" not in msg
+    for msg in messages
+)
+sys.exit(0 if ok else 1)
+MCP_CHECK
+  then
+    rm -rf -- "$probe_dir"
+    gbar "guardian: panel MCP probe failed (curl=$probe_rc, HTTP=$probe_http)"
+    return 1
+  fi
+  rm -rf -- "$probe_dir"
 
   # the write uses the guardian's own Hermes interpreter, which ships
   # PyYAML; the host python may not. The key rides stdin, never argv.
