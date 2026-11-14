@@ -363,6 +363,9 @@ MAIL_RELAY_FLAG="${REDOUBT_MAIL_RELAY:-}"
 MAIL_MX_CUTOVER_FLAG="${REDOUBT_MAIL_MX_CUTOVER:-}"
 MAIL_PUB4_FLAG="${REDOUBT_MAIL_PUB4:-}"
 MAIL_PUB6_FLAG="${REDOUBT_MAIL_PUB6:-}"
+MEDIA_FLAG="${REDOUBT_MEDIA:-}"
+MEDIA_PATH_FLAG="${REDOUBT_MEDIA_PATH:-}"
+MEDIA_HWACC_FLAG="${REDOUBT_MEDIA_HWACC:-}"
 
 # Self-heal: a run that got killed can leave the DNS lockdown active while
 # the resolver chain never came up on 127.0.0.1:53 (pi-hole fronts
@@ -5916,6 +5919,225 @@ else
   rm -f /etc/systemd/system/redoubt-mail-gate.service /usr/local/sbin/redoubt-mail-gate 2>/dev/null || true
 fi
 
+# 8e) Media (optional: the installer flag REDOUBT_MEDIA). The opt-in
+# persists in the env like every other owner choice, so an omitted
+# flag keeps the saved answer and a later REDOUBT_MEDIA=0 walks the
+# tier back (both services stop, the edge site and the panel tile go,
+# the media library, the Jellyfin /config volume and any credentials
+# stay). The tier is its own project outside the stack's profile
+# wildcards, so a stack recovery never sweeps it. This early pass
+# only reconciles the choice, validates the owner's media path and
+# reserves the edge doors (Jellyfin's own plus the kept-closed slot
+# for the pending Reiverr workflow) so the panel seed below can carry
+# the tile link; the service itself is built and its door gated after
+# the firewall section, where the owner's saved door story is known.
+# Fail closed: unreviewed releases, a missing or unsafe media path or
+# no free door all keep the tier off.
+MEDIA_JELLYFIN_VERSION=""
+# the reviewed Jellyfin release pins. Empty until the release review
+# fills them: an empty pin fails closed and the service never starts
+# on an unreviewed image. Never guess a digest.
+MEDIA_JELLYFIN_DIGEST=""
+MEDIA_JELLYFIN_IMAGE="jellyfin/jellyfin"
+# the reviewed official Reiverr image reference. The workflow itself
+# stays unwired until a specific release is selected and tested: see
+# the honest partial report below.
+MEDIA_REIVERR_VERSION=""
+MEDIA_REIVERR_DIGEST=""
+MEDIA_REIVERR_IMAGE="ghcr.io/aleksilassila/reiverr"
+MEDIA_REIVERR_REASON="the Reiverr releases differ materially: v2.1.1 has the Jellyfin plugin without the Sonarr/Radarr integration, the v3 beta is a different product with its own torrent client, the 1.0 branch carries the older integration; a specific release must be selected and tested"
+MEDIA_JELLYFIN_SVC_DIR="/opt/redoubt/services/jellyfin"
+MEDIA_CATALOG="/opt/redoubt/catalog"
+MEDIA_GATE_DIR="/etc/redoubt/svc-gates"
+# the explicit installer flag wins over the saved choice; a missing
+# flag keeps the one already sourced from the env
+[ -n "${MEDIA_FLAG:-}" ] && REDOUBT_MEDIA="$MEDIA_FLAG"
+case "${REDOUBT_MEDIA:-}" in 1|0) ;; *) REDOUBT_MEDIA=0 ;; esac
+MEDIA_ON="${REDOUBT_MEDIA}"
+# persist the choice: every later pass reconciles to it even when the
+# installer flag is not repeated
+if grep -qs '^REDOUBT_MEDIA=' "$_ENV_TMP" 2>/dev/null; then
+  sed -i "s|^REDOUBT_MEDIA=.*|REDOUBT_MEDIA=$REDOUBT_MEDIA|" "$_ENV_TMP"
+else
+  echo "REDOUBT_MEDIA=$REDOUBT_MEDIA" >> "$_ENV_TMP"
+fi
+kit_env_commit
+# the owner's media library: the kit mounts it read-only and never
+# writes to it. A later explicit flag still wins over a saved path.
+[ -n "${MEDIA_PATH_FLAG:-}" ] && REDOUBT_MEDIA_PATH="$MEDIA_PATH_FLAG"
+MEDIA_PATH="${REDOUBT_MEDIA_PATH:-}"
+media_path_ok() {
+  # the library must already exist as a directory under the resolved
+  # owner home, with no symlink components: a symlink that can be
+  # swapped later is not a stable mount. The kit never guesses a
+  # library location. An external disk bound into the home is fine.
+  # YAML-hostile characters are rejected because the path rides into
+  # the recipe's compose file.
+  local _mh
+  [ -n "$MEDIA_PATH" ] || return 1
+  case "$MEDIA_PATH" in *'"'*|*\\*) return 1 ;; esac
+  [ -d "$MEDIA_PATH" ] || return 1
+  _mh="${OWNER_HOME:-}"
+  [ -z "$_mh" ] && [ -n "${SUDO_USER:-}" ] && [ "$SUDO_USER" != "root" ] && _mh=$(getent passwd "$SUDO_USER" 2>/dev/null | cut -d: -f6)
+  [ -z "$_mh" ] && _mh=$(getent passwd | awk -F: '$3>=1000 && $3<65534 {print $6; exit}' 2>/dev/null)
+  [ -n "$_mh" ] || return 1
+  safe_owner_path "$MEDIA_PATH" "$_mh" || return 1
+}
+if media_path_ok; then
+  # persist the validated path so later passes keep it without the
+  # installer flag being repeated
+  if grep -qs '^REDOUBT_MEDIA_PATH=' "$_ENV_TMP" 2>/dev/null; then
+    sed -i "s|^REDOUBT_MEDIA_PATH=.*|REDOUBT_MEDIA_PATH=$MEDIA_PATH|" "$_ENV_TMP"
+  else
+    echo "REDOUBT_MEDIA_PATH=$MEDIA_PATH" >> "$_ENV_TMP"
+  fi
+  kit_env_commit
+elif [ -n "$MEDIA_PATH" ]; then
+  dbg "WARNING: REDOUBT_MEDIA_PATH is not a safe owner path: the media tier stays off"
+fi
+# hardware transcoding is its own opt-in, default off: software
+# transcoding runs first, inside the resource limits in the recipe
+[ -n "${MEDIA_HWACC_FLAG:-}" ] && REDOUBT_MEDIA_HWACC="$MEDIA_HWACC_FLAG"
+case "${REDOUBT_MEDIA_HWACC:-}" in 1|0) ;; *) REDOUBT_MEDIA_HWACC=0 ;; esac
+if grep -qs '^REDOUBT_MEDIA_HWACC=' "$_ENV_TMP" 2>/dev/null; then
+  sed -i "s|^REDOUBT_MEDIA_HWACC=.*|REDOUBT_MEDIA_HWACC=$REDOUBT_MEDIA_HWACC|" "$_ENV_TMP"
+else
+  echo "REDOUBT_MEDIA_HWACC=$REDOUBT_MEDIA_HWACC" >> "$_ENV_TMP"
+fi
+kit_env_commit
+if [ "$MEDIA_ON" = "1" ]; then
+  # fail closed: an unpinned release or a missing library keeps the
+  # tier off, whatever else this pass would like to do
+  if [ -z "$MEDIA_JELLYFIN_DIGEST" ] || [ -z "$MEDIA_JELLYFIN_VERSION" ]; then
+    dbg "media tier: Jellyfin stage pending (MEDIA_JELLYFIN_DIGEST is empty until the release review fills it; digests are never guessed)"
+    MEDIA_ON=0
+  elif ! media_path_ok; then
+    dbg "media tier: Jellyfin stage pending (REDOUBT_MEDIA_PATH missing or not a safe owner path: the kit never guesses a library location)"
+    MEDIA_ON=0
+  fi
+fi
+if [ "$MEDIA_ON" = "1" ]; then
+  # the honest partial report: the tier is two services and only one
+  # of them is wired yet
+  dbg "media tier: partial on purpose: Jellyfin activates alone; Reiverr stays pending ($MEDIA_REIVERR_REASON)"
+  dbg "media tier: no torrent client, no port-forwarding, no plugin or automatic-library-deletion defaults: those stay behind a separate owner decision and are not enabled"
+  if [ "${REDOUBT_MEDIA_HWACC:-0}" != "1" ]; then
+    dbg "media tier: transcode check: pending (REDOUBT_MEDIA_HWACC is off: software transcoding stays the default, inside the recipe's resource limits)"
+  fi
+  # the edge doors: two free ports from the service block, chosen under
+  # the builder's own lock and saved in the env, so re-runs keep the
+  # same links and the builder re-checks them before use. The built
+  # service's own meta wins for Jellyfin when it exists. The Reiverr
+  # slot stays reserved and closed: no meta, no site, no tile, and an
+  # explicit off gate so even a future build would start closed.
+  MEDIA_JELLYFIN_DOOR="${MEDIA_JELLYFIN_DOOR:-}"
+  MEDIA_REIVERR_DOOR="${MEDIA_REIVERR_DOOR:-}"
+  if [ -f "$MEDIA_JELLYFIN_SVC_DIR/meta" ]; then
+    _mj_meta_door=$(sed -n 's/^DOOR=//p' "$MEDIA_JELLYFIN_SVC_DIR/meta" 2>/dev/null || true)
+    [ -n "$_mj_meta_door" ] && MEDIA_JELLYFIN_DOOR="$_mj_meta_door"
+  fi
+  _mj_taken=0
+  if [ -n "$MEDIA_JELLYFIN_DOOR" ]; then
+    for _mjm in /opt/redoubt/services/*/meta; do
+      [ -f "$_mjm" ] || continue
+      [ "$_mjm" = "$MEDIA_JELLYFIN_SVC_DIR/meta" ] && continue
+      [ "$(sed -n 's/^DOOR=//p' "$_mjm" 2>/dev/null)" = "$MEDIA_JELLYFIN_DOOR" ] && _mj_taken=1
+    done
+  fi
+  [ "$_mj_taken" = "1" ] && MEDIA_JELLYFIN_DOOR=""
+  if [ -n "$MEDIA_REIVERR_DOOR" ]; then
+    for _mjm in /opt/redoubt/services/*/meta; do
+      [ -f "$_mjm" ] || continue
+      [ "$(sed -n 's/^DOOR=//p' "$_mjm" 2>/dev/null)" = "$MEDIA_REIVERR_DOOR" ] && MEDIA_REIVERR_DOOR=""
+    done
+  fi
+  [ -n "$MEDIA_REIVERR_DOOR" ] && [ "$MEDIA_REIVERR_DOOR" = "$MEDIA_JELLYFIN_DOOR" ] && MEDIA_REIVERR_DOOR=""
+  if [ -z "$MEDIA_JELLYFIN_DOOR" ] || [ -z "$MEDIA_REIVERR_DOOR" ] || [ -z "${SVC_PORT_LO:-}" ]; then
+    if [ -n "${SVC_PORT_LO:-}" ]; then
+      # the same lock file redoubt-svc flocks: the two allocators
+      # cannot race each other for a door
+      exec 9>/run/redoubt-svc.lock
+      flock -w 120 9 || true
+      _mj_used=""
+      for _mjm in /opt/redoubt/services/*/meta; do
+        [ -f "$_mjm" ] || continue
+        _mj_used="$_mj_used $(sed -n 's/^DOOR=//p' "$_mjm" 2>/dev/null)"
+      done
+      # a still-valid reservation counts as used: a fresh pick never
+      # lands on a kept one
+      [ -n "$MEDIA_JELLYFIN_DOOR" ] && _mj_used="$_mj_used $MEDIA_JELLYFIN_DOOR"
+      [ -n "$MEDIA_REIVERR_DOOR" ] && _mj_used="$_mj_used $MEDIA_REIVERR_DOOR"
+      for _mjd in $(seq "$SVC_PORT_LO" $((SVC_PORT_LO + SVC_PORT_N - 1))); do
+        case " $_mj_used " in
+          *" $_mjd "*) continue ;;
+          *)
+            if [ -z "$MEDIA_JELLYFIN_DOOR" ]; then
+              MEDIA_JELLYFIN_DOOR="$_mjd"; _mj_used="$_mj_used $_mjd"
+            elif [ -z "$MEDIA_REIVERR_DOOR" ]; then
+              MEDIA_REIVERR_DOOR="$_mjd"; _mj_used="$_mj_used $_mjd"
+            else
+              break
+            fi
+            ;;
+        esac
+      done
+      flock -u 9 2>/dev/null || true
+    else
+      # no service block on this box: a door without the block is not
+      # a door, drop both reservations like the Home Assistant pass
+      MEDIA_JELLYFIN_DOOR=""
+      MEDIA_REIVERR_DOOR=""
+    fi
+  fi
+  if [ -n "$MEDIA_JELLYFIN_DOOR" ]; then
+    sed -i '/^MEDIA_JELLYFIN_DOOR=/d' "$_ENV_TMP"
+    echo "MEDIA_JELLYFIN_DOOR=$MEDIA_JELLYFIN_DOOR" >> "$_ENV_TMP"
+    kit_env_commit
+    dbg "OK: media door reserved (Jellyfin $MEDIA_JELLYFIN_DOOR)"
+  else
+    dbg "WARNING: no free service door: the media tier stays off on this box"
+    MEDIA_ON=0
+  fi
+  if [ -n "$MEDIA_REIVERR_DOOR" ]; then
+    sed -i '/^MEDIA_REIVERR_DOOR=/d' "$_ENV_TMP"
+    echo "MEDIA_REIVERR_DOOR=$MEDIA_REIVERR_DOOR" >> "$_ENV_TMP"
+    kit_env_commit
+    dbg "OK: media door slot reserved for the pending Reiverr workflow ($MEDIA_REIVERR_DOOR, kept closed)"
+  fi
+  # the reserved slot stays closed: the off gate is the explicit
+  # marker that Reiverr may not open, only a future wired pass flips it
+  mkdir -p "$MEDIA_GATE_DIR"
+  printf 'off\n' > "$MEDIA_GATE_DIR/reiverr"
+  chmod 644 "$MEDIA_GATE_DIR/reiverr" 2>/dev/null || true
+else
+  # walking it back: both services stop, the edge site and the panel
+  # tile go, and the media library, the Jellyfin /config volume and
+  # any credentials all stay (the named volume survives a compose
+  # down; the media path is a read-only mount the kit never touches).
+  # The gate files keep the builder from re-rendering the sites too.
+  mkdir -p "$MEDIA_GATE_DIR"
+  printf 'off\n' > "$MEDIA_GATE_DIR/jellyfin"
+  chmod 644 "$MEDIA_GATE_DIR/jellyfin" 2>/dev/null || true
+  printf 'off\n' > "$MEDIA_GATE_DIR/reiverr"
+  chmod 644 "$MEDIA_GATE_DIR/reiverr" 2>/dev/null || true
+  if [ -f "$MEDIA_JELLYFIN_SVC_DIR/compose.yml" ]; then
+    docker compose -f "$MEDIA_JELLYFIN_SVC_DIR/compose.yml" down >/dev/null 2>&1 || true
+  fi
+  rm -f "$STACKDIR/caddy-services/jellyfin.caddy" 2>/dev/null || true
+  if docker ps --format '{{.Names}}' 2>/dev/null | grep -qx redoubt-edge-local-1; then
+    docker exec redoubt-edge-local-1 caddy reload --config /etc/caddy/Caddyfile --adapter caddyfile >/dev/null 2>&1 \
+      || docker restart redoubt-edge-local-1 >/dev/null 2>&1 || true
+  fi
+  systemctl disable --now redoubt-media-gate.service >/dev/null 2>&1 || true
+  rm -f /etc/systemd/system/redoubt-media-gate.service /usr/local/sbin/redoubt-media-gate 2>/dev/null || true
+fi
+# the media tile seeds only when the tier reconciled on this pass (a
+# reviewed Jellyfin pin, a valid library path and a reserved door);
+# the fail-closed states above leave MEDIA_ON=0, so no dead tile
+# survives
+SEED_MEDIA=""
+[ "$MEDIA_ON" = "1" ] && [ -n "${MEDIA_JELLYFIN_DOOR:-}" ] && SEED_MEDIA="https://${SEED_HOST}:${MEDIA_JELLYFIN_DOOR}"
+
 SEED_SECTIONS="full"
 [ "$MESH_MODE" = "selfhost" ] && SEED_SECTIONS="minimal"
 # the remote desktop tile seeds only when the owner asked for the
@@ -5991,6 +6213,7 @@ SEED_CONSOLE_PING=$SEED_CONSOLE_PING
 SEED_GUAC=$SEED_GUAC
 SEED_HA=$SEED_HA
 SEED_MAIL=$SEED_MAIL
+SEED_MEDIA=$SEED_MEDIA
 SEED_MCP_ID=$SEED_MCP_ID
 __SEED_JS__
 SEEDENV
@@ -6100,6 +6323,25 @@ SEEDENV
       db.prepare("DELETE FROM item WHERE id = ?").run(mailRows[m].id);
     }
     db.prepare("DELETE FROM app WHERE id = 'redoubt-app-mail'").run();
+  }
+  if (process.env.SEED_MEDIA) {
+    // the ping targets Jellyfin's own http port on the stack network:
+    // the edge door answers browsers with the local CA, while the
+    // panel's server-side ping reaches the container directly
+    APPS.push({ id: "redoubt-app-jellyfin", name: "Jellyfin",
+      icon: "/icons/jellyfin.svg",
+      href: process.env.SEED_MEDIA,
+      ping: "http://svc-jellyfin:8096" });
+  } else {
+    // a disabled media tier removes its kit-owned tile on every pass:
+    // the app row and every item that references it go, so a later
+    // REDOUBT_MEDIA=0 never leaves a dead tile on the board
+    var jfRows = db.prepare("SELECT id FROM item WHERE kind = 'app' AND options LIKE '%redoubt-app-jellyfin%'").all();
+    for (var jf = 0; jf < jfRows.length; jf++) {
+      db.prepare("DELETE FROM item_layout WHERE item_id = ?").run(jfRows[jf].id);
+      db.prepare("DELETE FROM item WHERE id = ?").run(jfRows[jf].id);
+    }
+    db.prepare("DELETE FROM app WHERE id = 'redoubt-app-jellyfin'").run();
   }
 
   var uuid = function () {
@@ -6464,6 +6706,9 @@ if [ "${REDOUBT_WELCOME:-1}" = "1" ]; then
   # the review confirms this slug once the mail tile goes live; a miss
   # here only leaves the tile iconless, never breaks the board
   cp "/var/lib/redoubt/caddy-local/cdn/gh/homarr-labs/dashboard-icons/svg/mail.svg" "/var/lib/redoubt/caddy-local/icons/mail.svg" 2>/dev/null || true
+  # the review confirms this slug once the media tile goes live; a miss
+  # here only leaves the tile iconless, never breaks the board
+  cp "/var/lib/redoubt/caddy-local/cdn/gh/homarr-labs/dashboard-icons/svg/jellyfin.svg" "/var/lib/redoubt/caddy-local/icons/jellyfin.svg" 2>/dev/null || true
   fetch_icon_set "png" \
     "https://install.tryredoubt.com/install/icons-png.tar.gz" \
     "62fe3de3c0063620439024de5eab6b3e3351a21e248cf780e49c21dd42252b18" \
@@ -11852,6 +12097,533 @@ mail_reconcile() {
   fi
 }
 mail_reconcile
+
+# 8e) Media reconcile: the early pass reserved the doors and seeded the
+# tile; this late pass builds Jellyfin alone strictly from the reviewed
+# catalog, pins its proxy trust to the edge, and opens or closes its
+# door to match the owner's saved firewall story and the rules that
+# are actually loaded. Reiverr stays reserved and closed: its workflow
+# lands only after a specific release is selected and tested. Runs on
+# every pass with or without the guardian. Anything unverified leaves
+# the site file absent, and an absent site file means the edge aborts
+# on the door.
+
+# render to a tmp in the same dir, move it in, then prove the final
+# file is byte for byte what was rendered (the same discipline the
+# service builder applies, kit side)
+media_put() {  # stdin -> $1 with mode $2
+  local _t _w _g
+  _t=$(mktemp "$(dirname "$1")/.mediaput.XXXXXX")
+  cat > "$_t"; chmod "$2" "$_t"
+  _w=$(sha256sum "$_t" | cut -d' ' -f1); mv -f "$_t" "$1"; _g=$(sha256sum "$1" | cut -d' ' -f1)
+  [ "$_w" = "$_g" ] || { rm -f "$1"; return 1; }
+}
+
+media_hwacc_probe() {  # prints DEVICE|GID for a detected render node, else nothing
+  # only a specific render node for a detected intel or amd gpu may be
+  # granted, and only when the owner opted in: no wholesale /dev/dri,
+  # no other device classes, no privileged flag anywhere
+  local node vendor gid
+  [ "${REDOUBT_MEDIA_HWACC:-0}" = "1" ] || return 0
+  for node in /dev/dri/renderD128 /dev/dri/renderD129; do
+    [ -e "$node" ] || continue
+    vendor=$(cat "/sys/class/drm/$(basename "$node")/device/vendor" 2>/dev/null || true)
+    case "$vendor" in
+      0x8086|0x1002)
+        gid=$(stat -c %g "$node" 2>/dev/null || true)
+        [ -n "$gid" ] && { printf '%s|%s\n' "$node" "$gid"; return 0; }
+        ;;
+    esac
+  done
+  return 0
+}
+
+media_catalog_install() {
+  # the root-owned Jellyfin recipe the builder may deploy: the env and
+  # compose are fixed here and their shas are pinned inside the recipe,
+  # so the whole package verifies from the single recipe.sha256 pin.
+  # Fails closed: an unpinned or mismatched recipe never reaches a
+  # start. The library path and the hardware acceleration grant are
+  # the only inputs, and both are kit-validated. The Reiverr entry
+  # keeps its own reviewed image reference and pin variables (see the
+  # early pass), but its recipe lands with the workflow: nothing here
+  # renders or activates it.
+  [ -n "$MEDIA_JELLYFIN_DIGEST" ] && [ -n "$MEDIA_JELLYFIN_VERSION" ] || return 1
+  media_path_ok || return 1
+  local pin node gid envsha composesha t tw w g _mj_hw
+  pin="${MEDIA_JELLYFIN_IMAGE}:${MEDIA_JELLYFIN_VERSION}@${MEDIA_JELLYFIN_DIGEST}"
+  node=""; gid=""
+  if [ "${REDOUBT_MEDIA_HWACC:-0}" = "1" ]; then
+    _mj_hw=$(media_hwacc_probe)
+    if [ -n "$_mj_hw" ]; then
+      node="${_mj_hw%%|*}"; gid="${_mj_hw##*|}"
+    else
+      dbg "media tier: REDOUBT_MEDIA_HWACC=1 but no supported render device was detected: hardware transcoding stays off this pass"
+    fi
+  fi
+  envsha=$(printf '%s\n' '# Jellyfin env, fixed by the kit recipe' | sha256sum | cut -d' ' -f1)
+  mkdir -p /opt/redoubt/catalog/jellyfin
+  t=$(mktemp /opt/redoubt/catalog/.mjrecipe.XXXXXX)
+  tw=$(mktemp /opt/redoubt/catalog/.mjcompose.XXXXXX)
+  # the single-service project: its own directory (outside the stack's
+  # profile wildcards), only the stack's own external network for the
+  # edge door, no published ports (the door is the edge), no host
+  # network, no docker socket, no privileged flag. The named volume
+  # holds all Jellyfin state; the library rides the validated owner
+  # path read-only, so Jellyfin can never write the library. Software
+  # transcoding runs inside the resource limits; the hardware grant
+  # below is the only device ever added, and only for the detected
+  # render node.
+  {
+    printf '%s\n' \
+      'services:' \
+      '  app:' \
+      "    image: $pin" \
+      '    container_name: svc-jellyfin' \
+      '    restart: unless-stopped' \
+      '    dns: [172.28.0.53, 127.0.0.11]' \
+      '    security_opt:' \
+      '      - no-new-privileges:true' \
+      '    environment:' \
+      '      TZ: UTC' \
+      '    volumes:' \
+      '      - jellyfin-config:/config' \
+      "      - \"$MEDIA_PATH:/media:ro\"" \
+      '    mem_limit: 4g' \
+      '    pids_limit: 256' \
+      '    cpus: "2.0"'
+    if [ -n "$node" ]; then
+      # the owner's opt-in plus a detected render node: grant exactly
+      # this one device, plus its host group so a non-root container
+      # user may open it. Nothing else rides in.
+      printf '    devices:\n      - %s:%s\n' "$node" "$node"
+      printf '    group_add:\n      - "%s"\n' "$gid"
+    fi
+    printf '%s\n' \
+      '    networks:' \
+      '      - default' \
+      'networks:' \
+      '  default:' \
+      '    external: true' \
+      '    name: redoubt_default' \
+      'volumes:' \
+      '  jellyfin-config:'
+  } > "$tw"
+  composesha=$(sha256sum "$tw" | cut -d' ' -f1)
+  {
+    printf 'NAME=jellyfin\nIMAGE=%s\nPORT=8096\nTILE=Jellyfin\nICON=/icons/jellyfin.svg\n' "$pin"
+    printf 'ENV_SHA=%s\nCOMPOSE_SHA=%s\n' "$envsha" "$composesha"
+    printf '%s\n' '__APP_ENV__'
+    printf '%s\n' '# Jellyfin env, fixed by the kit recipe'
+    printf '%s\n' '__COMPOSE__'
+    cat "$tw"
+  } > "$t"
+  rm -f "$tw"
+  chmod 644 "$t"; chown root:root "$t"
+  w=$(sha256sum "$t" | cut -d' ' -f1)
+  mv -f "$t" /opt/redoubt/catalog/jellyfin/recipe
+  g=$(sha256sum /opt/redoubt/catalog/jellyfin/recipe | cut -d' ' -f1)
+  [ "$w" = "$g" ] || { rm -f /opt/redoubt/catalog/jellyfin/recipe; return 1; }
+  printf '%s\n' "$g" > /opt/redoubt/catalog/jellyfin/recipe.sha256
+  chmod 644 /opt/redoubt/catalog/jellyfin/recipe.sha256
+  return 0
+}
+
+# the release review flips these to 1 only after the pinned release's
+# documented paths are confirmed. Until then the tier reports the
+# stage pending and never fakes a passing check: an answering page is
+# not a login, and a login is not playback.
+MEDIA_JELLYFIN_LOGIN_DOC=0
+MEDIA_JELLYFIN_PLAYBACK_DOC=0
+MEDIA_JELLYFIN_HWACC_DOC=0
+
+media_login_check() {  # $1 = door, $2 = host; the real login through the real route
+  [ "$MEDIA_JELLYFIN_LOGIN_DOC" = "1" ] || {
+    dbg "media tier: login check stage pending (the release review pins the documented Jellyfin login path for the pinned release first; the first administrator is provisioned through the setup wizard, the kit never invents an unattended path)"
+    return 1
+  }
+  # the review lands the documented call here: an AuthenticateByName
+  # request through the door with the owner's Jellyfin credential
+  # riding stdin (never argv), and only a valid session passes. The
+  # credential the kit checks is the one the owner provisioned in the
+  # setup wizard: the kit never mints, logs or stores it.
+  return 1
+}
+
+media_playback_check() {  # $1 = door, $2 = host; real playback through the real route
+  [ "$MEDIA_JELLYFIN_PLAYBACK_DOC" = "1" ] || {
+    dbg "media tier: playback check stage pending (the release review pins the documented playback route for the pinned release first; playback proof needs a library item, an answering page is not a stream)"
+    return 1
+  }
+  # the review lands the documented call here: a stream or media-info
+  # request through the door with the session token from the login
+  # check, and only a real media response passes.
+  return 1
+}
+
+media_gate_install() {
+  # the boot gate: after a reboot the Jellyfin door may never be more
+  # open than the saved story and the loaded rules justify. The script
+  # only closes; re-opening always rides a kit pass that re-verifies
+  # first. The story the boot gate reads is the kit's own last
+  # evaluation (the svc-gates file): the encrypted env's passphrase is
+  # never repeated outside the kit's own heredocs.
+  kit_put_exec /usr/local/sbin/redoubt-media-gate 755 <<'MEDIAGATE'
+#!/usr/bin/env bash
+# redoubt-media-gate: re-applies the Jellyfin door gate at boot.
+# The kit's last evaluation plus the rules actually loaded decide; the
+# site file is the switch (absent means the edge aborts on the door).
+# This script only ever closes the door: re-opening needs a kit pass.
+# A mesh-only door (the on-nas story) reads as closed here: closing a
+# door the story allowed is safe, the next kit pass re-opens it.
+set -euo pipefail
+umask 022
+PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
+CONF=/etc/redoubt/services.conf
+[ -s "$CONF" ] || exit 0
+cv() { sed -n "s/^$1=//p" "$CONF" | head -1; }
+STACKDIR=$(cv STACKDIR)
+META=/opt/redoubt/services/jellyfin/meta
+[ -f "$META" ] || exit 0
+DOOR=$(sed -n 's/^DOOR=//p' "$META" | head -1)
+[ -n "$DOOR" ] || exit 0
+STORY=/etc/redoubt/svc-gates/jellyfin
+[ -f "$STORY" ] || exit 0
+FW=$(cat "$STORY")
+GATE=on
+case "$FW" in on|on-nas) ;; *) GATE=off ;; esac
+if [ "$GATE" = "on" ] && command -v ufw >/dev/null 2>&1; then
+  R4=$(cat /etc/ufw/user.rules 2>/dev/null || true)
+  R6=$(cat /etc/ufw/user6.rules 2>/dev/null || true)
+  NEED6=0
+  grep -q '^IPV6=yes' /etc/ufw/ufw.conf 2>/dev/null && NEED6=1
+  if [ "$FW" = "on" ]; then
+    echo "$R4" | grep -q -- "--dport $DOOR" || GATE=off
+    if [ "$NEED6" = "1" ] && ! echo "$R6" | grep -q -- "--dport $DOOR"; then GATE=off; fi
+  else
+    echo "$R4" | grep -- "-i wt0" | grep -q -- "--dport $DOOR" || GATE=off
+    if [ "$NEED6" = "1" ] && ! echo "$R6" | grep -- "-i wt0" | grep -q -- "--dport $DOOR"; then GATE=off; fi
+  fi
+elif [ "$GATE" = "on" ] && command -v firewall-cmd >/dev/null 2>&1; then
+  # the service block rides as one N-M/tcp range: a listed range
+  # covers the door just like an exact port entry would
+  cover() {
+    for _p in $1; do
+      _p="${_p%%/*}"
+      case "$_p" in
+        *-*) _lo="${_p%-*}"; _hi="${_p#*-}"
+             case "$_lo$_hi" in
+               ""|*[!0-9]*) ;;
+               *) [ "$DOOR" -ge "$_lo" ] && [ "$DOOR" -le "$_hi" ] && return 0 ;;
+             esac ;;
+        *) [ "$_p" = "$DOOR" ] && return 0 ;;
+      esac
+    done
+    return 1
+  }
+  PORTS=$(firewall-cmd --list-ports 2>/dev/null || true)
+  if [ "$FW" = "on" ]; then
+    cover "$PORTS" || GATE=off
+  else
+    ZP=$(firewall-cmd --zone=redoubt-mesh --list-ports 2>/dev/null || true)
+    cover "$ZP" || GATE=off
+  fi
+elif [ "$GATE" = "on" ]; then
+  # no firewall tool left to verify the saved story against: the door
+  # stays closed until a kit pass re-verifies the loaded rules
+  GATE=off
+fi
+if [ "$GATE" = "on" ]; then
+  exit 0
+fi
+# close the door: drop the site file and reload the edge. A door with
+# no site behind it aborts at the edge.
+SITE="$STACKDIR/caddy-services/jellyfin.caddy"
+if [ -f "$SITE" ]; then
+  rm -f "$SITE"
+  docker exec redoubt-edge-local-1 caddy reload --config /etc/caddy/Caddyfile --adapter caddyfile >/dev/null 2>&1 \
+    || docker restart redoubt-edge-local-1 >/dev/null 2>&1 || true
+fi
+exit 0
+MEDIAGATE
+  cat > /etc/systemd/system/redoubt-media-gate.service <<'MEDIAUNIT'
+[Unit]
+Description=Redoubt media door gate (closed unless verified)
+After=docker.service network-online.target
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+ExecStart=/usr/local/sbin/redoubt-media-gate
+
+[Install]
+WantedBy=multi-user.target
+MEDIAUNIT
+  chmod 644 /etc/systemd/system/redoubt-media-gate.service
+  systemctl daemon-reload >/dev/null 2>&1 || true
+  systemctl enable redoubt-media-gate.service >/dev/null 2>&1 || true
+}
+
+media_reconcile() {
+  [ "${REDOUBT_MEDIA:-0}" = "1" ] || return 0
+  # the honest partial report, every pass: the tier is two services
+  # and only one of them is wired
+  dbg "media tier: partial on purpose: Jellyfin activates alone; Reiverr stays pending ($MEDIA_REIVERR_REASON)"
+  dbg "media tier: no torrent client, no port-forwarding, no plugin or automatic-library-deletion defaults: those stay behind a separate owner decision and are not enabled"
+  if [ "${REDOUBT_MEDIA_HWACC:-0}" != "1" ]; then
+    dbg "media tier: transcode check: pending (REDOUBT_MEDIA_HWACC is off: software transcoding stays the default, inside the recipe's resource limits)"
+  fi
+  if [ -z "$MEDIA_JELLYFIN_DIGEST" ] || [ -z "$MEDIA_JELLYFIN_VERSION" ]; then
+    dbg "media tier: Jellyfin stage pending (MEDIA_JELLYFIN_DIGEST is empty until the release review fills it; digests are never guessed)"
+    return 0
+  fi
+  if ! media_path_ok; then
+    dbg "media tier: Jellyfin stage pending (REDOUBT_MEDIA_PATH missing or not a safe owner path: the kit never guesses a library location)"
+    return 0
+  fi
+  local door="${MEDIA_JELLYFIN_DOOR:-}"
+  [ -n "$door" ] || { dbg "WARNING: the media tier has no reserved door: the tier stays off"; return 0; }
+  media_catalog_install || {
+    dbg "WARNING: media catalog failed the byte check: the tier stays off"
+    mkdir -p "$MEDIA_GATE_DIR"
+    printf 'off\n' > "$MEDIA_GATE_DIR/jellyfin"
+    chmod 644 "$MEDIA_GATE_DIR/jellyfin" 2>/dev/null || true
+    if [ -x /usr/local/sbin/redoubt-svc ]; then
+      /usr/local/sbin/redoubt-svc refresh >> "$LOG" 2>&1 || true
+    else
+      rm -f "$STACKDIR/caddy-services/jellyfin.caddy" 2>/dev/null || true
+    fi
+    return 0
+  }
+  # the gate is decided before anything starts, so a first activation
+  # never renders a site for an unverified firewall story: the saved
+  # story plus the rules that are really loaded decide, never the
+  # app-door list alone
+  local gate
+  gate=$(ha_gate_eval "$door")
+  mkdir -p "$MEDIA_GATE_DIR"
+  printf '%s\n' "$gate" > "$MEDIA_GATE_DIR/jellyfin"
+  chmod 644 "$MEDIA_GATE_DIR/jellyfin" 2>/dev/null || true
+  # the project lives outside the stack recovery wildcards: its own
+  # compose file in its own directory, so the stack's profile-wide
+  # up and down never sees it
+  if [ ! -f "$MEDIA_JELLYFIN_SVC_DIR/meta" ]; then
+    if [ -x /usr/local/sbin/redoubt-svc ]; then
+      # first activation: the builder builds from the recipe under its
+      # lock, honors the gate above, and rolls the whole thing back on
+      # any failure
+      if /usr/local/sbin/redoubt-svc activate jellyfin --door "$door" >> "$LOG" 2>&1; then
+        dbg "OK: Jellyfin built from the approved recipe"
+      else
+        dbg "WARNING: Jellyfin activation failed (see the log): rolled back, the door stays closed"
+        return 0
+      fi
+    else
+      dbg "WARNING: no service builder on this box: Jellyfin stays off"
+      return 0
+    fi
+  elif [ -f "$MEDIA_CATALOG/jellyfin/recipe.sha256" ] && [ -f "$MEDIA_JELLYFIN_SVC_DIR/recipe.sha256" ] \
+       && [ "$(cat "$MEDIA_CATALOG/jellyfin/recipe.sha256" 2>/dev/null)" != "$(cat "$MEDIA_JELLYFIN_SVC_DIR/recipe.sha256" 2>/dev/null)" ]; then
+    # the recipe pin moved (a new reviewed release, a moved library or
+    # a hardware acceleration change): rebuild from the new recipe on
+    # the same door (the /config volume survives)
+    dbg "media recipe pin moved: rebuilding Jellyfin from the reviewed release"
+    docker compose -f "$MEDIA_JELLYFIN_SVC_DIR/compose.yml" down >/dev/null 2>&1 || true
+    rm -rf "${MEDIA_JELLYFIN_SVC_DIR:?}"
+    if /usr/local/sbin/redoubt-svc activate jellyfin --door "$door" >> "$LOG" 2>&1; then
+      dbg "OK: Jellyfin rebuilt on the new pin"
+    else
+      dbg "WARNING: Jellyfin rebuild failed (see the log): rolled back, the door stays closed"
+      return 0
+    fi
+  fi
+  # the builder may have re-picked a door when the reservation was
+  # taken: its meta is the truth, the env and the gate follow it
+  _mj_act_door=$(sed -n 's/^DOOR=//p' "$MEDIA_JELLYFIN_SVC_DIR/meta" 2>/dev/null || true)
+  if [ -n "$_mj_act_door" ] && [ "$_mj_act_door" != "$door" ]; then
+    sed -i '/^MEDIA_JELLYFIN_DOOR=/d' "$_ENV_TMP"
+    echo "MEDIA_JELLYFIN_DOOR=$_mj_act_door" >> "$_ENV_TMP"
+    kit_env_commit
+    door="$_mj_act_door"
+    gate=$(ha_gate_eval "$door")
+    printf '%s\n' "$gate" > "$MEDIA_GATE_DIR/jellyfin"
+  fi
+  if [ -x /usr/local/sbin/redoubt-svc ]; then
+    /usr/local/sbin/redoubt-svc refresh >> "$LOG" 2>&1 \
+      || dbg "WARNING: Jellyfin site refresh failed"
+  else
+    rm -f "$STACKDIR/caddy-services/jellyfin.caddy" 2>/dev/null || true
+  fi
+  case "$gate" in
+    on) ;;
+    *)
+      if [ "$FW_ACTIVE" = "1" ]; then
+        case "${FW_DECISION:-}" in
+          on|on-nas) dbg "Jellyfin door $door stays closed: the saved story says ${FW_DECISION}, but the loaded rules do not show the door (both families)" ;;
+          on-nodoors) dbg "Jellyfin door $door stays closed: the saved firewall story is on-nodoors (no service exposure)" ;;
+          off) dbg "Jellyfin door $door stays closed: the saved firewall story is off" ;;
+          *) dbg "Jellyfin door $door stays closed: no saved firewall story yet (answer the firewall questions, or keep it box-only)" ;;
+        esac
+      else
+        dbg "Jellyfin door $door stays closed: no active firewall story was verified"
+      fi
+      return 0
+      ;;
+  esac
+  # the door may open, so prove the build again first: compose, site
+  # and the running digest must all byte-match their pins
+  if [ -x /usr/local/sbin/redoubt-svc ]; then
+    if ! /usr/local/sbin/redoubt-svc verify jellyfin >> "$LOG" 2>&1; then
+      dbg "WARNING: Jellyfin failed verification: the door stays closed"
+      printf 'off\n' > "$MEDIA_GATE_DIR/jellyfin"
+      /usr/local/sbin/redoubt-svc refresh >> "$LOG" 2>&1 || true
+      return 0
+    fi
+  fi
+  # proxy trust: Jellyfin reads client addresses from forwarded headers
+  # only when the sender is in its KnownProxies. Three states: a fresh
+  # config volume gets the kit's minimal network.xml, the factory
+  # default (first boot wrote it before this pass could) gets the
+  # empty KnownProxies element filled, and an owner-edited file is
+  # never rewritten. No trust is the safe state either way: without
+  # KnownProxies every client address reads as the edge itself. The
+  # write is followed by a restart: the network config is read at
+  # startup, never hot-reloaded.
+  local mj_edge_ip mj_cfg_owner mj_host mj_code i _MJ_HTTPS=0
+  mj_edge_ip=$(docker inspect -f '{{(index .NetworkSettings.Networks "redoubt_default").IPAddress}}' redoubt-edge-local-1 2>/dev/null || true)
+  if [ -z "$mj_edge_ip" ]; then
+    dbg "WARNING: the edge proxy address is unknown: Jellyfin trust config not written, the door stays closed"
+    printf 'off\n' > "$MEDIA_GATE_DIR/jellyfin"
+    return 0
+  fi
+  mj_cfg_owner=$(docker exec svc-jellyfin sh -c 'stat -c %u:%g /config 2>/dev/null' 2>/dev/null || true)
+  [ -n "$mj_cfg_owner" ] || mj_cfg_owner="0:0"
+  if docker exec svc-jellyfin sh -c '[ -s /config/config/network.xml ]' >/dev/null 2>&1; then
+    if docker exec svc-jellyfin sh -c 'grep -q "<KnownProxies[ >]" /config/config/network.xml && ! grep -q "<string>" /config/config/network.xml' >/dev/null 2>&1; then
+      # the factory default: keep a byte copy so a failed edit can
+      # restore, fill the empty element, then prove it landed
+      docker exec svc-jellyfin sh -c 'cp -f /config/config/network.xml /config/config/network.xml.redoubt-bak' >/dev/null 2>&1
+      docker exec svc-jellyfin sh -c "sed -i 's|<KnownProxies />|<KnownProxies><string>${mj_edge_ip}</string></KnownProxies>|; s|<KnownProxies></KnownProxies>|<KnownProxies><string>${mj_edge_ip}</string></KnownProxies>|' /config/config/network.xml" >/dev/null 2>&1
+      if docker exec svc-jellyfin sh -c "grep -q \"<string>${mj_edge_ip}</string>\" /config/config/network.xml" >/dev/null 2>&1; then
+        docker exec svc-jellyfin sh -c "chown \"$mj_cfg_owner\" /config/config/network.xml && rm -f /config/config/network.xml.redoubt-bak" >/dev/null 2>&1 || true
+        dbg "OK: Jellyfin proxy trust pinned to the edge (the factory KnownProxies element filled)"
+      else
+        docker exec svc-jellyfin sh -c 'mv -f /config/config/network.xml.redoubt-bak /config/config/network.xml' >/dev/null 2>&1 || true
+        dbg "WARNING: Jellyfin trust config did not land: the door stays closed"
+        printf 'off\n' > "$MEDIA_GATE_DIR/jellyfin"
+        return 0
+      fi
+    else
+      dbg "OK: Jellyfin network config exists (owner-owned: the kit leaves it alone)"
+    fi
+  else
+    # fresh volume: the kit's minimal network.xml, the edge is the
+    # only proxy Jellyfin ever trusts
+    docker exec -i svc-jellyfin sh -c 'cat > /config/config/network.xml' <<MJXML
+<?xml version="1.0" encoding="utf-8"?>
+<NetworkConfiguration xmlns:xsd="http://www.w3.org/2001/XMLSchema" xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance">
+  <KnownProxies>
+    <string>${mj_edge_ip}</string>
+  </KnownProxies>
+</NetworkConfiguration>
+MJXML
+    docker exec svc-jellyfin sh -c "chown \"$mj_cfg_owner\" /config/config/network.xml" >/dev/null 2>&1 || true
+    docker exec svc-jellyfin grep -q "<string>${mj_edge_ip}</string>" /config/config/network.xml 2>/dev/null \
+      && dbg "OK: Jellyfin proxy trust pinned to the edge (fresh minimal config)" \
+      || { dbg "WARNING: Jellyfin trust config did not land: the door stays closed"; printf 'off\n' > "$MEDIA_GATE_DIR/jellyfin"; return 0; }
+  fi
+  # the kit redacts request urls from Jellyfin's own logs: with the
+  # factory logging config the minimum level is Information, so the
+  # debug request lines that can carry an api key in the url are never
+  # written. When the owner has no logging.json yet (factory state),
+  # the kit pins that level with its own fixed file. An owner-owned
+  # logging.json is left alone, and the kit's own checks never put a
+  # key in a url.
+  if docker exec svc-jellyfin sh -c '[ -s /config/config/logging.default.json ] && [ ! -e /config/config/logging.json ]' >/dev/null 2>&1; then
+    docker exec -i svc-jellyfin sh -c 'cat > /config/config/logging.json' <<MJLOG
+{
+  "Serilog": {
+    "MinimumLevel": {
+      "Default": "Information",
+      "Override": {
+        "Microsoft": "Warning",
+        "System": "Warning"
+      }
+    },
+    "WriteTo": [
+      { "Name": "Console", "Args": { "outputTemplate": "[{Timestamp:HH:mm:ss.fff}] [{Level:u3}] [{ThreadId}] {SourceContext}: {Message:lj}{NewLine}{Exception}" } }
+    ]
+  }
+}
+MJLOG
+    docker exec svc-jellyfin sh -c "chown \"$mj_cfg_owner\" /config/config/logging.json" >/dev/null 2>&1 || true
+    docker exec svc-jellyfin grep -q '"Information"' /config/config/logging.json 2>/dev/null \
+      && dbg "OK: Jellyfin log level pinned at Information (request urls stay out of the log)" \
+      || { dbg "WARNING: Jellyfin log pin did not land: the door stays closed"; printf 'off\n' > "$MEDIA_GATE_DIR/jellyfin"; return 0; }
+  fi
+  # the trust config and the log pin are read at startup: restart so
+  # this pass verifies the state it actually runs
+  docker restart svc-jellyfin >/dev/null 2>&1 || true
+  # before reporting success: the real https route answers (a door
+  # answer alone proves the proxy; the public api proves Jellyfin)
+  mj_host=$(awk -v p=":$PORT_EDGE4" 'index($0,"https://")==1 && index($0,p) && /[{][[:space:]]*$/ {print; exit}' "$STACKDIR/local-caddy.Caddyfile" 2>/dev/null \
+    | grep -o 'https://[^:, ]*' | head -1 | sed 's|https://||')
+  if [ -n "$mj_host" ]; then
+    for i in $(seq 1 20); do
+      mj_code=$(curl -s -o /dev/null -w '%{http_code}' -m 5 --cacert /var/lib/redoubt/caddy-local/cert-share/root-ca.crt \
+        --resolve "$mj_host:$door:127.0.0.1" "https://$mj_host:$door/System/Info/Public" 2>/dev/null || true)
+      case "$mj_code" in [1-4]??) _MJ_HTTPS=1; break ;; esac
+      sleep 3
+    done
+  fi
+  if [ "$_MJ_HTTPS" != "1" ]; then
+    dbg "WARNING: Jellyfin did not answer through the door: the door stays closed"
+    printf 'off\n' > "$MEDIA_GATE_DIR/jellyfin"
+    if [ -x /usr/local/sbin/redoubt-svc ]; then
+      /usr/local/sbin/redoubt-svc refresh >> "$LOG" 2>&1 || true
+    else
+      rm -f "$STACKDIR/caddy-services/jellyfin.caddy" 2>/dev/null || true
+    fi
+    return 0
+  fi
+  # real login and playback through the real route before the tier
+  # counts as live
+  if ! media_login_check "$door" "$mj_host"; then
+    dbg "WARNING: the Jellyfin login check did not pass: the door stays closed"
+    printf 'off\n' > "$MEDIA_GATE_DIR/jellyfin"
+    if [ -x /usr/local/sbin/redoubt-svc ]; then
+      /usr/local/sbin/redoubt-svc refresh >> "$LOG" 2>&1 || true
+    fi
+    return 0
+  fi
+  if ! media_playback_check "$door" "$mj_host"; then
+    dbg "WARNING: the Jellyfin playback check did not pass: the door stays closed"
+    printf 'off\n' > "$MEDIA_GATE_DIR/jellyfin"
+    if [ -x /usr/local/sbin/redoubt-svc ]; then
+      /usr/local/sbin/redoubt-svc refresh >> "$LOG" 2>&1 || true
+    fi
+    return 0
+  fi
+  # the hardware transcode check, only when the owner opted in
+  if [ "${REDOUBT_MEDIA_HWACC:-0}" = "1" ]; then
+    if [ "$MEDIA_JELLYFIN_HWACC_DOC" != "1" ]; then
+      dbg "media tier: hardware transcode check: stage pending (the release review pins the documented transcode proof for the pinned release first)"
+    else
+      dbg "media tier: hardware transcode check: stage pending (the documented proof call lands with the review)"
+    fi
+  fi
+  # the boot gate keeps the door honest across reboots: it can only
+  # ever close it, a kit pass re-opens after re-verification
+  media_gate_install
+  dbg "OK: media tier: Jellyfin live on door $door (https, login and playback verified through the real route; the tier is partial on purpose: Reiverr stays pending until a specific release is selected and tested)"
+  if [ -t 3 ]; then
+    echo "Jellyfin is live: https://${SEED_HOST:-$LAN_IP}:${door}" >&3 2>/dev/null || true
+    echo "  Media tier is partial on purpose: Reiverr stays pending ($MEDIA_REIVERR_REASON)." >&3 2>/dev/null || true
+    echo "  Add your libraries through the Jellyfin dashboard (the kit mounts" >&3 2>/dev/null || true
+    echo "  $MEDIA_PATH read-only at /media inside the container)." >&3 2>/dev/null || true
+  fi
+}
+media_reconcile
 
 # the assistant wiring only proves homarr migrated its own db; the seed
 # writes the board serverSetting, so its absence means the panel was
