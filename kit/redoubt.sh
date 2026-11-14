@@ -5038,11 +5038,21 @@ vault_mount() {
         rm -f "$VAULT_MOUNT_ERR"
         # never lose the plain files: put them back and stay plain. A
         # failed mv must survive: rmdir only drops an EMPTY park, so a
-        # stuck file blocks the sweep instead of being deleted with it
+        # stuck file blocks the sweep instead of being deleted with it.
+        # The restore lands through an owner-writable pathname, so the
+        # destination is re-verified first: only a real directory that
+        # still resolves inside the owner home may receive the root
+        # moves. A symlink the owner planted where the empty mountpoint
+        # stood would otherwise redirect them into a protected directory.
+        # On any doubt the park is kept for the owner.
         [ -n "$VAULT_PRE" ] && {
-          find "$VAULT_PRE" -mindepth 1 -maxdepth 1 -exec mv {} "$MYREDOUBT"/ \; 2>/dev/null
-          find "$VAULT_PRE" -mindepth 1 -maxdepth 1 -exec mv -f {} "$MYREDOUBT"/ \; 2>/dev/null
-          rmdir "$VAULT_PRE" 2>/dev/null || dbg "WARNING: plain files stuck in $VAULT_PRE, kept for the owner"
+          if [ -d "$MYREDOUBT" ] && [ ! -L "$MYREDOUBT" ] && safe_owner_path "$MYREDOUBT"; then
+            find "$VAULT_PRE" -mindepth 1 -maxdepth 1 -exec mv {} "$MYREDOUBT"/ \; 2>/dev/null
+            find "$VAULT_PRE" -mindepth 1 -maxdepth 1 -exec mv -f {} "$MYREDOUBT"/ \; 2>/dev/null
+            rmdir "$VAULT_PRE" 2>/dev/null || dbg "WARNING: plain files stuck in $VAULT_PRE, kept for the owner"
+          else
+            dbg "WARNING: the vault path changed while the mount was down - plain files kept in $VAULT_PRE"
+          fi
         }
         dbg "WARNING: vault mount failed - the owner folder stays encrypted"
         return 1
@@ -6614,7 +6624,17 @@ SCANNOTE
       # entirely (seen on Rocky: the shortcut never appeared).
       # Hand it to the owner before the shortcut lands inside.
       chown "$(stat -c '%u:%g' "$OWNER_HOME")" "$DESKTOP_DIR" 2>/dev/null || true
-      cat > "$DESKTOP_DIR/My Redoubt.desktop" <<'DESKSHRT'
+      # the launcher is born under the owner's uid, same rule as the
+      # autostart entry: a root write plus a later chown and chmod on
+      # the leaf would follow a symlink the owner planted here, letting
+      # this pass truncate and re-own a file outside the desktop dir.
+      # set -C makes the shell create the leaf, never open an existing
+      # one, and the mode is applied inside the same owner shell.
+      DSK_OWNER="$(stat -c '%U' "$DESKTOP_DIR" 2>/dev/null)"
+      [ -n "${SUDO_USER:-}" ] && DSK_OWNER="$SUDO_USER"
+      [ -n "$DSK_OWNER" ] || DSK_OWNER="${OWNER_SYS_USER:-root}"
+      runuser -u "$DSK_OWNER" -- sh -c 'umask 022; rm -f "$1"; set -C; cat > "$1" && chmod 755 "$1"' \
+        _ "$DESKTOP_DIR/My Redoubt.desktop" <<'DESKSHRT'
 [Desktop Entry]
 Type=Application
 Name=My Redoubt
@@ -6623,11 +6643,10 @@ Exec=/usr/local/bin/redoubt-vault-open
 Icon=/var/lib/redoubt/caddy-local/logo.png
 Terminal=false
 DESKSHRT
-      DSK_OWNER="$(stat -c '%U' "$DESKTOP_DIR" 2>/dev/null)"
-      [ -n "${SUDO_USER:-}" ] && DSK_OWNER="$SUDO_USER"
-      chown "$DSK_OWNER":"$DSK_OWNER" "$DESKTOP_DIR/My Redoubt.desktop" 2>/dev/null || true
-      chmod 755 "$DESKTOP_DIR/My Redoubt.desktop" 2>/dev/null || true
-      gio set "$DESKTOP_DIR/My Redoubt.desktop" metadata::trusted true >/dev/null 2>&1 || true
+      # the trusted flag must land in the owner's own metadata store:
+      # as root it would be written for root and the desktop shell
+      # would still treat the launcher as untrusted
+      runuser -u "$DSK_OWNER" -- gio set "$DESKTOP_DIR/My Redoubt.desktop" metadata::trusted true >/dev/null 2>&1 || true
       # Fresh XFCE profiles sometimes lack the desktop-icons property
       # and xfdesktop stays silent with the launcher right there:
       # fill the default gap and reload the desktop as the owner so
@@ -6945,6 +6964,11 @@ $MOBILE_KEY_VAL
         ACCESS_WIFI=''
       fi
     rm -f "$MYREDOUBT/Access.txt"
+    # set -C makes the redirect create the leaf, never open an existing
+    # one: a planted Access.txt symlink cannot steer this write outside
+    # the vault dir. The chmod below re-verifies the leaf for the same
+    # reason, because chmod follows a link the owner can plant between
+    # the two calls.
     ( set -C; cat > "$MYREDOUBT/Access.txt" ) <<ACCESS
 Redoubt - your private cloud, ready.
 
@@ -6968,7 +6992,12 @@ pass: $OWNER_PASS
 
 $MOBILE_BLOCK$ACCESS_GUIDE_LINE
 ACCESS
-    chmod 600 "$MYREDOUBT/Access.txt"
+    # the mode lands only on a regular file this pass could own: a
+    # symlink swapped in after the write would point the chmod at a
+    # protected target, so the leaf is checked again right before use
+    [ -f "$MYREDOUBT/Access.txt" ] && [ ! -L "$MYREDOUBT/Access.txt" ] \
+      && chmod 600 "$MYREDOUBT/Access.txt" \
+      || dbg "WARNING: Access.txt was not left as a regular file - the mode was not applied"
     # terminal QRs for machines without a screen: the CLI prints them
     # named and scannable straight off the monitor
     cat > /etc/redoubt/qr-payloads.txt <<QRPAY
