@@ -48,7 +48,15 @@ One command, and the data comes home.
 
 ## License
 
-AGPL-3.0. Free software: use it, study it, share it, improve it. See
-[LICENSE](LICENSE). Copyright (C) 2026 Devitechy LLC. The Redoubt name
-and logo are reserved by Devitechy LLC. Third-party components and
-their licenses: [THIRD-PARTY-NOTICES.md](THIRD-PARTY-NOTICES.md).
+The Redoubt kit is licensed under AGPL-3.0-only, except where a file
+identifies separate terms. Third-party software and assets retain their
+own licenses. The Windows installer may have a separate license. See
+[LICENSE](LICENSE). Copyright (C) 2026 Devitechy LLC. Third-party
+components and their licenses:
+[THIRD-PARTY-NOTICES.md](THIRD-PARTY-NOTICES.md).
+
+## Trademarks
+
+The Redoubt name and logo are reserved by Devitechy LLC and are not
+covered by the AGPL grant. Third-party product names belong to their
+owners.
