@@ -6797,34 +6797,34 @@ ICNTMR
   # trivy: the stack's security scanner. It audits every container
   # image against the public CVE feeds and the compose file for
   # misconfigs and leaked secrets, then drops a readable report in the
-  # scan dir. The binary comes from the upstream GitHub release (sha
-  # pinned); the scan itself runs weekly through a systemd timer and
-  # once shortly after the first boot. Read-only: it never touches the
-  # running containers.
-  TRIVY_SHA="d1dfca6ae10a1ad4540bb94e64f0510077c47008920a9b554986b39dca573d83"
-  # the pinned release is x86_64 only: skip other arches before the
+  # scan dir. The binary floats on the upstream release: trivy bumps
+  # often (CVE feeds and fixes), and a hard binary pin goes stale and
+  # silently kills the owner's scanner, so the release tag is resolved
+  # fresh each pass and the download is verified against the vendor
+  # checksums file of that same release. Read-only: it never touches
+  # the running containers.
+  # the upstream release is x86_64 only: skip other arches before the
   # download instead of failing a checksum that can never match
-  [ "$(uname -m 2>/dev/null || true)" = "x86_64" ] || { dbg "WARN: no pinned trivy build for this arch, the weekly scan stays off"; return 1; }
-  # re-compare the installed binary on every pass: a bumped pin must
-  # replace the old scanner instead of riding it silently
-  if [ ! -x /opt/redoubt/bin/trivy ] \
-     || [ "$(sha256sum /opt/redoubt/bin/trivy 2>/dev/null | cut -d' ' -f1)" != "$TRIVY_SHA" ]; then
+  [ "$(uname -m 2>/dev/null || true)" = "x86_64" ] || { dbg "WARN: no trivy build for this arch, the weekly scan stays off"; return 1; }
+  _TV_TAG=$(curl -fsSL --max-time 30 "https://api.github.com/repos/aquasecurity/trivy/releases/latest" 2>/dev/null | sed -n 's/.*"tag_name": *"\([^"]*\)".*/\1/p' | head -1)
+  [ -n "$_TV_TAG" ] || { dbg "WARN: trivy: latest release lookup failed, the weekly scan stays off"; return 1; }
+  # re-download only when the installed release tag is older than the
+  # resolved one: the floating scanner still avoids churn on every pass
+  if [ ! -x /opt/redoubt/bin/trivy ] || [ "$(cat /opt/redoubt/bin/trivy-release 2>/dev/null)" != "$_TV_TAG" ]; then
     mkdir -p /opt/redoubt/bin
-    # the tarball sha differs from the binary sha: the tarball is
-    # verified against the vendor's checksums file, and the extracted
-    # binary against the pin above. Downloads live in a private
-    # mktemp dir so nobody can plant a fixed /tmp file under root.
+    # downloads live in a private mktemp dir so nobody can plant a
+    # fixed /tmp file under root
     TRIVY_TMP=$(mktemp -d /tmp/redoubt-trivy.XXXXXX) || { dbg "WARN: trivy: no temp dir"; return 1; }
     chmod 700 "$TRIVY_TMP"
     # one step at a time with its exit code and curl stderr in the log:
     # the old and-chain folded five different failures into one WARN
-    _TV_URL="https://github.com/aquasecurity/trivy/releases/download/v0.76.1"
-    _TV_TGZ="trivy_0.76.1_Linux-64bit.tar.gz"
+    _TV_URL="https://github.com/aquasecurity/trivy/releases/download/$_TV_TAG"
+    _TV_TGZ="trivy_${_TV_TAG#v}_Linux-64bit.tar.gz"
     _TV_OK=0
     curl -fsSL --max-time 600 -o "$TRIVY_TMP/trivy.tar.gz" "$_TV_URL/$_TV_TGZ" 2>"$TRIVY_TMP/curl1.err"
     _RC=$?; dbg "trivy: tarball curl rc=$_RC $(tr '\n' ' ' < "$TRIVY_TMP/curl1.err")"
     if [ $_RC -eq 0 ]; then
-      curl -fsSL --max-time 60 -o "$TRIVY_TMP/checksums.txt" "$_TV_URL/trivy_0.76.1_checksums.txt" 2>"$TRIVY_TMP/curl2.err"
+      curl -fsSL --max-time 60 -o "$TRIVY_TMP/checksums.txt" "$_TV_URL/trivy_${_TV_TAG#v}_checksums.txt" 2>"$TRIVY_TMP/curl2.err"
       _RC=$?; dbg "trivy: checksums curl rc=$_RC $(tr '\n' ' ' < "$TRIVY_TMP/curl2.err")"
     fi
     if [ $_RC -eq 0 ]; then
@@ -6837,15 +6837,12 @@ ICNTMR
     if [ $_RC -eq 0 ]; then
       tar_member "$TRIVY_TMP/trivy.tar.gz" trivy "$TRIVY_TMP/trivy" 2>"$TRIVY_TMP/tar.err"
       _RC=$?; dbg "trivy: tar rc=$_RC $(tr '\n' ' ' < "$TRIVY_TMP/tar.err")"
-    fi
-    if [ $_RC -eq 0 ]; then
-      _TV_BIN=$(sha256sum "$TRIVY_TMP/trivy" | cut -d' ' -f1)
-      [ "$_TV_BIN" = "$TRIVY_SHA" ] && _TV_OK=1
-      dbg "trivy: binary sha $_TV_BIN pin $TRIVY_SHA match=$_TV_OK"
+      [ $_RC -eq 0 ] && _TV_OK=1
     fi
     if [ $_TV_OK -eq 1 ]; then
       install -m 755 "$TRIVY_TMP/trivy" /opt/redoubt/bin/trivy
-      dbg "OK: trivy scanner installed (vendor checksum + pinned binary sha)"
+      printf '%s' "$_TV_TAG" > /opt/redoubt/bin/trivy-release
+      dbg "OK: trivy scanner installed (vendor checksum, release $_TV_TAG)"
     else
       dbg "WARN: trivy did not download (the weekly scan stays off; re-run the kit to retry)"
     fi
