@@ -86,3 +86,13 @@ router change.
 No software can promise complete security. The kit is provided under
 AGPL-3.0 without warranty, and the authors' liability is limited as
 stated in sections 15 and 16 of LICENSE.
+
+## Tor and network-anonymity services
+
+When a future release adds a Tor or onion-services tier, the owner
+must confirm that using Tor is lawful in their jurisdiction before
+enabling it. Several countries restrict or prohibit anonymity
+networks, and an ISP or employer policy may forbid them too. The kit
+will refuse to enable such a tier without the explicit owner
+confirmation, and the enabling flag will remain off by default.
+
