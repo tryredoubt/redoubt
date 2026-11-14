@@ -278,6 +278,57 @@ chmod 600 "$LOG" 2>/dev/null || true
 
 echo "[redoubt-kit] $(date -u +%FT%TZ) boot"
 [ "$(id -u)" -ne 0 ] && { fail_line "root required"; exit 1; }
+# safe_owner_path PATH [HOME]: succeed only if no existing component
+# below HOME is a symlink and PATH resolves inside HOME.
+safe_owner_path() {
+  local p="$1" h="${2:-${OWNER_HOME:-}}" rel cur c r
+  [ -n "$h" ] || return 1
+  r=$(realpath -e "$h" 2>/dev/null) || return 1
+  rel="${p#"$h"/}"; [ "$rel" != "$p" ] || return 1
+  cur="$h"
+  local IFS=/
+  for c in $rel; do
+    cur="$cur/$c"
+    [ -L "$cur" ] && return 1
+    [ -e "$cur" ] || break
+  done
+  case "$(realpath -m "$p" 2>/dev/null)" in "$r"/*) return 0 ;; esac
+  return 1
+}
+
+# tar_member ARCHIVE MEMBER DEST: pull one regular-file member into a
+# new exclusive file (no links, no specials, 64 MiB cap, no extraction).
+tar_member() {
+  local a="$1" m="$2" d="$3" n t
+  read -r t n < <(tar -tvzf "$a" 2>/dev/null \
+    | awk -v m="$m" '$NF==m||$NF=="./"m{print substr($1,1,1), $NF; exit}')
+  [ "$t" = "-" ] && [ -n "$n" ] || return 1
+  ( umask 077; set -C
+    timeout 120 tar -xzOf "$a" "$n" 2>/dev/null | head -c 67108864 > "$d" ) \
+    || return 1
+  [ -f "$d" ] && [ ! -L "$d" ] && [ -s "$d" ]
+}
+
+# photos_guard [PORT] on|off: fence a published tcp port in DOCKER-USER
+# until its first-run provisioning is proven done (default: the photos
+# edge). Traffic from this box over loopback still passes, so the
+# installer keeps its own provisioning channel while strangers stay
+# out. Fail closed on the message, not the pass.
+photos_guard() {
+  command -v iptables >/dev/null 2>&1 \
+    || { dbg "WARNING: no iptables, published port not fenced"; return 0; }
+  local port="$PORT_EDGE1"
+  case "${1:-}" in on|off) : ;; *) port="$1"; shift ;; esac
+  iptables -N DOCKER-USER 2>/dev/null || true
+  local r=(-p tcp -m conntrack --ctorigdstport "$port" -j DROP)
+  if [ "$1" = "on" ]; then
+    iptables -C DOCKER-USER "${r[@]}" 2>/dev/null \
+      || iptables -I DOCKER-USER 1 "${r[@]}" 2>/dev/null \
+      || dbg "WARNING: could not fence port $port"
+  else
+    while iptables -D DOCKER-USER "${r[@]}" 2>/dev/null; do :; done
+  fi
+}
 
 # The mesh pieces resolve their latest official release on every pass:
 # the GitHub API names it and the download urls carry the version. The
@@ -297,6 +348,24 @@ KIT_SELF_SHA=$(sha256sum "$KIT_SELF" 2>/dev/null | awk '{print $1}')
 # the monotonic build counter: the updater refuses to roll this
 # machine back to an older (even validly signed) kit
 KIT_BUILD="44"
+
+# the installer flags ride the process env: capture them before the
+# saved env is sourced below (the file would overwrite them), so an
+# explicit REDOUBT_HA on a re-run still wins over the saved choice
+HA_FLAG="${REDOUBT_HA:-}"
+MAIL_FLAG="${REDOUBT_MAIL:-}"
+MAIL_DOMAIN_FLAG="${REDOUBT_MAIL_DOMAIN:-}"
+MAIL_DNS_FLAG="${REDOUBT_MAIL_DNS:-}"
+MAIL_EXPOSE_FLAG="${REDOUBT_MAIL_EXPOSE:-}"
+MAIL_SUBMIT_FLAG="${REDOUBT_MAIL_SUBMIT:-}"
+MAIL_IMAP_FLAG="${REDOUBT_MAIL_IMAP:-}"
+MAIL_RELAY_FLAG="${REDOUBT_MAIL_RELAY:-}"
+MAIL_MX_CUTOVER_FLAG="${REDOUBT_MAIL_MX_CUTOVER:-}"
+MAIL_PUB4_FLAG="${REDOUBT_MAIL_PUB4:-}"
+MAIL_PUB6_FLAG="${REDOUBT_MAIL_PUB6:-}"
+MEDIA_FLAG="${REDOUBT_MEDIA:-}"
+MEDIA_PATH_FLAG="${REDOUBT_MEDIA_PATH:-}"
+MEDIA_HWACC_FLAG="${REDOUBT_MEDIA_HWACC:-}"
 
 # Self-heal: a run that got killed can leave the DNS lockdown active while
 # the resolver chain never came up on 127.0.0.1:53 (pi-hole fronts
@@ -956,8 +1025,11 @@ if ! command -v docker >/dev/null 2>&1 || docker info 2>&1 | grep -qi podman; th
       # The trust anchor for every docker package must match Docker's
       # published fingerprint. No TOFU on the key that signs the engine.
       # gpg prints the fingerprint with spaces; strip them before matching.
-      if ! gpg --show-keys --with-fingerprint /etc/apt/keyrings/docker.asc 2>/dev/null | tr -d ' ' | grep -qi '9DC858229FC7DD38854AE2D88D81803C0EBFCD88'; then
-        dbg "WARNING: docker gpg key fingerprint mismatch - not adding the repo"
+      _DK_REC=$(gpg --show-keys --with-colons /etc/apt/keyrings/docker.asc 2>/dev/null)
+      _DK_N=$(printf '%s\n' "$_DK_REC" | awk -F: '$1=="pub"{n++} END{print n+0}')
+      _DK_FP=$(printf '%s\n' "$_DK_REC" | awk -F: '$1=="pub"{p=1;next} p&&$1=="fpr"{print $10; exit}')
+      if [ "$_DK_N" != "1" ] || [ "$_DK_FP" != "9DC858229FC7DD38854AE2D88D81803C0EBFCD88" ]; then
+        dbg "WARNING: docker gpg keyring is not exactly the pinned key - not adding the repo"
         rm -f /etc/apt/keyrings/docker.asc
       fi
       # the repo only goes in with its verified key next to it: a
@@ -1278,6 +1350,7 @@ PORT_NETBIRD_MGMT="${PORT_NETBIRD_MGMT:-33073}"
 PORT_DASH="${PORT_DASH:-8448}"
 PORT_EDGE4="${PORT_EDGE4:-8446}"
 PORT_EDGE5="${PORT_EDGE5:-8447}"
+PORT_EDGE6="${PORT_EDGE6:-8449}"
 PORT_EDGE_CDN="${PORT_EDGE_CDN:-443}"
 PORT_DOCKGE="${PORT_DOCKGE:-8901}"
 
@@ -1292,7 +1365,7 @@ pick_free() {
 }
 
 PORTS_CHANGED=""
-for spec in "IMMICH 2283" "NEXTCLOUD 8080" "SEARXNG 8081" "EDGE1 8443" "EDGE2 8444" "EDGE3 8445" "NETBIRD 8390" "NETBIRD_MGMT 33073" "DASH 8448" "EDGE4 8446" "EDGE5 8447" "EDGE_CDN 443" "DOCKGE 8901"; do
+for spec in "IMMICH 2283" "NEXTCLOUD 8080" "SEARXNG 8081" "EDGE1 8443" "EDGE2 8444" "EDGE3 8445" "NETBIRD 8390" "NETBIRD_MGMT 33073" "DASH 8448" "EDGE4 8446" "EDGE5 8447" "EDGE6 8449" "EDGE_CDN 443" "DOCKGE 8901"; do
   set -- $spec
   NAME=$1; PN=PORT_$NAME; CUR=${!PN-}
   if port_busy "$CUR" && [ "${RERUN:-0}" != "1" ]; then
@@ -1320,6 +1393,7 @@ if [ -n "$PORTS_CHANGED" ]; then
     echo "PORT_DASH=$PORT_DASH"
     echo "PORT_EDGE4=$PORT_EDGE4"
     echo "PORT_EDGE5=$PORT_EDGE5"
+    echo "PORT_EDGE6=$PORT_EDGE6"
     echo "PORT_EDGE_CDN=$PORT_EDGE_CDN"
     echo "PORT_DOCKGE=$PORT_DOCKGE"
   } >> "$_ENV_TMP"
@@ -1328,6 +1402,33 @@ if [ -n "$PORTS_CHANGED" ]; then
   dbg "chosen ports saved"
 fi
 dbg "ports in use: immich $PORT_IMMICH, nextcloud $PORT_NEXTCLOUD, searxng $PORT_SEARXNG, edge $PORT_EDGE1/$PORT_EDGE2/$PORT_EDGE3, netbird $PORT_NETBIRD/$PORT_NETBIRD_MGMT, panel $PORT_EDGE4, ad shield $PORT_EDGE5, dockge $PORT_DOCKGE"
+# service doors: one block of ten edge ports for the services Cerberus
+# builds. Chosen once and saved in the env like every other port, so a
+# re-run never moves a link the owner already bookmarked. The block
+# must miss both live listeners and the ports this pass just picked
+# (those are not bound yet, so port_busy cannot see them).
+SVC_PORT_N=10
+if [ -z "${SVC_PORT_LO:-}" ]; then
+  for _lo in $(seq 8450 10 9490); do
+    _ok=1
+    for _p in $(seq "$_lo" $((_lo + SVC_PORT_N - 1))); do
+      port_busy "$_p" && { _ok=0; break; }
+      for _pn in PORT_IMMICH PORT_NEXTCLOUD PORT_SEARXNG PORT_EDGE1 PORT_EDGE2 PORT_EDGE3 PORT_NETBIRD PORT_NETBIRD_MGMT PORT_DASH PORT_EDGE4 PORT_EDGE5 PORT_EDGE6 PORT_EDGE_CDN PORT_DOCKGE; do
+        [ "${!_pn}" = "$_p" ] && { _ok=0; break 2; }
+      done
+    done
+    [ "$_ok" = 1 ] && { SVC_PORT_LO=$_lo; break; }
+  done
+  if [ -n "${SVC_PORT_LO:-}" ]; then
+    echo "SVC_PORT_LO=$SVC_PORT_LO" >> "$_ENV_TMP"
+    kit_env_commit
+  else
+    dbg "WARNING: no free block of $SVC_PORT_N ports - Cerberus cannot publish services on this box"
+  fi
+fi
+SVC_EDGE_PORTS=""
+[ -n "${SVC_PORT_LO:-}" ] && printf -v SVC_EDGE_PORTS '      - "0.0.0.0:%s-%s:%s-%s"' \
+  "$SVC_PORT_LO" $((SVC_PORT_LO + SVC_PORT_N - 1)) "$SVC_PORT_LO" $((SVC_PORT_LO + SVC_PORT_N - 1))
 
 # The LAN address the phone has to use. localhost only works on the
 # machine itself. Detected once here, then reused by the stack, the edge
@@ -1434,7 +1535,7 @@ resolve_netbird_key() {
         esac
       fi
       OUT="$(curl -s --max-time 20 -X POST "https://api.netbird.io/api/setup-keys" \
-        -H "Authorization: Token $IN" -H "Content-Type: application/json" \
+        -H @<(printf "Authorization: Token $IN" "$IN") -H "Content-Type: application/json" \
         -d "{\"name\":\"redoubt-kit\",\"type\":\"$KEY_TYPE\",\"expires_in\":$KEY_EXPIRES}" \
         | python3 -c "import sys,json; print(json.load(sys.stdin).get('key',''))" 2>/dev/null)"
       ;;
@@ -1998,17 +2099,17 @@ publish_remote_zone() {
   # "N/A" when logged out and the cut turns it into an N): never let
   # a non-address reach the zone record or /etc/hosts
   case "$_ZONE_IP" in [0-9]*.[0-9]*.[0-9]*.[0-9]*) ;; *) return 0 ;; esac
-  _ZONE_GROUP=$(curl -s --max-time 20 "$_ZONE_API/api/groups" -H "$_ZONE_AUTH" \
+  _ZONE_GROUP=$(curl -s --max-time 20 "$_ZONE_API/api/groups" -H @<(printf '%s' "$_ZONE_AUTH") \
     | python3 -c "import sys,json; print(next((g.get('id','') for g in json.load(sys.stdin) if g.get('name')=='All'), ''))" 2>/dev/null)
   if [ -z "$_ZONE_GROUP" ]; then
     dbg "WARN: the $_ZONE_LABEL zone skipped - the account has no All group"
     return 0
   fi
-  _ZONE_ID=$(curl -s --max-time 20 "$_ZONE_API/api/dns/zones" -H "$_ZONE_AUTH" \
+  _ZONE_ID=$(curl -s --max-time 20 "$_ZONE_API/api/dns/zones" -H @<(printf '%s' "$_ZONE_AUTH") \
     | python3 -c "import sys,json; print(next((z.get('id','') for z in json.load(sys.stdin) if z.get('domain')=='redoubt.remote'), ''))" 2>/dev/null)
   if [ -z "$_ZONE_ID" ]; then
     _ZONE_ID=$(curl -s --max-time 20 -X POST "$_ZONE_API/api/dns/zones" \
-      -H "$_ZONE_AUTH" -H "Content-Type: application/json" \
+      -H @<(printf '%s' "$_ZONE_AUTH") -H "Content-Type: application/json" \
       -d "{\"name\":\"Redoubt mesh\",\"domain\":\"redoubt.remote\",\"enabled\":true,\"enable_search_domain\":false,\"distribution_groups\":[\"$_ZONE_GROUP\"]}" \
       | python3 -c "import sys,json; print(json.load(sys.stdin).get('id',''))" 2>/dev/null)
   fi
@@ -2016,15 +2117,15 @@ publish_remote_zone() {
     dbg "WARN: the $_ZONE_LABEL zone did not publish (check the token), remote links keep the mesh address"
     return 0
   fi
-  _ZONE_REC=$(curl -s --max-time 20 "$_ZONE_API/api/dns/zones/$_ZONE_ID" -H "$_ZONE_AUTH" \
+  _ZONE_REC=$(curl -s --max-time 20 "$_ZONE_API/api/dns/zones/$_ZONE_ID" -H @<(printf '%s' "$_ZONE_AUTH") \
     | python3 -c "import sys,json; print(next((r.get('id','') for r in json.load(sys.stdin).get('records',[]) if r.get('name')=='redoubt.remote'), ''))" 2>/dev/null)
   if [ -n "$_ZONE_REC" ]; then
     curl -s --max-time 20 -X PUT "$_ZONE_API/api/dns/zones/$_ZONE_ID/records/$_ZONE_REC" \
-      -H "$_ZONE_AUTH" -H "Content-Type: application/json" \
+      -H @<(printf '%s' "$_ZONE_AUTH") -H "Content-Type: application/json" \
       -d "{\"name\":\"redoubt.remote\",\"type\":\"A\",\"content\":\"$_ZONE_IP\",\"ttl\":300}" >/dev/null 2>&1 || true
   else
     curl -s --max-time 20 -X POST "$_ZONE_API/api/dns/zones/$_ZONE_ID/records" \
-      -H "$_ZONE_AUTH" -H "Content-Type: application/json" \
+      -H @<(printf '%s' "$_ZONE_AUTH") -H "Content-Type: application/json" \
       -d "{\"name\":\"redoubt.remote\",\"type\":\"A\",\"content\":\"$_ZONE_IP\",\"ttl\":300}" >/dev/null 2>&1 || true
   fi
   sed -i '/[[:space:]]redoubt\.remote[[:space:]]*$/d' /etc/hosts 2>/dev/null || true
@@ -2534,7 +2635,11 @@ services:
     # it is only reachable through the local edge (the panel site), so it
     # lives behind the same perimeter as every other app. The admin, the
     # tiles and the branding are seeded by the kit after the first boot.
-    image: ghcr.io/homarr-labs/homarr:latest@sha256:44c480afe9df57ce9de44cb664aec53199ea19926ebdd4e590c7b2c2c0a5ef79
+    image: ghcr.io/homarr-labs/homarr:latest
+    # floating on purpose: the 2.0 schema migrations keep the kit seed
+    # working (proved in the lab: 2.13.0 seeded clean), and the homarr
+    # releases are the panel's own cadence. A digest pin here would
+    # freeze the panel while its upstream moves.
     dns: [172.28.0.53, 127.0.0.11]
     restart: unless-stopped
     environment:
@@ -2573,6 +2678,10 @@ services:
     volumes:
       - "$STACKDIR/local-caddy.Caddyfile:/etc/caddy/Caddyfile:ro"
       - /var/lib/redoubt/caddy-local:/data
+      # the services Cerberus builds: a directory mount, so a new site
+      # file shows up in the running edge and a reload picks it up. A
+      # single-file mount pins the old inode and never sees a rewrite.
+      - "$STACKDIR/caddy-services:/etc/caddy/services:ro"
     ports:
       - "0.0.0.0:${PORT_EDGE1}:8443"
       - "0.0.0.0:8086:80"
@@ -2580,8 +2689,10 @@ services:
       - "0.0.0.0:${PORT_EDGE3}:8445"
       - "0.0.0.0:${PORT_EDGE4}:8446"
       - "0.0.0.0:${PORT_EDGE5}:8447"
+      - "0.0.0.0:${PORT_EDGE6}:8449"
 $CADDY_DASH_PORT
       - "0.0.0.0:${PORT_EDGE_CDN}:443"
+$SVC_EDGE_PORTS
   netbird:
     profiles: ["selfhost"]
     image: netbirdio/netbird-server:${NBVER}
@@ -2665,6 +2776,29 @@ $CADDY_DASH_PORT
     restart: "no"
     volumes:
       - "$STACKDIR:/markers"
+  # remote desktop gateway (optional: the installer flag REDOUBT_GUAC
+  # turns the profile on). guacd speaks the hostile protocols (RDP/VNC/
+  # SSH) so nothing else has to; the client serves them as a browser
+  # tab. Both stay inside the stack network and only the edge reaches
+  # the client port.
+  guacd:
+    image: guacamole/guacd:1.5.5@sha256:38232cae271361ef53db46faf5c49fe64049a1320a05b82c597425b69d6ce77e
+    profiles: ["guacamole"]
+    restart: unless-stopped
+  guacamole:
+    image: guacamole/guacamole:1.5.5@sha256:0f62f6d17ab379e46aa66874b2ff564dab856a6ef5e754a69cbb34c32d3e588a
+    profiles: ["guacamole"]
+    restart: unless-stopped
+    environment:
+      GUACD_HOSTNAME: guacd
+      GUACAMOLE_HOME: /config
+    # no host port: the edge reaches guacamole:8080 on the stack
+    # network, a loopback publish would hand local users a plain-http
+    # door around it
+    volumes:
+      - /var/lib/redoubt/guacamole:/config
+    depends_on:
+      - guacd
 volumes:
   nc-core:
   dns-root:
@@ -2682,6 +2816,34 @@ COMPOSE
 # the kit file stays the truth and refreshes this on every pass
 mkdir -p /opt/stacks/redoubt
 cp "$STACKDIR/docker-compose.yml" /opt/stacks/redoubt/docker-compose.yml
+
+# remote desktop gateway: the user-mapping holds the one login the
+# edge authenticates; the hash is the same owner password the kit
+# already minted, so the gateway needs no second secret.
+guac_setup() {
+  mkdir -p /var/lib/redoubt/guacamole
+  local h
+  h=$(printf '%s' "$OWNER_PASS" | sha256sum | cut -d' ' -f1)
+  cat > /var/lib/redoubt/guacamole/user-mapping.xml <<GM
+<user-mapping>
+    <authorize username="$OWNER_USER" password="$h" encoding="sha256">
+    </authorize>
+</user-mapping>
+GM
+  # the 1.5 image runs as uid 1001 and copies GUACAMOLE_HOME at
+  # start: a root-only file is unreadable there and the login dies
+  chown -R 1001:1001 /var/lib/redoubt/guacamole
+  chmod 600 /var/lib/redoubt/guacamole/user-mapping.xml
+}
+GUAC_PROF=""
+[ "${REDOUBT_GUAC:-0}" = "1" ] && GUAC_PROF=" --profile guacamole"
+# the recovery paths below repeat exactly the profile set this pass
+# started with, never a wildcard: a '*' would resurrect profile-bound
+# services beyond the stack's own selection (the mail tier runs as a
+# separate compose project in its own directory, and a wildcard here
+# must never become its back door)
+STACK_PROF=""
+[ "$MESH_MODE" = "selfhost" ] && STACK_PROF=" --profile selfhost"
 
 # rolling tags pull fresh versions on every pass, and the old ones
 # linger eating the disk. Prune before pulling so the new images have
@@ -2772,6 +2934,16 @@ https://$LAN_IP:8445, https://127.0.0.1:8445 {
 https://$LAN_IP:8447, https://127.0.0.1:8447 {
 	tls internal
 	reverse_proxy pihole:80
+}
+
+# remote desktop (guacamole, optional profile). Websockets ride the
+# reverse proxy like every other site: the mesh address joins the
+# listen line on the post-join pass.
+https://$LAN_IP:8449, https://127.0.0.1:8449 {
+	tls internal
+	# tomcat mounts the guacamole webapp under its context path
+	redir / /guacamole/
+	reverse_proxy guacamole:8080
 }
 
 # local mirror for the panel login background icons: cdn.jsdelivr.net
@@ -2900,9 +3072,23 @@ fi
 # name on these ports, so an app that lands here by accident flags the
 # whole box 'not secure' (a self-inflicted MITM). The per-host vhosts
 # above keep serving; this block only covers the rest.
+mkdir -p "$STACKDIR/caddy-services"
+chmod 755 "$STACKDIR/caddy-services"
+# one file per service, written by redoubt-svc. A glob with no match
+# is legal for caddy, so a box without services stays clean.
+printf '\n# services built by Cerberus (redoubt-svc writes them)\nimport /etc/caddy/services/*.caddy\n' >> "$STACKDIR/local-caddy.Caddyfile"
+# the service doors get the same treatment as the app doors: a door
+# with nothing behind it aborts instead of handing out the local CA
+if [ -n "${SVC_PORT_LO:-}" ]; then
+  _SVC_CATCH=""
+  for _p in $(seq "$SVC_PORT_LO" $((SVC_PORT_LO + SVC_PORT_N - 1))); do
+    _SVC_CATCH="${_SVC_CATCH:+$_SVC_CATCH, }https://:$_p"
+  done
+  printf '\n%s {\n\tabort\n}\n' "$_SVC_CATCH" >> "$STACKDIR/local-caddy.Caddyfile"
+fi
 cat >> "$STACKDIR/local-caddy.Caddyfile" <<'CATCHALL'
 
-https://:443, https://:8443, https://:8444, https://:8445, https://:8446, https://:8447, https://:8448 {
+https://:443, https://:8443, https://:8444, https://:8445, https://:8446, https://:8447, https://:8448, https://:8449 {
 	abort
 }
 CATCHALL
@@ -3287,22 +3473,32 @@ fi
 case "$MESH_MODE" in
   cloud)
     dbg "OK: mesh mode cloud (NetBird brokers the handshake)"
-    IMGS=$(docker compose config --images 2>/dev/null)
+    IMGS=$(docker compose$GUAC_PROF config --images 2>/dev/null)
     N_IMG=$(echo "$IMGS" | wc -w)
     pull_stack
     # a jump from selfhost to cloud must not leave the coordinator
     # containers orphaned behind the cloud stack: stop and remove
     # them so only the cloud set runs
     docker compose --profile selfhost rm -sf netbird dashboard mesh-router mesh-wait >> "$LOG" 2>&1 || true
-    COMP_OUT=/tmp/redoubt-compose-out.$$
-    stack_up ""
+    COMP_OUT=$(mktemp /tmp/redoubt-compose-out.XXXXXX) || { fail_line "no private temp file"; exit 1; }
+    photos_guard on
+    # the panel edge stays fenced until the seed proves the admin exists
+    photos_guard "$PORT_EDGE4" on
+    [ "$GUAC_PROF" ] && guac_setup
+    stack_up "$GUAC_PROF"
     ;;
   selfhost)
-    IMGS=$(docker compose --profile selfhost config --images 2>/dev/null)
+    IMGS=$(docker compose --profile selfhost$GUAC_PROF config --images 2>/dev/null)
     N_IMG=$(echo "$IMGS" | wc -w)
     pull_stack
-    COMP_OUT=/tmp/redoubt-compose-out.$$
-    stack_up "--profile selfhost"
+    COMP_OUT=$(mktemp /tmp/redoubt-compose-out.XXXXXX) || { fail_line "no private temp file"; exit 1; }
+    photos_guard on
+    # the panel edge and the coordinator management port stay fenced
+    # until their first-run ownership is proven below
+    photos_guard "$PORT_EDGE4" on
+    photos_guard "$PORT_NETBIRD" on
+    [ "$GUAC_PROF" ] && guac_setup
+    stack_up "--profile selfhost$GUAC_PROF"
     ;;
 esac
 # boot grace: right after the up, a service can crash once or twice while
@@ -3361,8 +3557,12 @@ _STACK_DOWN=$(printf '%s' "$_STACK_PS" | awk '$2=="exited"||$2=="dead"{print $1}
 if [ -n "$_STACK_DOWN" ] && grep -q 'unexpectedly nil' "$COMP_OUT" 2>/dev/null; then
   docker rm -f "$_STACK_DOWN" >/dev/null 2>&1 || true
   # the profile flag matters here: without it the selfhost services
-  # (netbird-server, dashboard) never heal
-  docker compose --profile '*' up -d >> "$LOG" 2>&1 || true
+  # (netbird-server, dashboard) never heal. The heal repeats exactly
+  # the profile set this pass started with, never a wildcard: a '*'
+  # would resurrect profile-bound services beyond the stack's own
+  # selection (the mail tier is a separate compose project elsewhere,
+  # and a wildcard here must never sweep it back in)
+  docker compose$STACK_PROF$GUAC_PROF up -d >> "$LOG" 2>&1 || true
   log "OK: stack rebuilt ($_STACK_DOWN had a stale layer)"
   # the verdict must match what the owner sees: recount after the heal
   _STACK_PS2=$(stack_ps)
@@ -3378,7 +3578,7 @@ fi
 # pass: the wake checks never recover without this, they only wait.
 if grep -q 'failed to set up container networking' "$COMP_OUT" 2>/dev/null || bridge_dead; then
   bridge_heal
-  docker compose --profile '*' up -d >> "$LOG" 2>&1 || true
+  docker compose$STACK_PROF$GUAC_PROF up -d >> "$LOG" 2>&1 || true
   log "OK: docker network rebuilt (the old bridge died with a wipe); stack re-created"
   _STACK_PS3=$(stack_ps)
   _STACK_SUM3=$(printf '%s' "$_STACK_PS3" | awk -v c="$EM2" '$2=="running"{up++} END{printf "  %sstack: %d/%d containers running\033[0m", c, up, NR}')
@@ -3439,9 +3639,9 @@ else
     if [ -f "$STACKDIR/mesh-pat.txt" ]; then
       PAT=$(cat "$STACKDIR/mesh-pat.txt")
     else
-      R=$(curl -s --max-time 30 -X POST "http://127.0.0.1:$PORT_NETBIRD/api/setup" \
-        -H "Content-Type: application/json" \
-        -d "{\"email\":\"owner@redoubt.local\",\"name\":\"$OWNER_USER\",\"password\":\"$OWNER_PASS\",\"create_pat\":true,\"pat_expire_in\":365}")
+      R=$(printf '%s' "{\"email\":\"owner@redoubt.local\",\"name\":\"$OWNER_USER\",\"password\":\"$OWNER_PASS\",\"create_pat\":true,\"pat_expire_in\":365}" \
+        | curl -s --max-time 30 -X POST "http://127.0.0.1:$PORT_NETBIRD/api/setup" \
+        -H "Content-Type: application/json" --data-binary @-)
       PAT=$(printf '%s' "$R" | python3 -c "import sys,json; print(json.load(sys.stdin).get('personal_access_token',''))" 2>/dev/null)
       if [ -z "$PAT" ] && printf '%s' "$R" | grep -q 'already completed'; then
         # Setup already ran (an older pass or a lost PAT file). With no
@@ -3454,9 +3654,9 @@ else
         rm -rf /var/lib/redoubt/netbird
         docker start redoubt-netbird-1 >/dev/null 2>&1
         sleep 5
-        R=$(curl -s --max-time 30 -X POST "http://127.0.0.1:$PORT_NETBIRD/api/setup" \
-          -H "Content-Type: application/json" \
-          -d "{\"email\":\"owner@redoubt.local\",\"name\":\"$OWNER_USER\",\"password\":\"$OWNER_PASS\",\"create_pat\":true,\"pat_expire_in\":365}")
+        R=$(printf '%s' "{\"email\":\"owner@redoubt.local\",\"name\":\"$OWNER_USER\",\"password\":\"$OWNER_PASS\",\"create_pat\":true,\"pat_expire_in\":365}" \
+          | curl -s --max-time 30 -X POST "http://127.0.0.1:$PORT_NETBIRD/api/setup" \
+          -H "Content-Type: application/json" --data-binary @-)
         PAT=$(printf '%s' "$R" | python3 -c "import sys,json; print(json.load(sys.stdin).get('personal_access_token',''))" 2>/dev/null)
         # If setup is still claimed after a fresh coordinator, this was
         # not an old pass of this kit: someone else took the mesh. Say it
@@ -3471,6 +3671,9 @@ else
         printf '%s\n' "$PAT" > "$STACKDIR/mesh-pat.txt"
         chmod 600 "$STACKDIR/mesh-pat.txt"
         dbg "OK: coordinator bootstrapped"
+        # ownership is ours: open the management port again. A missing
+        # PAT (a third party claimed setup) keeps the fence up.
+        photos_guard "$PORT_NETBIRD" off
       fi
     fi
     if [ -n "$PAT" ]; then
@@ -3481,16 +3684,16 @@ else
       # also tags the enrolling peer with the machine's identity group:
       # the coordinator knows which peer belongs to this host.
       LISTK=$(mktemp /tmp/nb-keys.XXXXXX)
-      curl -s --max-time 30 "http://127.0.0.1:$PORT_NETBIRD/api/setup-keys" -H "Authorization: Bearer $PAT" > "$LISTK" 2>/dev/null
+      curl -s --max-time 30 "http://127.0.0.1:$PORT_NETBIRD/api/setup-keys" -H @<(printf "Authorization: Bearer $PAT" "$PAT") > "$LISTK" 2>/dev/null
       # the identity group must exist before the host key references it:
       # the coordinator rejects unknown auto groups, and the reference is
       # the group's ID, not its name (the name lookup 422s). Create the
       # group once, idempotently, and keep its id.
-      HOST_GROUP_ID=$(curl -s --max-time 20 "http://127.0.0.1:$PORT_NETBIRD/api/groups" -H "Authorization: Bearer $PAT" \
+      HOST_GROUP_ID=$(curl -s --max-time 20 "http://127.0.0.1:$PORT_NETBIRD/api/groups" -H @<(printf "Authorization: Bearer $PAT" "$PAT") \
         | python3 -c "import sys,json; print(next((g.get('id','') for g in json.load(sys.stdin) if g.get('name')=='host-$MESH_ID'), ''))" 2>/dev/null)
       if [ -z "$HOST_GROUP_ID" ]; then
         HOST_GROUP_ID=$(curl -s --max-time 20 -X POST "http://127.0.0.1:$PORT_NETBIRD/api/groups" \
-          -H "Content-Type: application/json" -H "Authorization: Bearer $PAT" \
+          -H "Content-Type: application/json" -H @<(printf "Authorization: Bearer $PAT" "$PAT") \
           -d "{\"name\":\"host-$MESH_ID\"}" \
           | python3 -c "import sys,json; print(json.load(sys.stdin).get('id',''))" 2>/dev/null)
       fi
@@ -3510,7 +3713,7 @@ for k in json.load(open(sys.argv[2])):
       }
       mint_host_key() {
         curl -s --max-time 30 -X POST "http://127.0.0.1:$PORT_NETBIRD/api/setup-keys" \
-          -H "Content-Type: application/json" -H "Authorization: Bearer $PAT" \
+          -H "Content-Type: application/json" -H @<(printf "Authorization: Bearer $PAT" "$PAT") \
           -d "{\"name\":\"host\",\"type\":\"one-off\",\"expires_in\":315360000,\"auto_groups\":[\"$HOST_GROUP_ID\"]}" \
           | python3 -c "
 import sys, json
@@ -3521,7 +3724,7 @@ print(d.get('id', ''))
       }
       mint_mobile_key() {
         curl -s --max-time 30 -X POST "http://127.0.0.1:$PORT_NETBIRD/api/setup-keys" \
-          -H "Content-Type: application/json" -H "Authorization: Bearer $PAT" \
+          -H "Content-Type: application/json" -H @<(printf "Authorization: Bearer $PAT" "$PAT") \
           -d "{\"name\":\"mobile\",\"type\":\"one-off\",\"expires_in\":2592000}" \
           | python3 -c "
 import sys, json
@@ -3542,9 +3745,10 @@ for k in json.load(open(sys.argv[1])):
             body.pop(f, None)
         print(json.dumps(body)); break
 " "$LISTK" "$1" 2>/dev/null)
-        [ -n "$OLD_JSON" ] && curl -s --max-time 30 -X PUT "http://127.0.0.1:$PORT_NETBIRD/api/setup-keys/$1" \
-          -H "Content-Type: application/json" -H "Authorization: Bearer $PAT" \
-          -d "$OLD_JSON" >/dev/null 2>&1 || true
+        [ -n "$OLD_JSON" ] && { printf '%s' "$OLD_JSON" | curl -sf --max-time 30 -X PUT "http://127.0.0.1:$PORT_NETBIRD/api/setup-keys/$1" \
+          -H "Content-Type: application/json" -H @<(printf "Authorization: Bearer $PAT" "$PAT") \
+          --data-binary @- >/dev/null 2>&1 \
+          || dbg "WARNING: could not revoke setup key $1, it stays valid until it expires"; }
       }
       HOST_KEY=""
       HOST_KEY_ID=""
@@ -3780,6 +3984,10 @@ NBDESK
           # first install would leave the tray empty until then. Launch
           # it in the current session right away, as the desktop user.
           if [ -n "${SUDO_USER:-}" ]; then
+            # a stale tray process from an older pass keeps its
+            # version on screen even with a fresh binary on disk:
+            # reap it before the launch
+            pkill -x netbird-ui >/dev/null 2>&1 || true
             sudo -u "$SUDO_USER" env DISPLAY="$GUI_DISPLAY" \
               WEBKIT_DISABLE_DMABUF_RENDERER=1 \
               nohup /usr/bin/netbird-ui >/dev/null 2>&1 &
@@ -3925,7 +4133,7 @@ NBDESKTOP
       # for this host is stable across passes, so a different machine
       # enrolled under our key raises a warning instead of passing.
       PEER_ID_FILE=/etc/redoubt/mesh-peer-id.txt
-      PEER_ID=$(curl -s --max-time 30 "http://127.0.0.1:$PORT_NETBIRD/api/peers" -H "Authorization: Bearer $PAT" \
+      PEER_ID=$(curl -s --max-time 30 "http://127.0.0.1:$PORT_NETBIRD/api/peers" -H @<(printf "Authorization: Bearer $PAT" "$PAT") \
         | python3 -c "
 import sys, json
 for p in json.load(sys.stdin):
@@ -4023,7 +4231,7 @@ for p in json.load(sys.stdin):
             NB_CHECK_NAME="Redoubt device certificate"
             NB_CHECK_ID=""
             NB_PC_RC=$(curl -s --max-time 20 -o "$NB_PC_TMP" -w '%{http_code}' \
-              "$NBAPI_PC/posture-checks" -H "Authorization: Bearer $PAT" 2>/dev/null || true)
+              "$NBAPI_PC/posture-checks" -H @<(printf "Authorization: Bearer $PAT" "$PAT") 2>/dev/null || true)
             if [ "$NB_PC_RC" = "200" ]; then
               NB_CHECK_ID=$(python3 -c '
 import sys, json
@@ -4053,7 +4261,7 @@ print(json.dumps({
 }))
 ' "$NB_CHECK_NAME" "$NB_PKI/root.crt" > "$NB_PC_TMP" 2>/dev/null
                 NB_PC_RC=$(curl -s --max-time 20 -o "$NB_PC_OUT" -w '%{http_code}' -X POST \
-                  "$NBAPI_PC/posture-checks" -H "Authorization: Bearer $PAT" \
+                  "$NBAPI_PC/posture-checks" -H @<(printf "Authorization: Bearer $PAT" "$PAT") \
                   -H "Content-Type: application/json" --data-binary @"$NB_PC_TMP" 2>/dev/null || true)
                 NB_CHECK_ID=$(python3 -c 'import sys,json; print(json.load(open(sys.argv[1])).get("id",""))' "$NB_PC_OUT" 2>/dev/null)
                 if [ -n "$NB_CHECK_ID" ]; then
@@ -4067,7 +4275,7 @@ print(json.dumps({
             fi
             if [ -n "$NB_CHECK_ID" ]; then
               NB_POL_NAME="Redoubt certified hosts"
-              curl -s --max-time 20 -o "$NB_PC_TMP" "$NBAPI_PC/groups" -H "Authorization: Bearer $PAT" 2>/dev/null || true
+              curl -s --max-time 20 -o "$NB_PC_TMP" "$NBAPI_PC/groups" -H @<(printf "Authorization: Bearer $PAT" "$PAT") 2>/dev/null || true
               NB_HG_ID=$(python3 -c '
 import sys, json
 print(next((g.get("id", "") for g in json.load(open(sys.argv[1])) if g.get("name") == sys.argv[2]), ""))
@@ -4078,7 +4286,7 @@ print(next((g.get("id", "") for g in json.load(open(sys.argv[1])) if g.get("name
 ' "$NB_PC_TMP" 2>/dev/null)
               NB_POL_ID=""
               NB_PC_RC=$(curl -s --max-time 20 -o "$NB_PC_TMP" -w '%{http_code}' \
-                "$NBAPI_PC/policies" -H "Authorization: Bearer $PAT" 2>/dev/null || true)
+                "$NBAPI_PC/policies" -H @<(printf "Authorization: Bearer $PAT" "$PAT") 2>/dev/null || true)
               [ "$NB_PC_RC" = "200" ] && NB_POL_ID=$(python3 -c '
 import sys, json
 print(next((p.get("id", "") for p in json.load(open(sys.argv[1])) if p.get("name") == sys.argv[2]), ""))
@@ -4107,11 +4315,11 @@ print(json.dumps({
 ' "$NB_POL_NAME" "$NB_CHECK_ID" "$NB_HG_ID" "$NB_ALL_ID" > "$NB_PC_TMP" 2>/dev/null
                 if [ -n "$NB_POL_ID" ]; then
                   NB_PC_RC=$(curl -s --max-time 20 -o "$NB_PC_OUT" -w '%{http_code}' -X PUT \
-                    "$NBAPI_PC/policies/$NB_POL_ID" -H "Authorization: Bearer $PAT" \
+                    "$NBAPI_PC/policies/$NB_POL_ID" -H @<(printf "Authorization: Bearer $PAT" "$PAT") \
                     -H "Content-Type: application/json" --data-binary @"$NB_PC_TMP" 2>/dev/null || true)
                 else
                   NB_PC_RC=$(curl -s --max-time 20 -o "$NB_PC_OUT" -w '%{http_code}' -X POST \
-                    "$NBAPI_PC/policies" -H "Authorization: Bearer $PAT" \
+                    "$NBAPI_PC/policies" -H @<(printf "Authorization: Bearer $PAT" "$PAT") \
                     -H "Content-Type: application/json" --data-binary @"$NB_PC_TMP" 2>/dev/null || true)
                 fi
                 # read the answer back: a wrong field name is accepted
@@ -4160,15 +4368,15 @@ print("ok" if sys.argv[2] in ids else "no")
             # the coordinator has none). Everything is 127.0.0.1-local.
             NBAPI="http://127.0.0.1:$PORT_NETBIRD/api"
             NBRC=""
-            NET_ID=$(curl -s --max-time 20 "$NBAPI/networks" -H "Authorization: Bearer $PAT" | python3 -c "import sys,json; d=json.load(sys.stdin); print(d[0]['id'] if d else '')" 2>/dev/null)
+            NET_ID=$(curl -s --max-time 20 "$NBAPI/networks" -H @<(printf "Authorization: Bearer $PAT" "$PAT") | python3 -c "import sys,json; d=json.load(sys.stdin); print(d[0]['id'] if d else '')" 2>/dev/null)
             if [ -z "$NET_ID" ]; then
-              NET_ID=$(curl -s --max-time 20 -X POST "$NBAPI/networks" -H "Authorization: Bearer $PAT" -H "Content-Type: application/json" -d '{"name":"default","description":"redoubt mesh"}' | python3 -c "import sys,json; print(json.load(sys.stdin).get('id',''))" 2>/dev/null)
+              NET_ID=$(curl -s --max-time 20 -X POST "$NBAPI/networks" -H @<(printf "Authorization: Bearer $PAT" "$PAT") -H "Content-Type: application/json" -d '{"name":"default","description":"redoubt mesh"}' | python3 -c "import sys,json; print(json.load(sys.stdin).get('id',''))" 2>/dev/null)
             fi
-            PEER_ID=$(curl -s --max-time 20 "$NBAPI/peers" -H "Authorization: Bearer $PAT" | python3 -c "import sys,json,os; d=json.load(sys.stdin); print(next((p['id'] for p in d if p.get('hostname')==os.uname().nodename), ''))" 2>/dev/null)
-            GRP_ID=$(curl -s --max-time 20 "$NBAPI/groups" -H "Authorization: Bearer $PAT" | python3 -c "import sys,json; d=json.load(sys.stdin); print(d[0]['id'] if d else '')" 2>/dev/null)
+            PEER_ID=$(curl -s --max-time 20 "$NBAPI/peers" -H @<(printf "Authorization: Bearer $PAT" "$PAT") | python3 -c "import sys,json,os; d=json.load(sys.stdin); print(next((p['id'] for p in d if p.get('hostname')==os.uname().nodename), ''))" 2>/dev/null)
+            GRP_ID=$(curl -s --max-time 20 "$NBAPI/groups" -H @<(printf "Authorization: Bearer $PAT" "$PAT") | python3 -c "import sys,json; d=json.load(sys.stdin); print(d[0]['id'] if d else '')" 2>/dev/null)
             if [ -n "$NET_ID" ] && [ -n "$PEER_ID" ] && [ -n "$GRP_ID" ]; then
               NBRC=$(curl -s -o /dev/null -w '%{http_code}' --max-time 20 -X POST "$NBAPI/routes" \
-                -H "Authorization: Bearer $PAT" -H "Content-Type: application/json" \
+                -H @<(printf "Authorization: Bearer $PAT" "$PAT") -H "Content-Type: application/json" \
                 -d "{\"network\":\"${LAN_IP%.*}.0/24\",\"network_id\":\"$NET_ID\",\"description\":\"home network\",\"peer\":\"$PEER_ID\",\"enabled\":true,\"masquerade\":false,\"metric\":9999,\"groups\":[\"$GRP_ID\"]}")
             fi
             if [ "$NBRC" = "200" ]; then
@@ -4628,24 +4836,26 @@ fi
 
 #    Create the Immich admin account (the loop retries while immich warms up).
 for i in $(seq 1 20); do
-  R=$(curl -s --max-time 5 -X POST "http://127.0.0.1:$PORT_IMMICH/api/auth/admin-sign-up" \
-    -H "Content-Type: application/json" \
-    -d "{\"email\":\"$IMMICH_EMAIL\",\"password\":\"$IMMICH_PASS\",\"name\":\"Owner\"}" 2>/dev/null)
+  R=$(printf '%s' "{\"email\":\"$IMMICH_EMAIL\",\"password\":\"$IMMICH_PASS\",\"name\":\"Owner\"}" \
+    | curl -s --max-time 5 -X POST "http://127.0.0.1:$PORT_IMMICH/api/auth/admin-sign-up" \
+    -H "Content-Type: application/json" --data-binary @- 2>/dev/null)
   case "$R" in
     *accessToken*|*"created"*) echo "OK: immich admin created"; break ;;
-    *already*)
-      # an admin from an older pass keeps its own password: align it
+    *already*|*"not available"*)
+      # immich answers "Admin setup is not available" (or the older
+      # "already registered") once the admin exists: align it
       # with the single vault so every app opens with Access.txt
       # (the change endpoint is authenticated: login first, then
       # change with the bearer token)
-      ALIGN_TOKEN=$(curl -s --max-time 10 -X POST "http://127.0.0.1:$PORT_IMMICH/api/auth/login" \
-        -H "Content-Type: application/json" \
-        -d "{\"email\":\"$IMMICH_EMAIL\",\"password\":\"$IMMICH_PASS\"}" \
+      ALIGN_TOKEN=$(printf '%s' "{\"email\":\"$IMMICH_EMAIL\",\"password\":\"$IMMICH_PASS\"}" \
+        | curl -s --max-time 10 -X POST "http://127.0.0.1:$PORT_IMMICH/api/auth/login" \
+        -H "Content-Type: application/json" --data-binary @- \
         | python3 -c "import sys,json; print(json.load(sys.stdin).get(\"accessToken\",\"\"))" 2>/dev/null)
       if [ -n "$ALIGN_TOKEN" ]; then
-        ALIGN=$(curl -s -o /dev/null -w '%{http_code}' --max-time 10 -X POST "http://127.0.0.1:$PORT_IMMICH/api/auth/change-password" \
-          -H "Authorization: Bearer $ALIGN_TOKEN" -H "Content-Type: application/json" \
-          -d "{\"password\":\"$IMMICH_PASS\",\"newPassword\":\"$OWNER_PASS\"}")
+        ALIGN=$(printf '%s' "{\"password\":\"$IMMICH_PASS\",\"newPassword\":\"$OWNER_PASS\"}" \
+          | curl -s -o /dev/null -w '%{http_code}' --max-time 10 -X POST "http://127.0.0.1:$PORT_IMMICH/api/auth/change-password" \
+          -H @<(printf "Authorization: Bearer $ALIGN_TOKEN" "$ALIGN_TOKEN") \
+          -H "Content-Type: application/json" --data-binary @-)
       else
         ALIGN=401
       fi
@@ -4655,6 +4865,12 @@ for i in $(seq 1 20); do
   sleep 3
 done
 
+# the first admin is ours or was already set: open the photos edge. Any
+# other outcome keeps the port fenced, loudly.
+case "$R" in
+  *accessToken*|*created*|*already*|*"not available"*) photos_guard off ;;
+  *) fail_line "immich admin not confirmed - the photos port stays closed" ;;
+esac
 #    Customer credentials: a 600 file and on screen.
 if [ "$MESH_MODE" = "selfhost" ]; then
   PHONE_LINE="same wifi only (this mesh is home-only by choice)"
@@ -4705,12 +4921,14 @@ anim_stop
 # by the owner), and the recovery phrase never touches the disk.
 VAULT_BIN=/usr/local/bin/gocryptfs
 VAULT_SHA="37ab7ee7e3f27cf96ba414a02d61e7810c730a4f95d0c7ee050bf3dbd048bacc"
+VAULT_TGZ_SHA="49b8c0eb0f6373b6ac99c394a52909d8478e74c08d0961527c1162967cc28c44"   # sha256 of gocryptfs_v2.6.1_linux-static_amd64.tar.gz
 # the kernel motor: the dojo builds fscrypt v0.3.7 (bin + pam module)
 # and ships it through the release channel; the unpacked checksums are
 # pinned so a tampered tarball dies before anything runs. The distro
 # package (Debian/Ubuntu archives) comes first in the fetch below.
 FSCRYPT_BIN_SHA="8ca62527d1600175fd65e233b2d346f6ec4c2933468da5f93b6fd110c86e4c74"
 FSCRYPT_PAM_SHA="05bca66c0c889458ca806e87314ba9047ab0e7c63157d24126e5b992b461b558"
+FSCRYPT_TGZ_SHA=""   # sha256 of fscrypt-bin.tar.gz, pin before release
 gocryptfs_pf() {  # secret in GCFS_PW; remaining args go to gocryptfs
   local d rc
   d=$(mktemp -d /tmp/redoubt-pf.XXXXXX) || return 1
@@ -4744,8 +4962,8 @@ vault_derive() {
   fi
   VAULT_KEYFILE="$OWNER_HOME/.local/share/redoubt/vault-daily.key"
   # root writes into an owner-controlled tree: never follow a planted link
-  if [ -L "$VAULT_KEYFILE" ] || [ -L "$(dirname "$VAULT_KEYFILE")" ]; then
-    dbg "WARNING: the vault key path is a symlink - refused"
+  if ! safe_owner_path "$VAULT_KEYFILE"; then
+    dbg "WARNING: the vault key path crosses a symlink - refused"
     return 1
   fi
   mkdir -p "$(dirname "$VAULT_KEYFILE")" || { dbg "WARNING: could not create the vault key dir"; return 1; }
@@ -4753,7 +4971,7 @@ vault_derive() {
   # pass umask: hand the root-owned ones to the owner, only up to the home
   _VKPAR="$(dirname "$VAULT_KEYFILE")"
   while [ "$_VKPAR" != "$OWNER_HOME" ] && [ "$_VKPAR" != "/" ]; do
-    [ "$(stat -c %u "$_VKPAR" 2>/dev/null)" = "0" ] && chown "$_VAULT_UID:$_VAULT_GID" "$_VKPAR" 2>/dev/null
+    [ "$(stat -c %u "$_VKPAR" 2>/dev/null)" = "0" ] && [ ! -L "$_VKPAR" ] && chown -h "$_VAULT_UID:$_VAULT_GID" "$_VKPAR" 2>/dev/null
     _VKPAR="$(dirname "$_VKPAR")"
   done
   if [ ! -s "$VAULT_KEYFILE" ] && [ -s "$_VAULT_OLDKEY" ]; then
@@ -4773,8 +4991,15 @@ vault_derive() {
       return 1
     fi
   fi
-  chown "$_VAULT_UID:$_VAULT_GID" "$VAULT_KEYFILE" 2>/dev/null || { dbg "WARNING: vault key chown to $OWNER_SYS_USER failed"; return 1; }
+  chown -h "$_VAULT_UID:$_VAULT_GID" "$VAULT_KEYFILE" 2>/dev/null || { dbg "WARNING: vault key chown to $OWNER_SYS_USER failed"; return 1; }
   chmod 600 "$VAULT_KEYFILE" 2>/dev/null || true
+  # 700 owner on the key dir stops other accounts from even listing the
+  # key name. The key stays owner-readable, not root-only: the login
+  # hook runs as the owner and must open the vault unattended. Residual:
+  # the daily key sits beside the ciphertext on the same storage, so the
+  # vault's protection against a stolen disk rests on the recovery
+  # phrase and any independent full-disk encryption.
+  chmod 700 "$(dirname "$VAULT_KEYFILE")" 2>/dev/null || true
   # the root copy is retired only once the home copy is proven identical
   if [ -f "$_VAULT_OLDKEY" ]; then
     if cmp -s "$_VAULT_OLDKEY" "$VAULT_KEYFILE"; then
@@ -4863,11 +5088,21 @@ vault_mount() {
         rm -f "$VAULT_MOUNT_ERR"
         # never lose the plain files: put them back and stay plain. A
         # failed mv must survive: rmdir only drops an EMPTY park, so a
-        # stuck file blocks the sweep instead of being deleted with it
+        # stuck file blocks the sweep instead of being deleted with it.
+        # The restore lands through an owner-writable pathname, so the
+        # destination is re-verified first: only a real directory that
+        # still resolves inside the owner home may receive the root
+        # moves. A symlink the owner planted where the empty mountpoint
+        # stood would otherwise redirect them into a protected directory.
+        # On any doubt the park is kept for the owner.
         [ -n "$VAULT_PRE" ] && {
-          find "$VAULT_PRE" -mindepth 1 -maxdepth 1 -exec mv {} "$MYREDOUBT"/ \; 2>/dev/null
-          find "$VAULT_PRE" -mindepth 1 -maxdepth 1 -exec mv -f {} "$MYREDOUBT"/ \; 2>/dev/null
-          rmdir "$VAULT_PRE" 2>/dev/null || dbg "WARNING: plain files stuck in $VAULT_PRE, kept for the owner"
+          if [ -d "$MYREDOUBT" ] && [ ! -L "$MYREDOUBT" ] && safe_owner_path "$MYREDOUBT"; then
+            find "$VAULT_PRE" -mindepth 1 -maxdepth 1 -exec mv {} "$MYREDOUBT"/ \; 2>/dev/null
+            find "$VAULT_PRE" -mindepth 1 -maxdepth 1 -exec mv -f {} "$MYREDOUBT"/ \; 2>/dev/null
+            rmdir "$VAULT_PRE" 2>/dev/null || dbg "WARNING: plain files stuck in $VAULT_PRE, kept for the owner"
+          else
+            dbg "WARNING: the vault path changed while the mount was down - plain files kept in $VAULT_PRE"
+          fi
         }
         dbg "WARNING: vault mount failed - the owner folder stays encrypted"
         return 1
@@ -4914,10 +5149,16 @@ vault_crypt_fscrypt() {
     FSCRYPT_TMP=$(mktemp -d /tmp/redoubt-fscrypt.XXXXXX) || return 1
     curl -fsSL --retry 3 -o "$FSCRYPT_TMP/f.tar.gz" "https://install.tryredoubt.com/install/fscrypt-bin.tar.gz" 2>/dev/null \
       || { dbg "WARNING: could not download fscrypt - the owner folder takes the fuse motor"; rm -rf "$FSCRYPT_TMP"; return 1; }
-    tar -xzf "$FSCRYPT_TMP/f.tar.gz" -C "$FSCRYPT_TMP" 2>/dev/null
-    [ "$(sha256sum "$FSCRYPT_TMP/fscrypt" 2>/dev/null | cut -d' ' -f1)" = "$FSCRYPT_BIN_SHA" ] \
+    if [ -z "$FSCRYPT_TGZ_SHA" ] \
+       || [ "$(sha256sum "$FSCRYPT_TMP/f.tar.gz" | cut -d' ' -f1)" != "$FSCRYPT_TGZ_SHA" ]; then
+      dbg "WARNING: fscrypt archive digest not pinned or mismatched - the fuse motor takes over"
+      rm -rf "$FSCRYPT_TMP"; return 1
+    fi
+    tar_member "$FSCRYPT_TMP/f.tar.gz" fscrypt "$FSCRYPT_TMP/fscrypt" \
+      && [ "$(sha256sum "$FSCRYPT_TMP/fscrypt" | cut -d' ' -f1)" = "$FSCRYPT_BIN_SHA" ] \
       && install -m 755 "$FSCRYPT_TMP/fscrypt" /usr/local/bin/fscrypt
-    [ "$(sha256sum "$FSCRYPT_TMP/pam_fscrypt.so" 2>/dev/null | cut -d' ' -f1)" = "$FSCRYPT_PAM_SHA" ] \
+    tar_member "$FSCRYPT_TMP/f.tar.gz" pam_fscrypt.so "$FSCRYPT_TMP/pam_fscrypt.so" \
+      && [ "$(sha256sum "$FSCRYPT_TMP/pam_fscrypt.so" | cut -d' ' -f1)" = "$FSCRYPT_PAM_SHA" ] \
       && install -m 644 "$FSCRYPT_TMP/pam_fscrypt.so" /usr/lib/security/pam_fscrypt.so
     rm -rf "$FSCRYPT_TMP"
     command -v fscrypt >/dev/null 2>&1 || { dbg "WARNING: fscrypt checksum mismatch - the fuse motor takes over"; return 1; }
@@ -4927,6 +5168,8 @@ vault_crypt_fscrypt() {
   # the owner uid comes from the home itself at the point of use,
   # never from a variable a sibling branch sets
   _FUID=$(stat -c %u "${OWNER_HOME:-$HOME}" 2>/dev/null || echo 0)
+  safe_owner_path "$VAULT_KEYFILE" "${OWNER_HOME:-$HOME}" \
+    || { dbg "WARNING: the vault key path crosses a symlink - refused"; return 1; }
   mkdir -p "$(dirname "$VAULT_KEYFILE")"
   # the ancestors (.local, .local/share) may be born root-owned 700
   # under this pass's umask: hand them to the owner or their own apps
@@ -4934,15 +5177,22 @@ vault_crypt_fscrypt() {
   if [ "$_FUID" != "0" ]; then
     _VKPAR="$(dirname "$VAULT_KEYFILE")"
     while [ "$_VKPAR" != "${OWNER_HOME:-$HOME}" ] && [ "$_VKPAR" != "/" ]; do
-      [ -d "$_VKPAR" ] && chown "$_FUID" "$_VKPAR" 2>/dev/null || true
+      [ -d "$_VKPAR" ] && [ ! -L "$_VKPAR" ] && chown -h "$_FUID" "$_VKPAR" 2>/dev/null || true
       _VKPAR="$(dirname "$_VKPAR")"
     done
   fi
   if [ ! -f "$VAULT_KEYFILE" ]; then
-    head -c 32 /dev/urandom > "$VAULT_KEYFILE" || return 1
+    ( umask 077; set -C; head -c 32 /dev/urandom > "$VAULT_KEYFILE" ) || return 1
     chmod 600 "$VAULT_KEYFILE"
-    [ "$_FUID" != "0" ] && chown "$_FUID" "$(dirname "$VAULT_KEYFILE")" "$VAULT_KEYFILE" 2>/dev/null || true
+    [ "$_FUID" != "0" ] && chown -h "$_FUID" "$(dirname "$VAULT_KEYFILE")" "$VAULT_KEYFILE" 2>/dev/null || true
   fi
+  # 700 owner on the key dir stops even a directory listing by other
+  # accounts. The raw key stays owner-readable: the desktop helper runs
+  # fscrypt unlock as the owner, and a root-only file would break the
+  # unattended login unlock. Residual: key and ciphertext share the same
+  # storage, so a stolen unencrypted disk defeats both; the recovery
+  # phrase remains the offline protection.
+  chmod 700 "$(dirname "$VAULT_KEYFILE")" 2>/dev/null || true
   if fscrypt status "$MYREDOUBT" >/dev/null 2>&1; then
     # re-runs: the policy exists, just unlock and keep writing into it
     fscrypt unlock --key="$VAULT_KEYFILE" "$MYREDOUBT" 2>/dev/null || true
@@ -5055,8 +5305,13 @@ vault_crypt() {
     VAULT_TMP=$(mktemp -d /tmp/redoubt-vault.XXXXXX) || return 1
     curl -fsSL --retry 3 -o "$VAULT_TMP/g.tar.gz" "https://github.com/rfjakob/gocryptfs/releases/download/v2.6.1/gocryptfs_v2.6.1_linux-static_amd64.tar.gz" 2>/dev/null \
       || { dbg "WARNING: could not download gocryptfs - the owner folder stays plain"; rm -rf "$VAULT_TMP"; return 1; }
-    tar -xzf "$VAULT_TMP/g.tar.gz" -C "$VAULT_TMP" 2>/dev/null
-    [ "$(sha256sum "$VAULT_TMP/gocryptfs" 2>/dev/null | cut -d' ' -f1)" = "$VAULT_SHA" ] \
+    if [ -z "$VAULT_TGZ_SHA" ] \
+       || [ "$(sha256sum "$VAULT_TMP/g.tar.gz" | cut -d' ' -f1)" != "$VAULT_TGZ_SHA" ]; then
+      dbg "WARNING: gocryptfs archive digest not pinned or mismatched - the owner folder stays plain"
+      rm -rf "$VAULT_TMP"; return 1
+    fi
+    tar_member "$VAULT_TMP/g.tar.gz" gocryptfs "$VAULT_TMP/gocryptfs" \
+      && [ "$(sha256sum "$VAULT_TMP/gocryptfs" | cut -d' ' -f1)" = "$VAULT_SHA" ] \
       || { dbg "WARNING: gocryptfs checksum mismatch - the owner folder stays plain"; rm -rf "$VAULT_TMP"; return 1; }
     install -m 755 "$VAULT_TMP/gocryptfs" "$VAULT_BIN" 2>/dev/null
     rm -rf "$VAULT_TMP"
@@ -5108,7 +5363,10 @@ VAULTOPEN
   # a crash between -init and the conf copy leaves a live cipher with
   # no conf copy: repair the conf and take the re-run path, instead of
   # re-running -init on a non-empty dir (which fails forever)
-  if [ ! -f "$VAULT_CONF" ] && [ -f "$VAULT_CIPHER/gocryptfs.conf" ]; then
+  if [ ! -f "$VAULT_CONF" ] && [ -f "$VAULT_CIPHER/gocryptfs.conf" ] \
+     && [ ! -L "$VAULT_CIPHER/gocryptfs.conf" ] \
+     && safe_owner_path "$VAULT_CIPHER/gocryptfs.conf" \
+     && safe_owner_path "$VAULT_CONF"; then
     mkdir -p "$(dirname "$VAULT_CONF")"
     cp "$VAULT_CIPHER/gocryptfs.conf" "$VAULT_CONF"
     chmod 600 "$VAULT_CONF"
@@ -5142,7 +5400,9 @@ vault_helpers() {
   _VAULT_UID=$(id -u "${OWNER_SYS_USER:-}" 2>/dev/null || echo 0)
   _VAULT_GID=$(id -g "${OWNER_SYS_USER:-}" 2>/dev/null || echo 0)
   if [ "$_VAULT_UID" != "0" ] && [ "$_VAULT_GID" != "0" ]; then
-    chown -R "$_VAULT_UID:$_VAULT_GID" "$VAULT_CIPHER" "$(dirname "$VAULT_CONF")" "$MYREDOUBT" 2>/dev/null || true
+    for _P in "$VAULT_CIPHER" "$(dirname "$VAULT_CONF")" "$MYREDOUBT"; do
+      safe_owner_path "$_P" && chown -hR "$_VAULT_UID:$_VAULT_GID" "$_P" 2>/dev/null || true
+    done
   else
     dbg "WARNING: vault owner unresolved - ownership left as is"
   fi
@@ -5150,8 +5410,11 @@ vault_helpers() {
   # starts, so the folder opens like any other from the file manager
   # even on desktops that never read .profile
   if [ -n "$OWNER_HOME" ]; then
-    mkdir -p "$OWNER_HOME/.config/autostart"
-    cat > "$OWNER_HOME/.config/autostart/redoubt-vault.desktop" <<'VAULTAUTO'
+    if [ "$_VAULT_UID" != "0" ] && [ "$_VAULT_GID" != "0" ] \
+       && safe_owner_path "$OWNER_HOME/.config/autostart/redoubt-vault.desktop"; then
+      runuser -u "$OWNER_SYS_USER" -- mkdir -p "$OWNER_HOME/.config/autostart" 2>/dev/null || true
+      runuser -u "$OWNER_SYS_USER" -- sh -c 'umask 022; rm -f "$1"; set -C; cat > "$1"' \
+        _ "$OWNER_HOME/.config/autostart/redoubt-vault.desktop" <<'VAULTAUTO'
 [Desktop Entry]
 Type=Application
 Name=Redoubt Vault
@@ -5160,14 +5423,8 @@ Hidden=false
 NoDisplay=true
 X-GNOME-Autostart-enabled=true
 VAULTAUTO
-    # OWNER_USER is the panel login and need not exist: a chown to it
-    # failed silently and left the entry 600 root, so it never fired
-    if [ "$_VAULT_UID" != "0" ] && [ "$_VAULT_GID" != "0" ]; then
-      chown "$_VAULT_UID:$_VAULT_GID" "$OWNER_HOME/.config/autostart" "$OWNER_HOME/.config/autostart/redoubt-vault.desktop" 2>/dev/null || true
-      [ "$(stat -c %u "$OWNER_HOME/.config" 2>/dev/null)" = "0" ] && chown "$_VAULT_UID:$_VAULT_GID" "$OWNER_HOME/.config" 2>/dev/null
-      chmod 644 "$OWNER_HOME/.config/autostart/redoubt-vault.desktop" 2>/dev/null || true
     else
-      dbg "WARNING: vault owner unresolved - the autostart entry stays root-owned and will not fire"
+      dbg "WARNING: vault owner unresolved or the autostart path is a link - no autostart entry"
     fi
   fi
   # the login hook: the owner's shell mounts the vault on entry, so the
@@ -5255,8 +5512,652 @@ VAULTHOOK
   if [ -n "${PAT:-}" ] && [ -n "${NETBIRD_IP:-}" ]; then
     publish_remote_zone "http://127.0.0.1:$PORT_NETBIRD" "Authorization: Bearer $PAT" "mesh"
   fi
+# 8a) Home Assistant (optional: the installer flag REDOUBT_HA). The
+# opt-in persists in the env like every other owner choice, so an
+# omitted flag keeps the saved answer and a later REDOUBT_HA=0 walks
+# it back (the service stops, the edge site and the tile go, the
+# /config volume stays). This early pass only reconciles the choice
+# and reserves the edge door so the panel seed below can carry the
+# tile link; the service itself is built and its door gated after the
+# firewall section, where the owner's saved door story is known.
+HA_VERSION="2026.10.3"
+# the reviewed Home Assistant Container release pin. Empty until the
+# release review fills it in: an empty pin fails closed and the
+# service never starts on an unreviewed image. Never guess a digest.
+HA_DIGEST=""
+HA_IMAGE="ghcr.io/home-assistant/home-assistant:${HA_VERSION}"
+HA_SVC_DIR="/opt/redoubt/services/svc-homeassistant"
+HA_CATALOG="/opt/redoubt/catalog/homeassistant"
+HA_GATE_DIR="/etc/redoubt/svc-gates"
+# the explicit installer flag wins over the saved choice; a missing
+# flag keeps the one already sourced from the env
+[ -n "${HA_FLAG:-}" ] && REDOUBT_HA="$HA_FLAG"
+case "${REDOUBT_HA:-}" in 1|0) ;; *) REDOUBT_HA=0 ;; esac
+HA_ON="${REDOUBT_HA}"
+# persist the choice: every later pass reconciles to it even when the
+# installer flag is not repeated
+if grep -qs '^REDOUBT_HA=' "$_ENV_TMP" 2>/dev/null; then
+  sed -i "s|^REDOUBT_HA=.*|REDOUBT_HA=$REDOUBT_HA|" "$_ENV_TMP"
+else
+  echo "REDOUBT_HA=$REDOUBT_HA" >> "$_ENV_TMP"
+fi
+kit_env_commit
+
+if [ "$HA_ON" = "1" ]; then
+  # an unpinned release is unreviewed: the service stays off until the
+  # review fills HA_DIGEST, whatever else this pass would like to do
+  [ -n "$HA_DIGEST" ] || {
+    dbg "WARNING: Home Assistant stays off: HA_DIGEST is empty (no reviewed release pin yet)"
+    HA_ON=0
+  }
+fi
+if [ "$HA_ON" = "1" ]; then
+  # the edge door: one free port from the service block, chosen under
+  # the builder's own lock and saved in the env, so re-runs keep the
+  # same link and the builder re-checks it before use. The built
+  # service's own meta wins when it exists (the builder may have
+  # re-picked after a later service grabbed the reservation).
+  HA_DOOR="${HA_DOOR:-}"
+  if [ -f "$HA_SVC_DIR/meta" ]; then
+    _ha_meta_door=$(sed -n 's/^DOOR=//p' "$HA_SVC_DIR/meta" 2>/dev/null || true)
+    [ -n "$_ha_meta_door" ] && HA_DOOR="$_ha_meta_door"
+  fi
+  _ha_taken=0
+  if [ -n "$HA_DOOR" ]; then
+    for _hm in /opt/redoubt/services/*/meta; do
+      [ -f "$_hm" ] || continue
+      [ "$_hm" = "$HA_SVC_DIR/meta" ] && continue
+      [ "$(sed -n 's/^DOOR=//p' "$_hm" 2>/dev/null)" = "$HA_DOOR" ] && _ha_taken=1
+    done
+  fi
+  if [ -z "$HA_DOOR" ] || [ "$_ha_taken" = "1" ] || [ -z "${SVC_PORT_LO:-}" ]; then
+    HA_DOOR=""
+    if [ -n "${SVC_PORT_LO:-}" ]; then
+      # the same lock file redoubt-svc flocks: the two allocators
+      # cannot race each other for a door
+      exec 9>/run/redoubt-svc.lock
+      flock -w 120 9 || true
+      _ha_used=""
+      for _hm in /opt/redoubt/services/*/meta; do
+        [ -f "$_hm" ] || continue
+        _ha_used="$_ha_used $(sed -n 's/^DOOR=//p' "$_hm" 2>/dev/null)"
+      done
+      for _hd in $(seq "$SVC_PORT_LO" $((SVC_PORT_LO + SVC_PORT_N - 1))); do
+        case " $_ha_used " in *" $_hd "*) ;; *) HA_DOOR="$_hd"; break ;; esac
+      done
+      flock -u 9 2>/dev/null || true
+    fi
+  fi
+  if [ -n "$HA_DOOR" ]; then
+    sed -i '/^HA_DOOR=/d' "$_ENV_TMP"
+    echo "HA_DOOR=$HA_DOOR" >> "$_ENV_TMP"
+    kit_env_commit
+    dbg "OK: Home Assistant door reserved ($HA_DOOR)"
+  else
+    dbg "WARNING: no free service door: Home Assistant stays off on this box"
+    HA_ON=0
+  fi
+else
+  # walking it back: the service stops, the edge site and the tile go,
+  # the /config volume stays (a named volume survives a compose down).
+  # The gate file keeps the builder from re-rendering the site too.
+  mkdir -p "$HA_GATE_DIR"
+  printf 'off\n' > "$HA_GATE_DIR/svc-homeassistant"
+  chmod 644 "$HA_GATE_DIR/svc-homeassistant" 2>/dev/null || true
+  if [ -f "$HA_SVC_DIR/compose.yml" ]; then
+    docker compose -f "$HA_SVC_DIR/compose.yml" down >/dev/null 2>&1 || true
+  fi
+  rm -f "$STACKDIR/caddy-services/svc-homeassistant.caddy" 2>/dev/null || true
+  if docker ps --format '{{.Names}}' 2>/dev/null | grep -qx redoubt-edge-local-1; then
+    docker exec redoubt-edge-local-1 caddy reload --config /etc/caddy/Caddyfile --adapter caddyfile >/dev/null 2>&1 \
+      || docker restart redoubt-edge-local-1 >/dev/null 2>&1 || true
+  fi
+  systemctl disable --now redoubt-ha-gate.service >/dev/null 2>&1 || true
+  rm -f /etc/systemd/system/redoubt-ha-gate.service /usr/local/sbin/redoubt-ha-gate 2>/dev/null || true
+fi
+
+# 8c) Mail (optional: the installer flag REDOUBT_MAIL). The opt-in
+# persists in the env like every other owner choice, so an omitted
+# flag keeps the saved answer and a later REDOUBT_MAIL=0 walks the
+# tier back (the project stops, the edge site and the panel tile go,
+# the mail queues, accounts, dkim keys and config volumes stay). The
+# tier is a separate compose project (svc-mail) in its own directory,
+# outside the stack's profile wildcards, so a stack recovery never
+# sweeps it. This early pass only reconciles the choice, validates
+# the owner's domain and roster, and reserves the edge door so the
+# panel seed below can carry the tile link; the project itself is
+# built and its door gated after the firewall section, where the
+# owner's saved door story is known. Fail closed: unreviewed
+# releases, a missing or invalid domain, or a missing roster all
+# keep the tier off.
+MAIL_STALWART_VERSION=""
+MAIL_BULWARK_VERSION=""
+# the reviewed release pins for the two containers. Empty until the
+# release review fills them: an empty pin fails closed and the tier
+# never starts on an unreviewed image. Never guess a digest.
+MAIL_STALWART_DIGEST=""
+MAIL_BULWARK_DIGEST=""
+MAIL_IMAGE_STALWART="ghcr.io/stalwartlabs/mail-server"
+MAIL_IMAGE_BULWARK="ghcr.io/bulwark-project/bulwark"
+MAIL_SVC_DIR="/opt/redoubt/services/svc-mail"
+MAIL_CATALOG="/opt/redoubt/catalog/mail"
+MAIL_GATE_DIR="/etc/redoubt/svc-gates"
+MAIL_CREDS="/etc/redoubt/mail-credentials"
+MAIL_ROSTER="/etc/redoubt/mail-roster.txt"
+MAIL_KEYS="/var/lib/redoubt/mail-keys"
+# the explicit installer flag wins over the saved choice; a missing
+# flag keeps the one already sourced from the env
+[ -n "${MAIL_FLAG:-}" ] && REDOUBT_MAIL="$MAIL_FLAG"
+case "${REDOUBT_MAIL:-}" in 1|0) ;; *) REDOUBT_MAIL=0 ;; esac
+MAIL_ON="${REDOUBT_MAIL}"
+# persist the choice: every later pass reconciles to it even when the
+# installer flag is not repeated
+if grep -qs '^REDOUBT_MAIL=' "$_ENV_TMP" 2>/dev/null; then
+  sed -i "s|^REDOUBT_MAIL=.*|REDOUBT_MAIL=$REDOUBT_MAIL|" "$_ENV_TMP"
+else
+  echo "REDOUBT_MAIL=$REDOUBT_MAIL" >> "$_ENV_TMP"
+fi
+kit_env_commit
+
+# the owner's domain is the only source of mail addresses and of the
+# mail hostname: the kit never invents a domain and never infers
+# family addresses from the single owner account. A later explicit
+# flag still wins over a saved domain.
+[ -n "${MAIL_DOMAIN_FLAG:-}" ] && REDOUBT_MAIL_DOMAIN="$MAIL_DOMAIN_FLAG"
+MAIL_DOMAIN=$(printf '%s' "${REDOUBT_MAIL_DOMAIN:-}" | tr 'A-Z' 'a-z')
+# the mail hostname the owner's MX and A records must point at; the
+# kit derives it, prints it, and never touches DNS itself
+MAIL_HOST="mail.${MAIL_DOMAIN}"
+mail_domain_ok() {
+  # an owner-supplied fqdn: labels of letters, digits and hyphens, no
+  # leading or trailing hyphen per label, no empty labels, at least
+  # one dot. Punycode is the owner's own to supply; the kit never
+  # transliterates it.
+  local _d="$1"
+  case "$_d" in
+    *[!A-Za-z0-9.-]*|.|-*|*-|*..*|.*|*.|*-.*|*.-*) return 1 ;;
+  esac
+  case "$_d" in *.*) return 0 ;; *) return 1 ;; esac
+}
+# one local-part per line, # comments and blank lines skipped. The
+# full address is local-part@MAIL_DOMAIN and exists only when it is
+# written here: never inferred from the owner account. The file must
+# be root-owned and private, or any local user could order accounts.
+mail_roster_ok() {
+  [ -f "$MAIL_ROSTER" ] || return 1
+  [ "$(stat -c '%u %a' "$MAIL_ROSTER" 2>/dev/null)" = "0 600" ] || return 1
+  local l n=0
+  while IFS= read -r l; do
+    case "$l" in ''|\#*) continue ;; esac
+    l="${l#"${l%%[![:space:]]*}"}"
+    l="${l%"${l##*[![:space:]]}"}"
+    case "$l" in *[[:space:]]*) return 1 ;; esac
+    # RFC 5321 dot-atom: atom specials and dots, no leading, trailing
+    # or consecutive dots. The apostrophe special is rejected on
+    # purpose: no real roster needs it and leaving it out keeps the
+    # validator clear of shell quoting traps. grep does the atom
+    # class check because a case pattern cannot carry a literal &
+    case "$l" in .*|*.|*..*) return 1 ;; esac
+    printf '%s' "$l" | grep -Eq '^[A-Za-z0-9.!#$%&*+/=?^_`{|}~-]+$' || return 1
+    [ "${#l}" -le 64 ] || return 1
+    n=$((n+1))
+  done < "$MAIL_ROSTER"
+  [ "$n" -gt 0 ]
+}
+if [ -n "$MAIL_DOMAIN" ] && mail_domain_ok "$MAIL_DOMAIN"; then
+  # persist the validated domain so later passes keep it without the
+  # installer flag being repeated
+  if grep -qs '^REDOUBT_MAIL_DOMAIN=' "$_ENV_TMP" 2>/dev/null; then
+    sed -i "s|^REDOUBT_MAIL_DOMAIN=.*|REDOUBT_MAIL_DOMAIN=$MAIL_DOMAIN|" "$_ENV_TMP"
+  else
+    echo "REDOUBT_MAIL_DOMAIN=$MAIL_DOMAIN" >> "$_ENV_TMP"
+  fi
+  kit_env_commit
+elif [ -n "$MAIL_DOMAIN" ]; then
+  dbg "WARNING: REDOUBT_MAIL_DOMAIN is not a valid domain: the mail tier stays off"
+fi
+
+# the delivery plan: paste prints the records for the owner to apply
+# by hand (the honest default: nothing moves without the owner's own
+# act), managed reconciles through the owner's provider adapter in
+# the late pass, which alone holds the scoped provider credential.
+# The kit itself never calls a provider API.
+[ -n "${MAIL_DNS_FLAG:-}" ] && REDOUBT_MAIL_DNS="$MAIL_DNS_FLAG"
+case "${REDOUBT_MAIL_DNS:-}" in managed|paste) ;; *) REDOUBT_MAIL_DNS=paste ;; esac
+MAIL_DNS_MODE="${REDOUBT_MAIL_DNS}"
+if grep -qs '^REDOUBT_MAIL_DNS=' "$_ENV_TMP" 2>/dev/null; then
+  sed -i "s|^REDOUBT_MAIL_DNS=.*|REDOUBT_MAIL_DNS=$MAIL_DNS_MODE|" "$_ENV_TMP"
+else
+  echo "REDOUBT_MAIL_DNS=$MAIL_DNS_MODE" >> "$_ENV_TMP"
+fi
+kit_env_commit
+# the public exposure decision, default closed: off publishes no SMTP
+# door, relay sends outbound through the owner's relay only, on
+# publishes inbound 25 plus whatever the owner selected below
+[ -n "${MAIL_EXPOSE_FLAG:-}" ] && REDOUBT_MAIL_EXPOSE="$MAIL_EXPOSE_FLAG"
+case "${REDOUBT_MAIL_EXPOSE:-}" in on|relay|off) ;; *) REDOUBT_MAIL_EXPOSE=off ;; esac
+MAIL_EXPOSE="${REDOUBT_MAIL_EXPOSE}"
+if grep -qs '^REDOUBT_MAIL_EXPOSE=' "$_ENV_TMP" 2>/dev/null; then
+  sed -i "s|^REDOUBT_MAIL_EXPOSE=.*|REDOUBT_MAIL_EXPOSE=$MAIL_EXPOSE|" "$_ENV_TMP"
+else
+  echo "REDOUBT_MAIL_EXPOSE=$MAIL_EXPOSE" >> "$_ENV_TMP"
+fi
+kit_env_commit
+# submission and IMAP ride their own opt-ins, both default closed: a
+# public 587 or 993 door never opens just because inbound 25 did
+[ -n "${MAIL_SUBMIT_FLAG:-}" ] && REDOUBT_MAIL_SUBMIT="$MAIL_SUBMIT_FLAG"
+case "${REDOUBT_MAIL_SUBMIT:-}" in 1|0) ;; *) REDOUBT_MAIL_SUBMIT=0 ;; esac
+[ -n "${MAIL_IMAP_FLAG:-}" ] && REDOUBT_MAIL_IMAP="$MAIL_IMAP_FLAG"
+case "${REDOUBT_MAIL_IMAP:-}" in 1|0) ;; *) REDOUBT_MAIL_IMAP=0 ;; esac
+if grep -qs '^REDOUBT_MAIL_SUBMIT=' "$_ENV_TMP" 2>/dev/null; then
+  sed -i "s|^REDOUBT_MAIL_SUBMIT=.*|REDOUBT_MAIL_SUBMIT=$REDOUBT_MAIL_SUBMIT|" "$_ENV_TMP"
+else
+  echo "REDOUBT_MAIL_SUBMIT=$REDOUBT_MAIL_SUBMIT" >> "$_ENV_TMP"
+fi
+if grep -qs '^REDOUBT_MAIL_IMAP=' "$_ENV_TMP" 2>/dev/null; then
+  sed -i "s|^REDOUBT_MAIL_IMAP=.*|REDOUBT_MAIL_IMAP=$REDOUBT_MAIL_IMAP|" "$_ENV_TMP"
+else
+  echo "REDOUBT_MAIL_IMAP=$REDOUBT_MAIL_IMAP" >> "$_ENV_TMP"
+fi
+kit_env_commit
+# the cutover confirmation: MX records never move without it. Managed
+# mode hands the MX line to the provider adapter only when this is 1;
+# paste mode prints it flagged for the owner's own planned cutover
+[ -n "${MAIL_MX_CUTOVER_FLAG:-}" ] && REDOUBT_MAIL_MX_CUTOVER="$MAIL_MX_CUTOVER_FLAG"
+case "${REDOUBT_MAIL_MX_CUTOVER:-}" in 1|0) ;; *) REDOUBT_MAIL_MX_CUTOVER=0 ;; esac
+if grep -qs '^REDOUBT_MAIL_MX_CUTOVER=' "$_ENV_TMP" 2>/dev/null; then
+  sed -i "s|^REDOUBT_MAIL_MX_CUTOVER=.*|REDOUBT_MAIL_MX_CUTOVER=$REDOUBT_MAIL_MX_CUTOVER|" "$_ENV_TMP"
+else
+  echo "REDOUBT_MAIL_MX_CUTOVER=$REDOUBT_MAIL_MX_CUTOVER" >> "$_ENV_TMP"
+fi
+kit_env_commit
+# the outbound relay (host[:port]) and the owner-supplied public
+# addresses for the A/AAAA records. The kit never calls an ip echo
+# service: a box that keeps its public addresses to itself leaves
+# those records to the owner. Both persist validated, or not at all.
+[ -n "${MAIL_RELAY_FLAG:-}" ] && REDOUBT_MAIL_RELAY="$MAIL_RELAY_FLAG"
+MAIL_RELAY=$(printf '%s' "${REDOUBT_MAIL_RELAY:-}" | tr 'A-Z' 'a-z')
+case "$MAIL_RELAY" in
+  *[!a-z0-9.:-]*|-*|*-|*..*|.) MAIL_RELAY="" ;;
+  *:*)
+    _mail_rp="${MAIL_RELAY##*:}"
+    case "$_mail_rp" in ''|*[!0-9]*|0*) MAIL_RELAY="" ;; *) [ "$_mail_rp" -le 65535 ] || MAIL_RELAY="" ;; esac
+    ;;
+esac
+[ -n "$MAIL_RELAY" ] && {
+  if grep -qs '^REDOUBT_MAIL_RELAY=' "$_ENV_TMP" 2>/dev/null; then
+    sed -i "s|^REDOUBT_MAIL_RELAY=.*|REDOUBT_MAIL_RELAY=$MAIL_RELAY|" "$_ENV_TMP"
+  else
+    echo "REDOUBT_MAIL_RELAY=$MAIL_RELAY" >> "$_ENV_TMP"
+  fi
+  kit_env_commit
+}
+[ -n "${MAIL_PUB4_FLAG:-}" ] && REDOUBT_MAIL_PUB4="$MAIL_PUB4_FLAG"
+[ -n "${MAIL_PUB6_FLAG:-}" ] && REDOUBT_MAIL_PUB6="$MAIL_PUB6_FLAG"
+mail_ip_lit() {  # true when $1 is a plain ip literal (family $2)
+  case "$2" in
+    4) printf '%s' "$1" | grep -Eq '^([0-9]{1,3}\.){3}[0-9]{1,3}$' || return 1 ;;
+    6) printf '%s' "$1" | grep -Eq '^[0-9a-fA-F:]+$' || return 1 ;;
+    *) return 1 ;;
+  esac
+}
+MAIL_PUB4="${REDOUBT_MAIL_PUB4:-}"
+MAIL_PUB6="${REDOUBT_MAIL_PUB6:-}"
+mail_ip_lit "$MAIL_PUB4" 4 || MAIL_PUB4=""
+mail_ip_lit "$MAIL_PUB6" 6 || MAIL_PUB6=""
+if grep -qs '^REDOUBT_MAIL_PUB4=' "$_ENV_TMP" 2>/dev/null; then
+  sed -i "s|^REDOUBT_MAIL_PUB4=.*|REDOUBT_MAIL_PUB4=$MAIL_PUB4|" "$_ENV_TMP"
+else
+  echo "REDOUBT_MAIL_PUB4=$MAIL_PUB4" >> "$_ENV_TMP"
+fi
+if grep -qs '^REDOUBT_MAIL_PUB6=' "$_ENV_TMP" 2>/dev/null; then
+  sed -i "s|^REDOUBT_MAIL_PUB6=.*|REDOUBT_MAIL_PUB6=$MAIL_PUB6|" "$_ENV_TMP"
+else
+  echo "REDOUBT_MAIL_PUB6=$MAIL_PUB6" >> "$_ENV_TMP"
+fi
+kit_env_commit
+
+if [ "$MAIL_ON" = "1" ]; then
+  # fail closed: unpinned releases, an unverified domain and a missing
+  # roster all keep the tier off, whatever else this pass would like
+  if [ -z "$MAIL_STALWART_DIGEST" ] || [ -z "$MAIL_BULWARK_DIGEST" ] \
+     || [ -z "$MAIL_STALWART_VERSION" ] || [ -z "$MAIL_BULWARK_VERSION" ]; then
+    dbg "mail tier: stage pending (no reviewed release pins yet: MAIL_STALWART_DIGEST and MAIL_BULWARK_DIGEST are empty until the release review fills them; digests are never guessed)"
+    MAIL_ON=0
+  elif [ -z "$MAIL_DOMAIN" ] || ! mail_domain_ok "$MAIL_DOMAIN"; then
+    dbg "mail tier: stage pending (REDOUBT_MAIL_DOMAIN missing or invalid: the tier requires the owner's real domain, it never invents one)"
+    MAIL_ON=0
+  elif ! mail_roster_ok; then
+    dbg "mail tier: stage pending (no valid $MAIL_ROSTER: one local-part per line, root-owned 600; family accounts are never inferred from the owner account)"
+    MAIL_ON=0
+  fi
+fi
+if [ "$MAIL_ON" = "1" ]; then
+  # the edge door: one free port from the service block, chosen under
+  # the builder's own lock and saved in the env, so re-runs keep the
+  # same link and the builder re-checks it before use. The built
+  # project's own meta wins when it exists.
+  MAIL_DOOR="${MAIL_DOOR:-}"
+  if [ -f "$MAIL_SVC_DIR/meta" ]; then
+    _mail_meta_door=$(sed -n 's/^DOOR=//p' "$MAIL_SVC_DIR/meta" 2>/dev/null || true)
+    [ -n "$_mail_meta_door" ] && MAIL_DOOR="$_mail_meta_door"
+  fi
+  _mail_taken=0
+  if [ -n "$MAIL_DOOR" ]; then
+    for _mm in /opt/redoubt/services/*/meta; do
+      [ -f "$_mm" ] || continue
+      [ "$_mm" = "$MAIL_SVC_DIR/meta" ] && continue
+      [ "$(sed -n 's/^DOOR=//p' "$_mm" 2>/dev/null)" = "$MAIL_DOOR" ] && _mail_taken=1
+    done
+  fi
+  if [ -z "$MAIL_DOOR" ] || [ "$_mail_taken" = "1" ] || [ -z "${SVC_PORT_LO:-}" ]; then
+    MAIL_DOOR=""
+    if [ -n "${SVC_PORT_LO:-}" ]; then
+      # the same lock file redoubt-svc flocks: the two allocators
+      # cannot race each other for a door
+      exec 9>/run/redoubt-svc.lock
+      flock -w 120 9 || true
+      _mail_used=""
+      for _mm in /opt/redoubt/services/*/meta; do
+        [ -f "$_mm" ] || continue
+        _mail_used="$_mail_used $(sed -n 's/^DOOR=//p' "$_mm" 2>/dev/null)"
+      done
+      for _md in $(seq "$SVC_PORT_LO" $((SVC_PORT_LO + SVC_PORT_N - 1))); do
+        case " $_mail_used " in *" $_md "*) ;; *) MAIL_DOOR="$_md"; break ;; esac
+      done
+      flock -u 9 2>/dev/null || true
+    fi
+  fi
+  if [ -n "$MAIL_DOOR" ]; then
+    sed -i '/^MAIL_DOOR=/d' "$_ENV_TMP"
+    echo "MAIL_DOOR=$MAIL_DOOR" >> "$_ENV_TMP"
+    kit_env_commit
+    dbg "OK: mail door reserved ($MAIL_DOOR)"
+  else
+    dbg "WARNING: no free service door: the mail tier stays off on this box"
+    MAIL_ON=0
+  fi
+else
+  # walking it back: the project stops, the edge site and the panel
+  # tile go, and the mail queues, accounts, dkim keys and config
+  # volumes all stay (named volumes survive a compose down; the
+  # roster, credentials and keys are files the kit never deletes).
+  # Warn before disabling: delivery can fail or queue elsewhere, and
+  # the kit never silently changes the domain's MX records.
+  if [ -n "$MAIL_DOMAIN" ] && mail_domain_ok "$MAIL_DOMAIN"; then
+    dbg "mail tier off: mail for $MAIL_DOMAIN can fail or queue elsewhere; the kit never changes MX records (point them at $MAIL_HOST yourself, or at a fallback host you control)"
+  fi
+  mkdir -p "$MAIL_GATE_DIR"
+  printf 'off\n' > "$MAIL_GATE_DIR/svc-mail"
+  chmod 644 "$MAIL_GATE_DIR/svc-mail" 2>/dev/null || true
+  if [ -f "$MAIL_SVC_DIR/compose.yml" ]; then
+    docker compose -p svc-mail -f "$MAIL_SVC_DIR/compose.yml" down >/dev/null 2>&1 || true
+  fi
+  rm -f "$STACKDIR/caddy-services/svc-mail.caddy" 2>/dev/null || true
+  # the SMTP doors close with the tier: the kit-managed host rules for
+  # 25, 587 and 993 come out in both firewall forms, and the boot
+  # gate's SMTP story goes to off so a reboot never re-justifies them.
+  # 465 rides the cleanup too in case an older pass ever added it.
+  printf 'off\n' > "$MAIL_GATE_DIR/svc-mail-smtp"
+  chmod 644 "$MAIL_GATE_DIR/svc-mail-smtp" 2>/dev/null || true
+  for _msp in 25 587 465 993; do
+    if command -v ufw >/dev/null 2>&1; then
+      ufw delete allow "$_msp/tcp" >/dev/null 2>&1 || true
+      ufw delete allow in on wt0 to any port "$_msp" proto tcp >/dev/null 2>&1 || true
+    fi
+    if command -v firewall-cmd >/dev/null 2>&1; then
+      firewall-cmd --permanent --remove-port="$_msp/tcp" >/dev/null 2>&1 || true
+      firewall-cmd --permanent --zone=redoubt-mesh --remove-port="$_msp/tcp" >/dev/null 2>&1 || true
+    fi
+  done
+  command -v firewall-cmd >/dev/null 2>&1 && firewall-cmd --reload >/dev/null 2>&1 || true
+  if docker ps --format '{{.Names}}' 2>/dev/null | grep -qx redoubt-edge-local-1; then
+    docker exec redoubt-edge-local-1 caddy reload --config /etc/caddy/Caddyfile --adapter caddyfile >/dev/null 2>&1 \
+      || docker restart redoubt-edge-local-1 >/dev/null 2>&1 || true
+  fi
+  systemctl disable --now redoubt-mail-gate.service >/dev/null 2>&1 || true
+  rm -f /etc/systemd/system/redoubt-mail-gate.service /usr/local/sbin/redoubt-mail-gate 2>/dev/null || true
+fi
+
+# 8e) Media (optional: the installer flag REDOUBT_MEDIA). The opt-in
+# persists in the env like every other owner choice, so an omitted
+# flag keeps the saved answer and a later REDOUBT_MEDIA=0 walks the
+# tier back (both services stop, the edge site and the panel tile go,
+# the media library, the Jellyfin /config volume and any credentials
+# stay). The tier is its own project outside the stack's profile
+# wildcards, so a stack recovery never sweeps it. This early pass
+# only reconciles the choice, validates the owner's media path and
+# reserves the edge doors (Jellyfin's own plus the kept-closed slot
+# for the pending Reiverr workflow) so the panel seed below can carry
+# the tile link; the service itself is built and its door gated after
+# the firewall section, where the owner's saved door story is known.
+# Fail closed: unreviewed releases, a missing or unsafe media path or
+# no free door all keep the tier off.
+MEDIA_JELLYFIN_VERSION=""
+# the reviewed Jellyfin release pins. Empty until the release review
+# fills them: an empty pin fails closed and the service never starts
+# on an unreviewed image. Never guess a digest.
+MEDIA_JELLYFIN_DIGEST=""
+MEDIA_JELLYFIN_IMAGE="jellyfin/jellyfin"
+# the reviewed official Reiverr image reference. The workflow itself
+# stays unwired until a specific release is selected and tested: see
+# the honest partial report below.
+MEDIA_REIVERR_VERSION=""
+MEDIA_REIVERR_DIGEST=""
+MEDIA_REIVERR_IMAGE="ghcr.io/aleksilassila/reiverr"
+MEDIA_REIVERR_REASON="the Reiverr releases differ materially: v2.1.1 has the Jellyfin plugin without the Sonarr/Radarr integration, the v3 beta is a different product with its own torrent client, the 1.0 branch carries the older integration; a specific release must be selected and tested"
+MEDIA_JELLYFIN_SVC_DIR="/opt/redoubt/services/jellyfin"
+MEDIA_CATALOG="/opt/redoubt/catalog"
+MEDIA_GATE_DIR="/etc/redoubt/svc-gates"
+# the explicit installer flag wins over the saved choice; a missing
+# flag keeps the one already sourced from the env
+[ -n "${MEDIA_FLAG:-}" ] && REDOUBT_MEDIA="$MEDIA_FLAG"
+case "${REDOUBT_MEDIA:-}" in 1|0) ;; *) REDOUBT_MEDIA=0 ;; esac
+MEDIA_ON="${REDOUBT_MEDIA}"
+# persist the choice: every later pass reconciles to it even when the
+# installer flag is not repeated
+if grep -qs '^REDOUBT_MEDIA=' "$_ENV_TMP" 2>/dev/null; then
+  sed -i "s|^REDOUBT_MEDIA=.*|REDOUBT_MEDIA=$REDOUBT_MEDIA|" "$_ENV_TMP"
+else
+  echo "REDOUBT_MEDIA=$REDOUBT_MEDIA" >> "$_ENV_TMP"
+fi
+kit_env_commit
+# the owner's media library: the kit mounts it read-only and never
+# writes to it. A later explicit flag still wins over a saved path.
+[ -n "${MEDIA_PATH_FLAG:-}" ] && REDOUBT_MEDIA_PATH="$MEDIA_PATH_FLAG"
+MEDIA_PATH="${REDOUBT_MEDIA_PATH:-}"
+media_path_ok() {
+  # the library must already exist as a directory under the resolved
+  # owner home, with no symlink components: a symlink that can be
+  # swapped later is not a stable mount. The kit never guesses a
+  # library location. An external disk bound into the home is fine.
+  # YAML-hostile characters are rejected because the path rides into
+  # the recipe's compose file.
+  local _mh
+  [ -n "$MEDIA_PATH" ] || return 1
+  case "$MEDIA_PATH" in *'"'*|*\\*) return 1 ;; esac
+  [ -d "$MEDIA_PATH" ] || return 1
+  _mh="${OWNER_HOME:-}"
+  [ -z "$_mh" ] && [ -n "${SUDO_USER:-}" ] && [ "$SUDO_USER" != "root" ] && _mh=$(getent passwd "$SUDO_USER" 2>/dev/null | cut -d: -f6)
+  [ -z "$_mh" ] && _mh=$(getent passwd | awk -F: '$3>=1000 && $3<65534 {print $6; exit}' 2>/dev/null)
+  [ -n "$_mh" ] || return 1
+  safe_owner_path "$MEDIA_PATH" "$_mh" || return 1
+}
+if media_path_ok; then
+  # persist the validated path so later passes keep it without the
+  # installer flag being repeated
+  if grep -qs '^REDOUBT_MEDIA_PATH=' "$_ENV_TMP" 2>/dev/null; then
+    sed -i "s|^REDOUBT_MEDIA_PATH=.*|REDOUBT_MEDIA_PATH=$MEDIA_PATH|" "$_ENV_TMP"
+  else
+    echo "REDOUBT_MEDIA_PATH=$MEDIA_PATH" >> "$_ENV_TMP"
+  fi
+  kit_env_commit
+elif [ -n "$MEDIA_PATH" ]; then
+  dbg "WARNING: REDOUBT_MEDIA_PATH is not a safe owner path: the media tier stays off"
+fi
+# hardware transcoding is its own opt-in, default off: software
+# transcoding runs first, inside the resource limits in the recipe
+[ -n "${MEDIA_HWACC_FLAG:-}" ] && REDOUBT_MEDIA_HWACC="$MEDIA_HWACC_FLAG"
+case "${REDOUBT_MEDIA_HWACC:-}" in 1|0) ;; *) REDOUBT_MEDIA_HWACC=0 ;; esac
+if grep -qs '^REDOUBT_MEDIA_HWACC=' "$_ENV_TMP" 2>/dev/null; then
+  sed -i "s|^REDOUBT_MEDIA_HWACC=.*|REDOUBT_MEDIA_HWACC=$REDOUBT_MEDIA_HWACC|" "$_ENV_TMP"
+else
+  echo "REDOUBT_MEDIA_HWACC=$REDOUBT_MEDIA_HWACC" >> "$_ENV_TMP"
+fi
+kit_env_commit
+if [ "$MEDIA_ON" = "1" ]; then
+  # fail closed: an unpinned release or a missing library keeps the
+  # tier off, whatever else this pass would like to do
+  if [ -z "$MEDIA_JELLYFIN_DIGEST" ] || [ -z "$MEDIA_JELLYFIN_VERSION" ]; then
+    dbg "media tier: Jellyfin stage pending (MEDIA_JELLYFIN_DIGEST is empty until the release review fills it; digests are never guessed)"
+    MEDIA_ON=0
+  elif ! media_path_ok; then
+    dbg "media tier: Jellyfin stage pending (REDOUBT_MEDIA_PATH missing or not a safe owner path: the kit never guesses a library location)"
+    MEDIA_ON=0
+  fi
+fi
+if [ "$MEDIA_ON" = "1" ]; then
+  # the honest partial report: the tier is two services and only one
+  # of them is wired yet
+  dbg "media tier: partial on purpose: Jellyfin activates alone; Reiverr stays pending ($MEDIA_REIVERR_REASON)"
+  dbg "media tier: no torrent client, no port-forwarding, no plugin or automatic-library-deletion defaults: those stay behind a separate owner decision and are not enabled"
+  if [ "${REDOUBT_MEDIA_HWACC:-0}" != "1" ]; then
+    dbg "media tier: transcode check: pending (REDOUBT_MEDIA_HWACC is off: software transcoding stays the default, inside the recipe's resource limits)"
+  fi
+  # the edge doors: two free ports from the service block, chosen under
+  # the builder's own lock and saved in the env, so re-runs keep the
+  # same links and the builder re-checks them before use. The built
+  # service's own meta wins for Jellyfin when it exists. The Reiverr
+  # slot stays reserved and closed: no meta, no site, no tile, and an
+  # explicit off gate so even a future build would start closed.
+  MEDIA_JELLYFIN_DOOR="${MEDIA_JELLYFIN_DOOR:-}"
+  MEDIA_REIVERR_DOOR="${MEDIA_REIVERR_DOOR:-}"
+  if [ -f "$MEDIA_JELLYFIN_SVC_DIR/meta" ]; then
+    _mj_meta_door=$(sed -n 's/^DOOR=//p' "$MEDIA_JELLYFIN_SVC_DIR/meta" 2>/dev/null || true)
+    [ -n "$_mj_meta_door" ] && MEDIA_JELLYFIN_DOOR="$_mj_meta_door"
+  fi
+  _mj_taken=0
+  if [ -n "$MEDIA_JELLYFIN_DOOR" ]; then
+    for _mjm in /opt/redoubt/services/*/meta; do
+      [ -f "$_mjm" ] || continue
+      [ "$_mjm" = "$MEDIA_JELLYFIN_SVC_DIR/meta" ] && continue
+      [ "$(sed -n 's/^DOOR=//p' "$_mjm" 2>/dev/null)" = "$MEDIA_JELLYFIN_DOOR" ] && _mj_taken=1
+    done
+  fi
+  [ "$_mj_taken" = "1" ] && MEDIA_JELLYFIN_DOOR=""
+  if [ -n "$MEDIA_REIVERR_DOOR" ]; then
+    for _mjm in /opt/redoubt/services/*/meta; do
+      [ -f "$_mjm" ] || continue
+      [ "$(sed -n 's/^DOOR=//p' "$_mjm" 2>/dev/null)" = "$MEDIA_REIVERR_DOOR" ] && MEDIA_REIVERR_DOOR=""
+    done
+  fi
+  [ -n "$MEDIA_REIVERR_DOOR" ] && [ "$MEDIA_REIVERR_DOOR" = "$MEDIA_JELLYFIN_DOOR" ] && MEDIA_REIVERR_DOOR=""
+  if [ -z "$MEDIA_JELLYFIN_DOOR" ] || [ -z "$MEDIA_REIVERR_DOOR" ] || [ -z "${SVC_PORT_LO:-}" ]; then
+    if [ -n "${SVC_PORT_LO:-}" ]; then
+      # the same lock file redoubt-svc flocks: the two allocators
+      # cannot race each other for a door
+      exec 9>/run/redoubt-svc.lock
+      flock -w 120 9 || true
+      _mj_used=""
+      for _mjm in /opt/redoubt/services/*/meta; do
+        [ -f "$_mjm" ] || continue
+        _mj_used="$_mj_used $(sed -n 's/^DOOR=//p' "$_mjm" 2>/dev/null)"
+      done
+      # a still-valid reservation counts as used: a fresh pick never
+      # lands on a kept one
+      [ -n "$MEDIA_JELLYFIN_DOOR" ] && _mj_used="$_mj_used $MEDIA_JELLYFIN_DOOR"
+      [ -n "$MEDIA_REIVERR_DOOR" ] && _mj_used="$_mj_used $MEDIA_REIVERR_DOOR"
+      for _mjd in $(seq "$SVC_PORT_LO" $((SVC_PORT_LO + SVC_PORT_N - 1))); do
+        case " $_mj_used " in
+          *" $_mjd "*) continue ;;
+          *)
+            if [ -z "$MEDIA_JELLYFIN_DOOR" ]; then
+              MEDIA_JELLYFIN_DOOR="$_mjd"; _mj_used="$_mj_used $_mjd"
+            elif [ -z "$MEDIA_REIVERR_DOOR" ]; then
+              MEDIA_REIVERR_DOOR="$_mjd"; _mj_used="$_mj_used $_mjd"
+            else
+              break
+            fi
+            ;;
+        esac
+      done
+      flock -u 9 2>/dev/null || true
+    else
+      # no service block on this box: a door without the block is not
+      # a door, drop both reservations like the Home Assistant pass
+      MEDIA_JELLYFIN_DOOR=""
+      MEDIA_REIVERR_DOOR=""
+    fi
+  fi
+  if [ -n "$MEDIA_JELLYFIN_DOOR" ]; then
+    sed -i '/^MEDIA_JELLYFIN_DOOR=/d' "$_ENV_TMP"
+    echo "MEDIA_JELLYFIN_DOOR=$MEDIA_JELLYFIN_DOOR" >> "$_ENV_TMP"
+    kit_env_commit
+    dbg "OK: media door reserved (Jellyfin $MEDIA_JELLYFIN_DOOR)"
+  else
+    dbg "WARNING: no free service door: the media tier stays off on this box"
+    MEDIA_ON=0
+  fi
+  if [ -n "$MEDIA_REIVERR_DOOR" ]; then
+    sed -i '/^MEDIA_REIVERR_DOOR=/d' "$_ENV_TMP"
+    echo "MEDIA_REIVERR_DOOR=$MEDIA_REIVERR_DOOR" >> "$_ENV_TMP"
+    kit_env_commit
+    dbg "OK: media door slot reserved for the pending Reiverr workflow ($MEDIA_REIVERR_DOOR, kept closed)"
+  fi
+  # the reserved slot stays closed: the off gate is the explicit
+  # marker that Reiverr may not open, only a future wired pass flips it
+  mkdir -p "$MEDIA_GATE_DIR"
+  printf 'off\n' > "$MEDIA_GATE_DIR/reiverr"
+  chmod 644 "$MEDIA_GATE_DIR/reiverr" 2>/dev/null || true
+else
+  # walking it back: both services stop, the edge site and the panel
+  # tile go, and the media library, the Jellyfin /config volume and
+  # any credentials all stay (the named volume survives a compose
+  # down; the media path is a read-only mount the kit never touches).
+  # The gate files keep the builder from re-rendering the sites too.
+  mkdir -p "$MEDIA_GATE_DIR"
+  printf 'off\n' > "$MEDIA_GATE_DIR/jellyfin"
+  chmod 644 "$MEDIA_GATE_DIR/jellyfin" 2>/dev/null || true
+  printf 'off\n' > "$MEDIA_GATE_DIR/reiverr"
+  chmod 644 "$MEDIA_GATE_DIR/reiverr" 2>/dev/null || true
+  if [ -f "$MEDIA_JELLYFIN_SVC_DIR/compose.yml" ]; then
+    docker compose -f "$MEDIA_JELLYFIN_SVC_DIR/compose.yml" down >/dev/null 2>&1 || true
+  fi
+  rm -f "$STACKDIR/caddy-services/jellyfin.caddy" 2>/dev/null || true
+  if docker ps --format '{{.Names}}' 2>/dev/null | grep -qx redoubt-edge-local-1; then
+    docker exec redoubt-edge-local-1 caddy reload --config /etc/caddy/Caddyfile --adapter caddyfile >/dev/null 2>&1 \
+      || docker restart redoubt-edge-local-1 >/dev/null 2>&1 || true
+  fi
+  systemctl disable --now redoubt-media-gate.service >/dev/null 2>&1 || true
+  rm -f /etc/systemd/system/redoubt-media-gate.service /usr/local/sbin/redoubt-media-gate 2>/dev/null || true
+fi
+# the media tile seeds only when the tier reconciled on this pass (a
+# reviewed Jellyfin pin, a valid library path and a reserved door);
+# the fail-closed states above leave MEDIA_ON=0, so no dead tile
+# survives
+SEED_MEDIA=""
+[ "$MEDIA_ON" = "1" ] && [ -n "${MEDIA_JELLYFIN_DOOR:-}" ] && SEED_MEDIA="https://${SEED_HOST}:${MEDIA_JELLYFIN_DOOR}"
+
 SEED_SECTIONS="full"
 [ "$MESH_MODE" = "selfhost" ] && SEED_SECTIONS="minimal"
+# the remote desktop tile seeds only when the owner asked for the
+# gateway: a board without it keeps the clock row as it was
+SEED_GUAC=""
+[ "${REDOUBT_GUAC:-0}" = "1" ] && SEED_GUAC="https://${SEED_HOST}:$PORT_EDGE6"
+# the Home Assistant tile seeds only when the owner asked for it and a
+# door was reserved for it this pass
+SEED_HA=""
+[ "${REDOUBT_HA:-0}" = "1" ] && [ -n "${HA_DOOR:-}" ] && SEED_HA="https://${SEED_HOST}:${HA_DOOR}"
+# the mail tile seeds only when the tier reconciled on this pass (a
+# reviewed pin, a valid domain and roster, and a reserved door); the
+# fail-closed states above leave MAIL_ON=0, so no dead tile survives
+SEED_MAIL=""
+[ "$MAIL_ON" = "1" ] && [ -n "${MAIL_DOOR:-}" ] && SEED_MAIL="https://${SEED_HOST}:${MAIL_DOOR}"
+# the guardian's panel MCP key: only the id rides into the seed (it is
+# not secret), so the seed can keep a key that still exists instead of
+# minting a new one every pass. The tr keeps a damaged file from
+# injecting anything into the sourced env block.
+SEED_MCP_ID=$(cut -d. -f1 /etc/redoubt/homarr-mcp.key 2>/dev/null | tr -cd 'a-z0-9' || true)
 # exec only reaches a running container: a homarr left in Created made
 # the gate wait out its whole window and skip the seed. Bring it up
 # first, and nudge it again every 5 minutes of the 15-minute window.
@@ -5267,9 +6168,17 @@ for _i in $(seq 1 90); do
   sleep 10
 done
 if docker compose -f "$STACKDIR/docker-compose.yml" exec -T homarr sh -c 'test -f /appdata/db/db.sqlite' >/dev/null 2>&1; then
-  # the vault path resolves for real in section 8; the seed asks first
-  # on headless passes, so pin a default here or set -u trips
-  [ -z "${MYREDOUBT:-}" ] && MYREDOUBT="${OWNER_HOME:-/home/owner}/Documents/My Redoubt"
+  # the vault path resolves for real in section 8, so a default is
+  # pinned here for headless passes (or set -u trips). The Linux owner
+  # is resolved before the recovery read, never after: Access.txt may
+  # only come from that owner's own mounted vault, so a fallback home
+  # can never hand a stranger's password to the seed
+  _SEED_HOME="${OWNER_HOME:-}"
+  [ -z "$_SEED_HOME" ] && [ -n "${SUDO_USER:-}" ] && [ "$SUDO_USER" != "root" ] && _SEED_HOME=$(getent passwd "$SUDO_USER" 2>/dev/null | cut -d: -f6)
+  [ -z "$_SEED_HOME" ] && _SEED_HOME=$(getent passwd | awk -F: '$3>=1000 && $3<65534 {print $6; exit}' 2>/dev/null)
+  # MYREDOUBT follows the resolved owner's home, never a literal
+  # /home/owner guess, so the mount and uid checks below agree with it
+  [ -z "${MYREDOUBT:-}" ] && MYREDOUBT="${_SEED_HOME:-${OWNER_HOME:-/home/owner}}/Documents/My Redoubt"
   # the vault (Access.txt) is the truth the owner types. A re-run can
   # hold a divergent pass in the env (the panel user then drifts from
   # the vault), so the seed always hashes the vault pass. The read
@@ -5277,7 +6186,10 @@ if docker compose -f "$STACKDIR/docker-compose.yml" exec -T homarr sh -c 'test -
   # dir holds no truth and must not override the env pass.
   _SEED_PASS="$OWNER_PASS"
   _VAULT_PASS=""
-  if mountpoint -q "$MYREDOUBT" 2>/dev/null; then
+  if [ -n "$_SEED_HOME" ] && mountpoint -q "$MYREDOUBT" 2>/dev/null \
+     && safe_owner_path "$MYREDOUBT/Access.txt" "$_SEED_HOME" \
+     && [ -f "$MYREDOUBT/Access.txt" ] \
+     && [ "$(stat -c %u "$MYREDOUBT/Access.txt" 2>/dev/null)" = "$(stat -c %u "$_SEED_HOME" 2>/dev/null)" ]; then
     _VAULT_PASS=$(awk -F': ' '/^[[:space:]]*pass:/ {print $2; exit}' "$MYREDOUBT/Access.txt" 2>/dev/null || true)
   fi
   [ -n "$_VAULT_PASS" ] && _SEED_PASS="$_VAULT_PASS"
@@ -5298,6 +6210,11 @@ SEED_PIHOLE=https://${SEED_HOST}:$PORT_EDGE5/admin
 SEED_WHEREAMI=/whereami
 SEED_CONSOLE=$SEED_CONSOLE
 SEED_CONSOLE_PING=$SEED_CONSOLE_PING
+SEED_GUAC=$SEED_GUAC
+SEED_HA=$SEED_HA
+SEED_MAIL=$SEED_MAIL
+SEED_MEDIA=$SEED_MEDIA
+SEED_MCP_ID=$SEED_MCP_ID
 __SEED_JS__
 SEEDENV
     cat <<'SEEDJS'
@@ -5359,6 +6276,72 @@ SEEDENV
       icon: "/icons/netbird.svg",
       href: process.env.SEED_CONSOLE,
       ping: process.env.SEED_CONSOLE_PING || null });
+  }
+  if (process.env.SEED_GUAC) {
+    // the ping targets the webapp's context path: the bare root
+    // answers 404 and would paint a red dot on a live gateway
+    APPS.push({ id: "redoubt-app-guac", name: "Remote Desktop",
+      icon: "/icons/guacamole.svg",
+      href: process.env.SEED_GUAC + "/",
+      ping: "http://guacamole:8080/guacamole/" });
+  }
+  if (process.env.SEED_HA) {
+    // the ping targets the container's own http port: the edge door
+    // answers browsers with the local CA, while the panel's
+    // server-side ping reaches the container on the stack network
+    APPS.push({ id: "redoubt-app-homeassistant", name: "Home Assistant",
+      icon: "/icons/home-assistant.svg",
+      href: process.env.SEED_HA,
+      ping: "http://svc-homeassistant:8123" });
+  } else {
+    // a disabled gateway removes its kit-owned tile on every pass: the
+    // app row and every item that references it go, so a later
+    // REDOUBT_HA=0 never leaves a dead tile on the board
+    var haRows = db.prepare("SELECT id FROM item WHERE kind = 'app' AND options LIKE '%redoubt-app-homeassistant%'").all();
+    for (var h = 0; h < haRows.length; h++) {
+      db.prepare("DELETE FROM item_layout WHERE item_id = ?").run(haRows[h].id);
+      db.prepare("DELETE FROM item WHERE id = ?").run(haRows[h].id);
+    }
+    db.prepare("DELETE FROM app WHERE id = 'redoubt-app-homeassistant'").run();
+  }
+  if (process.env.SEED_MAIL) {
+    // the ping targets the Bulwark webmail container, the door's own
+    // backend: the edge door answers browsers with the local CA,
+    // while the panel's server-side ping reaches the mail project
+    // directly. The store keeps its admin listener on its own alias.
+    APPS.push({ id: "redoubt-app-mail", name: "Mail",
+      icon: "/icons/mail.svg",
+      href: process.env.SEED_MAIL,
+      ping: "http://svc-mail-web:8080" });
+  } else {
+    // a disabled mail tier removes its kit-owned tile on every pass:
+    // the app row and every item that references it go, so a later
+    // REDOUBT_MAIL=0 never leaves a dead tile on the board
+    var mailRows = db.prepare("SELECT id FROM item WHERE kind = 'app' AND options LIKE '%redoubt-app-mail%'").all();
+    for (var m = 0; m < mailRows.length; m++) {
+      db.prepare("DELETE FROM item_layout WHERE item_id = ?").run(mailRows[m].id);
+      db.prepare("DELETE FROM item WHERE id = ?").run(mailRows[m].id);
+    }
+    db.prepare("DELETE FROM app WHERE id = 'redoubt-app-mail'").run();
+  }
+  if (process.env.SEED_MEDIA) {
+    // the ping targets Jellyfin's own http port on the stack network:
+    // the edge door answers browsers with the local CA, while the
+    // panel's server-side ping reaches the container directly
+    APPS.push({ id: "redoubt-app-jellyfin", name: "Jellyfin",
+      icon: "/icons/jellyfin.svg",
+      href: process.env.SEED_MEDIA,
+      ping: "http://svc-jellyfin:8096" });
+  } else {
+    // a disabled media tier removes its kit-owned tile on every pass:
+    // the app row and every item that references it go, so a later
+    // REDOUBT_MEDIA=0 never leaves a dead tile on the board
+    var jfRows = db.prepare("SELECT id FROM item WHERE kind = 'app' AND options LIKE '%redoubt-app-jellyfin%'").all();
+    for (var jf = 0; jf < jfRows.length; jf++) {
+      db.prepare("DELETE FROM item_layout WHERE item_id = ?").run(jfRows[jf].id);
+      db.prepare("DELETE FROM item WHERE id = ?").run(jfRows[jf].id);
+    }
+    db.prepare("DELETE FROM app WHERE id = 'redoubt-app-jellyfin'").run();
   }
 
   var uuid = function () {
@@ -5586,6 +6569,48 @@ SEEDENV
   // instead of deleting, so a pass never re-arms the wizard for a
   // device that already walked it
   db.prepare("UPDATE onboarding SET step = 'finish' WHERE step != 'finish'").run();
+
+  // the guardian drives the panel through its MCP server, which accepts
+  // an "ApiKey: <id>.<token>" header. The key is minted here, next to the
+  // admin it acts for, so the row is born with the right owner. A failure
+  // must not cost the owner the rest of the seed: it logs and moves on,
+  // and the guardian wiring fails closed later on the missing key.
+  try {
+    var crypto = require("crypto");
+    var keyCols = db.prepare('PRAGMA table_info("apiKey")').all().map(function (c) { return c.name; });
+    if (keyCols.length === 0) { throw new Error("no apiKey table"); }
+    // our keys carry a fixed id prefix: a re-mint revokes only what the
+    // kit made and never touches keys the owner created by hand
+    var keepId = /^redoubtmcp[0-9a-f]{14}$/.test(process.env.SEED_MCP_ID || "") ? process.env.SEED_MCP_ID : "";
+    var keyRow = keepId ? db.prepare('SELECT api_key FROM "apiKey" WHERE id = ?').get(keepId) : null;
+    // a 64-hex api_key is the kit's legacy sha256 row: it can never
+    // verify under the bcrypt scheme, so treat it as absent and re-mint
+    var legacySha = keyRow && /^[0-9a-f]{64}$/.test(keyRow.api_key);
+    if (!keepId || !keyRow || legacySha) {
+      db.prepare('DELETE FROM "apiKey" WHERE id LIKE ?').run("redoubtmcp%");
+      // 24 lowercase alnum chars, the shape of homarr's own ids. The
+      // token is 64 hex: no "." to break the header split.
+      var keyId = "redoubtmcp" + crypto.randomBytes(7).toString("hex");
+      var token = crypto.randomBytes(32).toString("hex");
+      // homarr 2.13.0 verifies api tokens with bcrypt at cost 10 (the
+      // rabbit confirmed it in the tagged source); a sha256 digest can
+      // never pass that compare, so hash with the same algorithm
+      var apiKey = bcrypt.hashSync(token, 10);
+      var names = ["id", "api_key", "user_id"];
+      var vals = [keyId, apiKey, uid];
+      // the guardian edits boards and apps: a read-only key would list
+      // the tools and then fail on every write
+      if (keyCols.indexOf("read_only") !== -1) { names.push("read_only"); vals.push(0); }
+      db.prepare('INSERT INTO "apiKey" (' + names.join(", ") + ") VALUES (" +
+        names.map(function () { return "?"; }).join(", ") + ")").run(vals);
+      // the plaintext leaves through a 600 file, never stdout: SEED_OUT
+      // lands in the kit log on the warning path
+      fs.writeFileSync("/appdata/.redoubt-mcp.new", keyId + "." + token, { mode: 384 });
+      console.log("homarr seed: mcp key minted");
+    }
+  } catch (err) {
+    console.log("homarr seed: mcp key skipped (" + err.message + ")");
+  }
   console.log("homarr seed: done");
 })();
 SEEDJS
@@ -5593,6 +6618,26 @@ SEEDJS
     homarr sh -c 'cat > /appdata/seed.in && sed -n "/^__SEED_JS__\$/q;p" /appdata/seed.in > /appdata/seed.env && sed -n "/^__SEED_JS__\$/,\$p" /appdata/seed.in | tail -n +2 > /appdata/seed.js && set -a && . /appdata/seed.env && set +a && node /appdata/seed.js; rc=$?; rm -f /appdata/seed.js /appdata/seed.env /appdata/seed.in; exit $rc' )
   if printf '%s' "$SEED_OUT" | grep -qE "homarr seed: done"; then
     dbg "OK: panel seeded (admin, tiles, branding)"
+    # the admin exists now: first-run onboarding can no longer be
+    # claimed by a stranger, so the panel edge opens
+    photos_guard "$PORT_EDGE4" off
+    # a freshly minted MCP key moves out of the panel volume into a
+    # root-only file on the host, the single source the guardian wiring
+    # reads. The volume copy goes in the same exec: if the host write then
+    # fails, the next pass finds no id and simply mints a new key.
+    _MCP_NEW=$(docker compose -f "$STACKDIR/docker-compose.yml" exec -T homarr sh -c \
+      'if [ -f /appdata/.redoubt-mcp.new ]; then cat /appdata/.redoubt-mcp.new; rm -f /appdata/.redoubt-mcp.new; fi' 2>/dev/null || true)
+    case "$_MCP_NEW" in
+      redoubtmcp[0-9a-f]*.[0-9a-f]*)
+        ( umask 077; printf '%s\n' "$_MCP_NEW" > /etc/redoubt/homarr-mcp.key.tmp ) \
+          && mv -f /etc/redoubt/homarr-mcp.key.tmp /etc/redoubt/homarr-mcp.key \
+          && chmod 600 /etc/redoubt/homarr-mcp.key \
+          && dbg "OK: panel MCP key stored for the guardian"
+        ;;
+      "") ;;
+      *) dbg "WARN: panel MCP key handoff malformed, a re-run mints a fresh one" ;;
+    esac
+    unset _MCP_NEW
   else
     dbg "WARN: panel seed returned unexpected output: $(printf '%s' "$SEED_OUT" | tail -2)"
   fi
@@ -5661,6 +6706,14 @@ if [ "${REDOUBT_WELCOME:-1}" = "1" ]; then
   # so a browser without the local CA still renders it (a jsdelivr url
   # would hand it the cdn host's cert and drop a ghost on the lan)
   cp "/var/lib/redoubt/caddy-local/cdn/gh/homarr-labs/dashboard-icons/svg/netbird.svg" "/var/lib/redoubt/caddy-local/icons/netbird.svg" 2>/dev/null || true
+  cp "/var/lib/redoubt/caddy-local/cdn/gh/homarr-labs/dashboard-icons/svg/guacamole.svg" "/var/lib/redoubt/caddy-local/icons/guacamole.svg" 2>/dev/null || true
+  cp "/var/lib/redoubt/caddy-local/cdn/gh/homarr-labs/dashboard-icons/svg/home-assistant.svg" "/var/lib/redoubt/caddy-local/icons/home-assistant.svg" 2>/dev/null || true
+  # the review confirms this slug once the mail tile goes live; a miss
+  # here only leaves the tile iconless, never breaks the board
+  cp "/var/lib/redoubt/caddy-local/cdn/gh/homarr-labs/dashboard-icons/svg/mail.svg" "/var/lib/redoubt/caddy-local/icons/mail.svg" 2>/dev/null || true
+  # the review confirms this slug once the media tile goes live; a miss
+  # here only leaves the tile iconless, never breaks the board
+  cp "/var/lib/redoubt/caddy-local/cdn/gh/homarr-labs/dashboard-icons/svg/jellyfin.svg" "/var/lib/redoubt/caddy-local/icons/jellyfin.svg" 2>/dev/null || true
   fetch_icon_set "png" \
     "https://install.tryredoubt.com/install/icons-png.tar.gz" \
     "62fe3de3c0063620439024de5eab6b3e3351a21e248cf780e49c21dd42252b18" \
@@ -5749,34 +6802,34 @@ ICNTMR
   # trivy: the stack's security scanner. It audits every container
   # image against the public CVE feeds and the compose file for
   # misconfigs and leaked secrets, then drops a readable report in the
-  # scan dir. The binary comes from the upstream GitHub release (sha
-  # pinned); the scan itself runs weekly through a systemd timer and
-  # once shortly after the first boot. Read-only: it never touches the
-  # running containers.
-  TRIVY_SHA="d1dfca6ae10a1ad4540bb94e64f0510077c47008920a9b554986b39dca573d83"
-  # the pinned release is x86_64 only: skip other arches before the
+  # scan dir. The binary floats on the upstream release: trivy bumps
+  # often (CVE feeds and fixes), and a hard binary pin goes stale and
+  # silently kills the owner's scanner, so the release tag is resolved
+  # fresh each pass and the download is verified against the vendor
+  # checksums file of that same release. Read-only: it never touches
+  # the running containers.
+  # the upstream release is x86_64 only: skip other arches before the
   # download instead of failing a checksum that can never match
-  [ "$(uname -m 2>/dev/null || true)" = "x86_64" ] || { dbg "WARN: no pinned trivy build for this arch, the weekly scan stays off"; return 1; }
-  # re-compare the installed binary on every pass: a bumped pin must
-  # replace the old scanner instead of riding it silently
-  if [ ! -x /opt/redoubt/bin/trivy ] \
-     || [ "$(sha256sum /opt/redoubt/bin/trivy 2>/dev/null | cut -d' ' -f1)" != "$TRIVY_SHA" ]; then
+  [ "$(uname -m 2>/dev/null || true)" = "x86_64" ] || { dbg "WARN: no trivy build for this arch, the weekly scan stays off"; return 1; }
+  _TV_TAG=$(curl -fsSL --max-time 30 "https://api.github.com/repos/aquasecurity/trivy/releases/latest" 2>/dev/null | sed -n 's/.*"tag_name": *"\([^"]*\)".*/\1/p' | head -1)
+  [ -n "$_TV_TAG" ] || { dbg "WARN: trivy: latest release lookup failed, the weekly scan stays off"; return 1; }
+  # re-download only when the installed release tag is older than the
+  # resolved one: the floating scanner still avoids churn on every pass
+  if [ ! -x /opt/redoubt/bin/trivy ] || [ "$(cat /opt/redoubt/bin/trivy-release 2>/dev/null)" != "$_TV_TAG" ]; then
     mkdir -p /opt/redoubt/bin
-    # the tarball sha differs from the binary sha: the tarball is
-    # verified against the vendor's checksums file, and the extracted
-    # binary against the pin above. Downloads live in a private
-    # mktemp dir so nobody can plant a fixed /tmp file under root.
+    # downloads live in a private mktemp dir so nobody can plant a
+    # fixed /tmp file under root
     TRIVY_TMP=$(mktemp -d /tmp/redoubt-trivy.XXXXXX) || { dbg "WARN: trivy: no temp dir"; return 1; }
     chmod 700 "$TRIVY_TMP"
     # one step at a time with its exit code and curl stderr in the log:
     # the old and-chain folded five different failures into one WARN
-    _TV_URL="https://github.com/aquasecurity/trivy/releases/download/v0.76.1"
-    _TV_TGZ="trivy_0.76.1_Linux-64bit.tar.gz"
+    _TV_URL="https://github.com/aquasecurity/trivy/releases/download/$_TV_TAG"
+    _TV_TGZ="trivy_${_TV_TAG#v}_Linux-64bit.tar.gz"
     _TV_OK=0
     curl -fsSL --max-time 600 -o "$TRIVY_TMP/trivy.tar.gz" "$_TV_URL/$_TV_TGZ" 2>"$TRIVY_TMP/curl1.err"
     _RC=$?; dbg "trivy: tarball curl rc=$_RC $(tr '\n' ' ' < "$TRIVY_TMP/curl1.err")"
     if [ $_RC -eq 0 ]; then
-      curl -fsSL --max-time 60 -o "$TRIVY_TMP/checksums.txt" "$_TV_URL/trivy_0.76.1_checksums.txt" 2>"$TRIVY_TMP/curl2.err"
+      curl -fsSL --max-time 60 -o "$TRIVY_TMP/checksums.txt" "$_TV_URL/trivy_${_TV_TAG#v}_checksums.txt" 2>"$TRIVY_TMP/curl2.err"
       _RC=$?; dbg "trivy: checksums curl rc=$_RC $(tr '\n' ' ' < "$TRIVY_TMP/curl2.err")"
     fi
     if [ $_RC -eq 0 ]; then
@@ -5787,17 +6840,14 @@ ICNTMR
       _RC=$?; dbg "trivy: vendor checksum rc=$_RC (tarball sha $_TV_HASH)"
     fi
     if [ $_RC -eq 0 ]; then
-      tar -xzf "$TRIVY_TMP/trivy.tar.gz" -C "$TRIVY_TMP" trivy 2>"$TRIVY_TMP/tar.err"
+      tar_member "$TRIVY_TMP/trivy.tar.gz" trivy "$TRIVY_TMP/trivy" 2>"$TRIVY_TMP/tar.err"
       _RC=$?; dbg "trivy: tar rc=$_RC $(tr '\n' ' ' < "$TRIVY_TMP/tar.err")"
-    fi
-    if [ $_RC -eq 0 ]; then
-      _TV_BIN=$(sha256sum "$TRIVY_TMP/trivy" | cut -d' ' -f1)
-      [ "$_TV_BIN" = "$TRIVY_SHA" ] && _TV_OK=1
-      dbg "trivy: binary sha $_TV_BIN pin $TRIVY_SHA match=$_TV_OK"
+      [ $_RC -eq 0 ] && _TV_OK=1
     fi
     if [ $_TV_OK -eq 1 ]; then
       install -m 755 "$TRIVY_TMP/trivy" /opt/redoubt/bin/trivy
-      dbg "OK: trivy scanner installed (vendor checksum + pinned binary sha)"
+      printf '%s' "$_TV_TAG" > /opt/redoubt/bin/trivy-release
+      dbg "OK: trivy scanner installed (vendor checksum, release $_TV_TAG)"
     else
       dbg "WARN: trivy did not download (the weekly scan stays off; re-run the kit to retry)"
     fi
@@ -6032,16 +7082,20 @@ CERT_URL="https://$REMOTE_HOST:$PORT_EDGE1/root-ca.crt"
         FF_NAILED=0
         pgrep -x firefox >/dev/null 2>&1 && FF_RUNNING=1
         pgrep -x firefox-esr >/dev/null 2>&1 && FF_RUNNING=1
+        _CA_PUB=$(mktemp /tmp/redoubt-ca.XXXXXX) && cp "$CA_CRT" "$_CA_PUB" && chmod 644 "$_CA_PUB"
         for PF in /home/*/.mozilla/firefox/*.default* /home/*/.mozilla/firefox/*.default-release \
                   /home/*/.config/mozilla/firefox/*.default* /home/*/.config/mozilla/firefox/*.default-release; do
-          [ -d "$PF" ] || continue
-          while certutil -L -d "sql:$PF" 2>/dev/null | grep -q "Redoubt Local CA"; do
-            certutil -D -d "sql:$PF" -n "Redoubt Local CA" >/dev/null 2>&1 || break
+          [ -d "$PF" ] && [ ! -L "$PF" ] || continue
+          _PF_OWN=$(stat -c %U "$PF" 2>/dev/null || true)
+          case "$_PF_OWN" in ""|root|UNKNOWN*) continue ;; esac
+          while runuser -u "$_PF_OWN" -- certutil -L -d "sql:$PF" 2>/dev/null | grep -q "Redoubt Local CA"; do
+            runuser -u "$_PF_OWN" -- certutil -D -d "sql:$PF" -n "Redoubt Local CA" >/dev/null 2>&1 || break
           done
           FF_PROFILES=$((FF_PROFILES + 1))
-          certutil -A -d "sql:$PF" -n "Redoubt Local CA" -t "CT,," -i "$CA_CRT" >/dev/null 2>&1 \
+          runuser -u "$_PF_OWN" -- certutil -A -d "sql:$PF" -n "Redoubt Local CA" -t "CT,," -i "$_CA_PUB" >/dev/null 2>&1 \
             && FF_NAILED=$((FF_NAILED + 1))
         done
+        rm -f "$_CA_PUB"
         if [ "$FF_NAILED" -gt 0 ]; then
           dbg "OK: Firefox trust imported into every profile (deduped, C, trust bits)"
           if [ "$FF_RUNNING" = "1" ]; then
@@ -6055,17 +7109,21 @@ CERT_URL="https://$REMOTE_HOST:$PORT_EDGE1/root-ca.crt"
           # classic and the XDG layout, and drop the trusted CA in it.
           # Firefox adopts the ready profile on its very first open and
           # the padlock is green before the owner ever touches it.
+          _CA_PUB=$(mktemp /tmp/redoubt-ca.XXXXXX) && cp "$CA_CRT" "$_CA_PUB" && chmod 644 "$_CA_PUB"
           for BASE in /home/*/.config/mozilla/firefox /home/*/.mozilla/firefox; do
             [ -d "$(dirname "$BASE")" ] || continue
-            _FF_OWN=$(stat -c %U "$(dirname "$(dirname "$BASE")")" 2>/dev/null || true)
+            _FF_HOME="${BASE%%/.*}"
+            [ -L "$_FF_HOME" ] && continue
+            _FF_OWN=$(stat -c %U "$_FF_HOME" 2>/dev/null || true)
+            case "$_FF_OWN" in ""|root|UNKNOWN*) continue ;; esac
             NEWPROF="$BASE/redoubt.default"
-            mkdir -p "$NEWPROF"
-            certutil -N -d "sql:$NEWPROF" --empty-password >/dev/null 2>&1
-            certutil -A -d "sql:$NEWPROF" -n "Redoubt Local CA" -t "CT,," -i "$CA_CRT" >/dev/null 2>&1 \
+            runuser -u "$_FF_OWN" -- mkdir -p "$NEWPROF" || continue
+            runuser -u "$_FF_OWN" -- certutil -N -d "sql:$NEWPROF" --empty-password >/dev/null 2>&1
+            runuser -u "$_FF_OWN" -- certutil -A -d "sql:$NEWPROF" -n "Redoubt Local CA" -t "CT,," -i "$_CA_PUB" >/dev/null 2>&1 \
               && FF_NAILED=$((FF_NAILED + 1))
             INI="$(dirname "$BASE")/profiles.ini"
-            if [ ! -f "$INI" ]; then
-              cat > "$INI" <<'PROFILES'
+            if [ ! -e "$INI" ] && [ ! -L "$INI" ]; then
+              runuser -u "$_FF_OWN" -- sh -c 'set -C; cat > "$1"' _ "$INI" <<'PROFILES'
 [General]
 StartWithLastProfile=1
 Version=2
@@ -6077,13 +7135,8 @@ Path=redoubt.default
 Default=1
 PROFILES
             fi
-            # the profile must belong to the home's owner: Firefox runs
-            # as them, and a root-owned profile cannot be written
-            if [ -n "$_FF_OWN" ] && [ "$_FF_OWN" != "root" ]; then
-              chown -R "$_FF_OWN" "$NEWPROF" 2>/dev/null || true
-              [ -f "$INI" ] && chown "$_FF_OWN" "$INI" 2>/dev/null || true
-            fi
           done
+          rm -f "$_CA_PUB"
           [ "$FF_NAILED" -gt 0 ] && \
             dbg "OK: Firefox trust pre-imported into a fresh profile (green padlock from the very first open)"
         fi
@@ -6293,6 +7346,14 @@ SCANNOTE
       WELCOME_STAGED=1
       dbg "WARNING: the owner's own vault mount holds My Redoubt - the welcome is staged and lands on the next pass"
     fi
+    if [ "$WELCOME_STAGED" = "0" ] && ! safe_owner_path "$MYREDOUBT"; then
+      dbg "WARNING: the welcome path crosses a symlink - staged instead"
+      MYREDOUBT_REAL="$MYREDOUBT"
+      MYREDOUBT=/var/lib/redoubt/welcome-pending
+      rm -rf "$MYREDOUBT"
+      install -d -m 700 "$MYREDOUBT"
+      WELCOME_STAGED=1
+    fi
     mkdir -p "$MYREDOUBT/Only for Thinkers"
     # A .directory file is the XFCE/Thunar-native way to pin the folder
     # icon (gvfs metadata is Nautilus-flavoured and gets written under
@@ -6305,7 +7366,8 @@ SCANNOTE
     # My Redoubt gets chowned below, but Documents is born here and
     # would stay root-only, locking the owner out of their own vault.
     # fix the parent right where it may be born.
-    chown "$(stat -c '%u:%g' "$OWNER_HOME")" "$OWNER_HOME/Documents" 2>/dev/null || true
+    safe_owner_path "$OWNER_HOME/Documents" \
+      && chown -h "$(stat -c '%u:%g' "$OWNER_HOME")" "$OWNER_HOME/Documents" 2>/dev/null || true
     # The folder wears the logo and the desktop gets a one-click
     # shortcut. gio metadata drives both, so no root tricks and no
     # launcher-trust prompts; the icon file lives in the kit's own dir.
@@ -6332,7 +7394,17 @@ SCANNOTE
       # entirely (seen on Rocky: the shortcut never appeared).
       # Hand it to the owner before the shortcut lands inside.
       chown "$(stat -c '%u:%g' "$OWNER_HOME")" "$DESKTOP_DIR" 2>/dev/null || true
-      cat > "$DESKTOP_DIR/My Redoubt.desktop" <<'DESKSHRT'
+      # the launcher is born under the owner's uid, same rule as the
+      # autostart entry: a root write plus a later chown and chmod on
+      # the leaf would follow a symlink the owner planted here, letting
+      # this pass truncate and re-own a file outside the desktop dir.
+      # set -C makes the shell create the leaf, never open an existing
+      # one, and the mode is applied inside the same owner shell.
+      DSK_OWNER="$(stat -c '%U' "$DESKTOP_DIR" 2>/dev/null)"
+      [ -n "${SUDO_USER:-}" ] && DSK_OWNER="$SUDO_USER"
+      [ -n "$DSK_OWNER" ] || DSK_OWNER="${OWNER_SYS_USER:-root}"
+      runuser -u "$DSK_OWNER" -- sh -c 'umask 022; rm -f "$1"; set -C; cat > "$1" && chmod 755 "$1"' \
+        _ "$DESKTOP_DIR/My Redoubt.desktop" <<'DESKSHRT'
 [Desktop Entry]
 Type=Application
 Name=My Redoubt
@@ -6341,11 +7413,10 @@ Exec=/usr/local/bin/redoubt-vault-open
 Icon=/var/lib/redoubt/caddy-local/logo.png
 Terminal=false
 DESKSHRT
-      DSK_OWNER="$(stat -c '%U' "$DESKTOP_DIR" 2>/dev/null)"
-      [ -n "${SUDO_USER:-}" ] && DSK_OWNER="$SUDO_USER"
-      chown "$DSK_OWNER":"$DSK_OWNER" "$DESKTOP_DIR/My Redoubt.desktop" 2>/dev/null || true
-      chmod 755 "$DESKTOP_DIR/My Redoubt.desktop" 2>/dev/null || true
-      gio set "$DESKTOP_DIR/My Redoubt.desktop" metadata::trusted true >/dev/null 2>&1 || true
+      # the trusted flag must land in the owner's own metadata store:
+      # as root it would be written for root and the desktop shell
+      # would still treat the launcher as untrusted
+      runuser -u "$DSK_OWNER" -- gio set "$DESKTOP_DIR/My Redoubt.desktop" metadata::trusted true >/dev/null 2>&1 || true
       # Fresh XFCE profiles sometimes lack the desktop-icons property
       # and xfdesktop stays silent with the launcher right there:
       # fill the default gap and reload the desktop as the owner so
@@ -6383,11 +7454,18 @@ DESKSHRT
       # The profile may live in .mozilla or .config/mozilla (Mint and
       # some XDG setups use the latter). Scan both, so the padlock never
       # depends on where the browser keeps its profile.
-      for PROF in "$OWNER_HOME"/.mozilla/firefox/* "$OWNER_HOME"/.config/mozilla/firefox/*; do
-        [ -d "$PROF" ] && [ -f "$PROF/cert9.db" ] || continue
-        certutil -A -n "Redoubt Local CA" -t "C,," -i "$CA_CRT" -d "sql:$PROF" >/dev/null 2>&1 \
-          && echo "OK: local CA into firefox profile (clean padlock, zero clicks)" && break
-      done
+      # NSS reads the profile's pkcs11 module config when it opens the
+      # database: certutil runs as the profile owner, never as root, so
+      # a user-selected shared library cannot load into the installer
+      _FX_OWN=$(stat -c '%U' "$OWNER_HOME" 2>/dev/null || true)
+      case "$_FX_OWN" in ""|root|UNKNOWN*) : ;; *)
+        for PROF in "$OWNER_HOME"/.mozilla/firefox/* "$OWNER_HOME"/.config/mozilla/firefox/*; do
+          [ -d "$PROF" ] && [ ! -L "$PROF" ] && [ -f "$PROF/cert9.db" ] || continue
+          runuser -u "$_FX_OWN" -- certutil -A -n "Redoubt Local CA" -t "C,," -i "$CA_CRT" -d "sql:$PROF" >/dev/null 2>&1 \
+            && echo "OK: local CA into firefox profile (clean padlock, zero clicks)" && break
+        done
+        ;;
+      esac
     fi
     # The iPhone profile: same CA, in the format iOS installs with one
     # tap from the Files app.
@@ -6494,11 +7572,15 @@ inject_ca_to_desktop() {
   fi
   # Chromium reads the owner's shared NSS db; create it empty when it
   # does not exist yet (Chromium picks it up all the same)
+  case "$_OU" in ""|root|UNKNOWN*) return 0 ;; esac
+  { [ -L "$_OH/.pki" ] || [ -L "$_OH/.pki/nssdb" ]; } && return 0
+  _CA_PUB=$(mktemp /tmp/redoubt-ca.XXXXXX) && cp "$_CA" "$_CA_PUB" && chmod 644 "$_CA_PUB" || return 0
   if [ ! -d "$_OH/.pki/nssdb" ]; then
-    mkdir -p "$_OH/.pki/nssdb" 2>/dev/null || return 0
-    certutil -d "sql:$_OH/.pki/nssdb" -N --empty-password >/dev/null 2>&1 || true
+    runuser -u "$_OU" -- mkdir -p "$_OH/.pki/nssdb" 2>/dev/null || { rm -f "$_CA_PUB"; return 0; }
+    runuser -u "$_OU" -- certutil -d "sql:$_OH/.pki/nssdb" -N --empty-password >/dev/null 2>&1 || true
   fi
-  certutil -d "sql:$_OH/.pki/nssdb" -A -t "C,," -n "Redoubt Root CA" -i "$_CA" >/dev/null 2>&1 || true
+  runuser -u "$_OU" -- certutil -d "sql:$_OH/.pki/nssdb" -A -t "C,," -n "Redoubt Root CA" -i "$_CA_PUB" >/dev/null 2>&1 || true
+  rm -f "$_CA_PUB"
   # merge into an existing policies.json: a clobber would wipe the
   # distro's own Firefox policies
   mkdir -p /etc/firefox/policies 2>/dev/null
@@ -6585,6 +7667,7 @@ FXPOLMERGE
      search  https://%s:%s
      panel   https://%s:%s' "$LAN_IP" "$LAN_HOST" "$PORT_EDGE1" "$LAN_HOST" "$PORT_EDGE2" "$LAN_HOST" "$PORT_EDGE3" "$LAN_HOST" "$PORT_EDGE4"
     fi
+    CA_FP=$(openssl x509 -in /var/lib/redoubt/caddy-local/caddy/pki/authorities/local/root.crt -noout -fingerprint -sha256 2>/dev/null | cut -d= -f2)
     cat > "$MYREDOUBT/Welcome Guide.txt" <<GUIDE
 Redoubt - welcome guide
 
@@ -6592,9 +7675,13 @@ Your cloud is up. This file is the quick tour.
 
 1. The lock (do this once)
    The apps speak https signed by your own local CA, so the phone must
-   trust it once: open http://${MESH_IP:-$LAN_IP}:8086/ca on the phone
-   and install the certificate (iPhone: Redoubt Root CA.mobileconfig;
-   Android: Redoubt Root CA.crt).
+   trust it once. The download is plain http and can be swapped on the
+   way, so check it first. This box's CA fingerprint (SHA-256):
+     ${CA_FP:-unavailable, run: redoubt guide on the box console}
+   Open http://${MESH_IP:-$LAN_IP}:8086/ca, compare the fingerprint
+   shown in the certificate details with the line above, and enable
+   trust only if every byte matches. Then install it (iPhone: Redoubt
+   Root CA.mobileconfig; Android: Redoubt Root CA.crt).
 $DESKTOP_CERT_LINE
    The not-secure warning goes away for good.
 
@@ -6653,7 +7740,13 @@ $MOBILE_KEY_VAL
         printf -v ACCESS_LAN_LINES 'home wifi:\n  photos  https://%s:%s\n  files   https://%s:%s\n  search  https://%s:%s\n  panel   https://%s:%s\n' "$LAN_HOST" "$PORT_EDGE1" "$LAN_HOST" "$PORT_EDGE2" "$LAN_HOST" "$PORT_EDGE3" "$LAN_HOST" "$PORT_EDGE4"
         ACCESS_WIFI=''
       fi
-    cat > "$MYREDOUBT/Access.txt" <<ACCESS
+    rm -f "$MYREDOUBT/Access.txt"
+    # set -C makes the redirect create the leaf, never open an existing
+    # one: a planted Access.txt symlink cannot steer this write outside
+    # the vault dir. The chmod below re-verifies the leaf for the same
+    # reason, because chmod follows a link the owner can plant between
+    # the two calls.
+    ( set -C; cat > "$MYREDOUBT/Access.txt" ) <<ACCESS
 Redoubt - your private cloud, ready.
 
 Photos:   https://${APPS_HOST}:$PORT_EDGE1
@@ -6676,7 +7769,12 @@ pass: $OWNER_PASS
 
 $MOBILE_BLOCK$ACCESS_GUIDE_LINE
 ACCESS
-    chmod 600 "$MYREDOUBT/Access.txt"
+    # the mode lands only on a regular file this pass could own: a
+    # symlink swapped in after the write would point the chmod at a
+    # protected target, so the leaf is checked again right before use
+    [ -f "$MYREDOUBT/Access.txt" ] && [ ! -L "$MYREDOUBT/Access.txt" ] \
+      && chmod 600 "$MYREDOUBT/Access.txt" \
+      || dbg "WARNING: Access.txt was not left as a regular file - the mode was not applied"
     # terminal QRs for machines without a screen: the CLI prints them
     # named and scannable straight off the monitor
     cat > /etc/redoubt/qr-payloads.txt <<QRPAY
@@ -7050,11 +8148,23 @@ WELCOMEHTML
   #     dies in a restart loop.
   if command -v curl >/dev/null 2>&1 && [ -n "${OWNER_PASS:-}" ]; then
     IMMICH_ADMIN='{"email":"'"${IMMICH_EMAIL:-owner@redoubt.local}"'","password":"'"$OWNER_PASS"'","name":"'"${OWNER_USER:-owner}"'"}'
+    IMMICH_ADMIN_OK=0
     for i in $(seq 1 30); do
-      RC=$(curl -s -o /dev/null -w '%{http_code}' --max-time 8 -X POST "http://127.0.0.1:$PORT_IMMICH/api/auth/admin-sign-up" -H "Content-Type: application/json" -d "$IMMICH_ADMIN" 2>/dev/null)
-      case "$RC" in 200|201) echo "OK: immich admin created"; break ;; 400) echo "OK: immich admin already set"; break ;; esac
+      # body and code together: immich answers 400 both for "admin
+      # exists" and for a rejected payload, only the first may open
+      R8C=$(printf '%s' "$IMMICH_ADMIN" | curl -s -w '\n%{http_code}' --max-time 8 -X POST "http://127.0.0.1:$PORT_IMMICH/api/auth/admin-sign-up" -H "Content-Type: application/json" --data-binary @- 2>/dev/null)
+      RC=${R8C##*$'\n'}
+      case "$RC:$R8C" in
+        200:*|201:*) echo "OK: immich admin created"; IMMICH_ADMIN_OK=1; break ;;
+        400:*already*|400:*"not available"*) echo "OK: immich admin already set"; IMMICH_ADMIN_OK=1; break ;;
+      esac
       sleep 10
     done
+    if [ "$IMMICH_ADMIN_OK" = "1" ]; then
+      photos_guard off
+    else
+      fail_line "immich admin not confirmed - the photos port stays closed"
+    fi
     NC_OK=""
     # nextcloud 35 no longer writes 'installed' => true to its config
     # (the $CONFIG format changed) and its entrypoint does not
@@ -7167,8 +8277,13 @@ NCPHP
     # container when the owner row already exists, or the customer
     # logs in again after every update
     DOCKGE_HAS=$(docker exec redoubt-dockge-1 node -e 'require("@louislam/sqlite3"); const d=new (require("@louislam/sqlite3").verbose()).Database("/app/data/dockge.db"); d.get("SELECT COUNT(*) AS c FROM user WHERE username = ? AND active = 1", ["owner"], function (e, r) { console.log(r && r.c ? r.c : 0); d.close(); });' 2>/dev/null)
-    if [ "$DOCKGE_HAS" = "1" ]; then
-      dbg "OK: dockge owner already set (session kept)"
+    # an active owner row only counts when its stored hash opens with the
+    # installer password: a local first-run claimant keeps a foreign
+    # password, its row fails the compare, and the upsert below takes
+    # the account back (the restart then drops its sessions)
+    DOCKGE_MATCH=$(printf '%s\n' "$DOCKGE_PASS" | docker exec -i redoubt-dockge-1 sh -c 'IFS= read -r DP; export DP; exec node -e "$1"' sh 'require("@louislam/sqlite3"); const bcrypt=require("bcryptjs"); const d=new (require("@louislam/sqlite3").verbose()).Database("/app/data/dockge.db"); d.get("SELECT password AS p FROM user WHERE username = ? AND active = 1", ["owner"], function (e, r) { console.log(r && bcrypt.compareSync(process.env.DP, r.p) ? "match" : "mismatch"); d.close(); });' 2>/dev/null)
+    if [ "$DOCKGE_HAS" = "1" ] && [ "$DOCKGE_MATCH" = "match" ]; then
+      dbg "OK: dockge owner verified (session kept)"
     else
       DOCKGE_OK=0
       for i in $(seq 1 30); do
@@ -7717,6 +8832,8 @@ table inet redoubt-dns {
     tcp dport 53 ip daddr != $ALLOW53 reject
     udp dport 853 ip daddr != { 9.9.9.9, 149.112.112.112 } reject
     tcp dport 853 ip daddr != { 9.9.9.9, 149.112.112.112 } reject
+    meta nfproto ipv6 udp dport { 53, 853 } ip6 daddr != ::1 reject
+    meta nfproto ipv6 tcp dport { 53, 853 } ip6 daddr != ::1 reject
   }
   chain forward {
     type filter hook forward priority filter; policy accept;
@@ -7767,7 +8884,11 @@ GUARDIAN_PORT=8642
 BRAIN_PORT=8686
 GATEWAY_SVC="hermes-gateway-cerberus"
 HERMES_INSTALL_URL="https://install.tryredoubt.com/hermes-install.sh"
-HERMES_INSTALL_SHA="50348fcc95e934d2f92b493b40fa2a4f22d58237184ef88ed69ad395531f1ad4"
+# pinned to the mirror copy, not to upstream: the mirror serves the
+# installer with the broken release tag patched, so this sha differs
+# from the Nous original on purpose. The watchdog stays paused while
+# upstream ships the broken tag; resuming re-pins to upstream.
+HERMES_INSTALL_SHA="80e95070abb28a0d34b60b02f9388e62c9e685c045015ac032d380de76e38e2e"
 GUARDIAN_PROFILE_URL="${REDOUBT_GUARDIAN_PROFILE_URL:-https://install.tryredoubt.com/install/guardian-profile.tar.gz}"
 GUARDIAN_PROFILE_SHA="246fbc95b66cefb26b06e9cca7cda4780bfff921ec3d0be2844a872718c54370"
 BRAIN_IMAGE="ghcr.io/ggml-org/llama.cpp:server@sha256:c77881bba21e863bc56391995511f361040952f7ed6033cf1589da7f77a04eff"
@@ -7957,7 +9078,16 @@ install_guardian_user() {
     useradd -r -m -s /bin/bash "$GUARDIAN_USER"
     gbar "guardian: user $GUARDIAN_USER created"
   fi
-  usermod -aG docker "$GUARDIAN_USER" 2>/dev/null || true
+  # no docker group for the guardian: any member can run a container
+  # that mounts /, which is root without a password. Cerberus reaches
+  # docker only through redoubt-svc (guardian_services). Older passes
+  # added the group, so take it back. The user manager keeps the groups
+  # it started with, so it restarts too (the gateway comes back later
+  # in this pass).
+  if id -nG "$GUARDIAN_USER" 2>/dev/null | tr ' ' '\n' | grep -qx docker; then
+    gpasswd -d "$GUARDIAN_USER" docker >/dev/null 2>&1 || true
+    systemctl try-restart "user@$(id -u "$GUARDIAN_USER").service" >/dev/null 2>&1 || true
+  fi
 }
 
 install_guardian_hermes() {
@@ -8216,14 +9346,14 @@ guardian_wire_assistant() {
   key=$(grep "^API_SERVER_KEY=" "/home/$GUARDIAN_USER/.hermes/profiles/cerberus/.env" | cut -d= -f2)
   # encrypt inside the panel container with its own SECRET_ENCRYPTION_KEY
   # (node lives there; the host has no guarantee of a crypto lib)
-  cipher=$(docker exec redoubt-homarr-1 node -e '
+  cipher=$(printf '%s' "$key" | docker exec -i redoubt-homarr-1 node -e '
     const c = require("crypto");
     const k = Buffer.from(process.env.SECRET_ENCRYPTION_KEY, "hex");
     const iv = c.randomBytes(16);
     const ci = c.createCipheriv("aes-256-cbc", k, iv);
-    const out = Buffer.concat([ci.update(process.argv[1], "utf8"), ci.final()]);
+    const out = Buffer.concat([ci.update(require("fs").readFileSync(0, "utf8"), "utf8"), ci.final()]);
     console.log(out.toString("hex") + "." + iv.toString("hex"));
-  ' "$key" 2>/dev/null)
+  ' 2>/dev/null)
   [ -n "$cipher" ] || { gbar "guardian: could not encrypt the api key"; return 1; }
 
   # roundtrip before the UPDATE: decrypt what we would store and compare
@@ -8268,6 +9398,121 @@ WIRE
   fi
 }
 
+guardian_wire_mcp() {
+  # Cerberus drives the panel (boards, apps, integrations) through the
+  # panel's own MCP server, never through the docker socket. It goes
+  # through the same edge the owner uses, so the panel sees a normal
+  # authenticated client and nothing new is exposed.
+  local keyf=/etc/redoubt/homarr-mcp.key
+  local pdir="/home/$GUARDIAN_USER/.hermes/profiles/cerberus"
+  local cfg="$pdir/config.yaml"
+  local ca="$pdir/redoubt-root-ca.crt"
+  local url="${PANEL_BASE}/api/mcp"
+  local hdr sid body py
+  [ -s "$keyf" ] || { gbar "guardian: no panel MCP key - MCP wiring skipped"; return 1; }
+  [ -f "$cfg" ] || { gbar "guardian: cerberus config missing - MCP wiring skipped"; return 1; }
+  # the edge serves the local CA's cert: the guardian needs its own
+  # readable copy, because the cert-share path belongs to the stack
+  install -o "$GUARDIAN_USER" -g "$GUARDIAN_USER" -m 644 \
+    /var/lib/redoubt/caddy-local/cert-share/root-ca.crt "$ca" 2>/dev/null \
+    || { gbar "guardian: local CA not found - MCP wiring skipped"; return 1; }
+
+  # probe before writing anything: the same url, CA and key Hermes will
+  # use. The response and the curl evidence stay in a private dir so a
+  # failure can be told apart (transport, HTTP status, auth or route),
+  # and the key survives so the next pass does not re-mint for nothing.
+  probe_dir=$(mktemp -d) || { gbar "guardian: cannot create MCP probe directory"; return 1; }
+  hdr="$probe_dir/headers"
+  body="$probe_dir/body"
+  if ! printf 'ApiKey: %s\n' "$(cat "$keyf")" > "$hdr"; then
+    rm -rf -- "$probe_dir"
+    gbar "guardian: cannot prepare MCP probe"
+    return 1
+  fi
+  probe_rc=0
+  probe_http=$(curl -sS -m 30 --cacert "$ca" \
+    -o "$body" -w '%{http_code}' -X POST "$url" -H "@$hdr" \
+    -H 'Content-Type: application/json' -H 'Accept: application/json, text/event-stream' \
+    -d '{"jsonrpc":"2.0","id":2,"method":"tools/list"}' 2>/dev/null) || probe_rc=$?
+  # a JSON-RPC result with the tools array (plain json or SSE frames)
+  # is the only pass; anything else reports the evidence and keeps the
+  # key in place
+  if [ "$probe_rc" -ne 0 ] || \
+     [[ ! "$probe_http" =~ ^2[0-9][0-9]$ ]] || \
+     ! python3 - "$body" <<'MCP_CHECK'
+import json
+import re
+import sys
+
+text = open(sys.argv[1], encoding="utf-8").read()
+messages = []
+try:
+    messages.append(json.loads(text))
+except (ValueError, UnicodeError):
+    for event in re.split(r"\r?\n\r?\n", text):
+        data = [line[5:].lstrip(" ") for line in event.splitlines()
+                if line.startswith("data:")]
+        if data:
+            try:
+                messages.append(json.loads("\n".join(data)))
+            except ValueError:
+                pass
+
+ok = any(
+    isinstance(msg, dict)
+    and msg.get("jsonrpc") == "2.0"
+    and msg.get("id") == 2
+    and isinstance(msg.get("result"), dict)
+    and isinstance(msg["result"].get("tools"), list)
+    and "error" not in msg
+    for msg in messages
+)
+sys.exit(0 if ok else 1)
+MCP_CHECK
+  then
+    rm -rf -- "$probe_dir"
+    gbar "guardian: panel MCP probe failed (curl=$probe_rc, HTTP=$probe_http)"
+    return 1
+  fi
+  rm -rf -- "$probe_dir"
+
+  # the write uses the guardian's own Hermes interpreter, which ships
+  # PyYAML; the host python may not. The key rides stdin, never argv.
+  py=$(head -1 "/home/$GUARDIAN_USER/.local/bin/hermes" 2>/dev/null | sed -n 's/^#!//p')
+  "$py" -c 'import yaml' 2>/dev/null || py=python3
+  if "$py" - "$cfg" "$url" "$ca" < "$keyf" <<'MCPW'
+import os, sys, yaml
+cfg, url, ca = sys.argv[1:4]
+key = sys.stdin.read().strip()
+with open(cfg) as f:
+    data = yaml.safe_load(f) or {}
+want = {"url": url, "headers": {"ApiKey": key}, "ssl_verify": ca,
+        "timeout": 120, "connect_timeout": 30, "enabled": True}
+servers = data.get("mcp_servers") or {}
+# compare first: a re-run with the same key leaves the file untouched
+if servers.get("homarr") == want:
+    sys.exit(0)
+servers["homarr"] = want
+data["mcp_servers"] = servers
+tmp = cfg + ".tmp"
+# 600 from birth: the file now holds a key with admin rights on the panel
+fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+with os.fdopen(fd, "w") as f:
+    yaml.safe_dump(data, f, sort_keys=False, default_flow_style=False)
+os.replace(tmp, cfg)
+MCPW
+  then
+    chown "$GUARDIAN_USER:$GUARDIAN_USER" "$cfg"
+    chmod 600 "$cfg"
+    # no restart here: guardian_warmup restarts the gateway right after,
+    # and that restart loads the new server
+    gbar "guardian: panel MCP wired (tools/list answered)"
+  else
+    gbar "guardian: panel MCP config write failed"
+    return 1
+  fi
+}
+
 guardian_warmup() {
   local key i code svc w tries=1 t0
   # no GPU: the model may still be paging in when the health ports
@@ -8307,7 +9552,7 @@ guardian_warmup() {
     code=$(curl -s -o /dev/null -w '%{http_code}' -m 900 \
       http://127.0.0.1:8642/v1/chat/completions \
       -H "Content-Type: application/json" \
-      -H "Authorization: Bearer $key" \
+      -H @<(printf "Authorization: Bearer $key" "$key") \
       -d "{\"model\":\"Cerberus\",\"messages\":[{\"role\":\"user\",\"content\":\"Stand by (pass $(date +%s)-$w).\"}],\"max_tokens\":32}")
     [ "$code" = "200" ] && break
     # only a fast 000 is a model still loading; a slow one already paid
@@ -8335,7 +9580,7 @@ guardian_verify() {
     # same idempotency note as the warm-up: a per-pass nonce.
     resp=$(curl -s -m 900 http://127.0.0.1:8642/v1/chat/completions \
       -H "Content-Type: application/json" \
-      -H "Authorization: Bearer $key" \
+      -H @<(printf "Authorization: Bearer $key" "$key") \
       -d "{\"model\":\"Cerberus\",\"messages\":[{\"role\":\"user\",\"content\":\"Are the gates closed (pass $(date +%s))?\"}],\"max_tokens\":64}")
     if printf '%s' "$resp" | grep -q '"content"'; then
       warm_beat_stop
@@ -8383,6 +9628,575 @@ warm_beat_stop() {
   WARM_BEAT_PID=""
 }
 
+kit_put_exec() {  # stdin -> $1 with mode $2, proven byte for byte
+  local t w g
+  t=$(mktemp "$1.XXXXXX") || return 1
+  { cat > "$t" && chmod "$2" "$t" && chown root:root "$t"; } || { rm -f "$t"; return 1; }
+  w=$(sha256sum "$t" | cut -d' ' -f1)
+  mv -f "$t" "$1"
+  g=$(sha256sum "$1" | cut -d' ' -f1)
+  [ "$w" = "$g" ] || { rm -f "$1"; return 1; }
+}
+
+install_redoubt_svc() {
+  kit_put_exec /usr/local/sbin/redoubt-svc 755 <<'SVC'
+#!/usr/bin/env bash
+# redoubt-svc: the only root door the guardian has. Cerberus asks and
+# this script builds. Every file comes from a fixed template, so the
+# caller never hands over raw YAML, a Caddy block or a firewall rule.
+set -euo pipefail
+umask 022
+PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
+die() { echo "redoubt-svc: $*" >&2; exit 1; }
+[ "$(id -u)" = 0 ] || die "run it as: sudo -n redoubt-svc ..."
+CONF=/etc/redoubt/services.conf
+[ -s "$CONF" ] || die "$CONF missing: rerun the kit"
+# read the keys by name and never source the file: a sourced file is code
+cv() { sed -n "s/^$1=//p" "$CONF" | head -1; }
+STACKDIR=$(cv STACKDIR); PORT_EDGE4=$(cv PORT_EDGE4); PANEL_BASE=$(cv PANEL_BASE)
+LO=$(cv SVC_PORT_LO); N=$(cv SVC_PORT_N); GU=$(cv GUARDIAN_USER)
+for _v in STACKDIR PORT_EDGE4 PANEL_BASE GU; do [ -n "${!_v}" ] || die "$_v missing in $CONF"; done
+ROOT=/opt/redoubt/services
+CATALOG=/opt/redoubt/catalog
+GATES=/etc/redoubt/svc-gates
+SNIP="$STACKDIR/caddy-services"
+SPOOL=/var/lib/redoubt/cerberus-spool
+CADDYFILE="$STACKDIR/local-caddy.Caddyfile"
+EDGE=redoubt-edge-local-1
+CA=/var/lib/redoubt/caddy-local/cert-share/root-ca.crt
+shopt -s nullglob
+# one build at a time: two creates racing for one door would both win
+exec 9>/run/redoubt-svc.lock
+flock -w 120 9 || die "another redoubt-svc run holds the lock"
+
+sha() { sha256sum "$1" | cut -d' ' -f1; }
+valid_name() { [[ $1 =~ ^[a-z][a-z0-9-]{1,23}$ ]] || die "name must match ^[a-z][a-z0-9-]{1,23}\$"; }
+meta() { sed -n "s/^$2=//p" "$ROOT/$1/meta" | head -1; }
+rv() { sed -n "s/^$2=//p" "$1" | head -1; }
+gate_off() { [ -f "$GATES/$1" ] && [ "$(cat "$GATES/$1" 2>/dev/null)" = "off" ]; }
+
+# render to a tmp in the same dir, move it in, then prove the final file
+# is byte for byte what was rendered. Prints the sha for the record.
+put() {  # stdin -> $1 with mode $2
+  local t w g
+  t=$(mktemp "$(dirname "$1")/.put.XXXXXX")
+  cat > "$t"; chmod "$2" "$t"
+  w=$(sha "$t"); mv -f "$t" "$1"; g=$(sha "$1")
+  [ "$w" = "$g" ] || die "byte check failed on $1"
+  printf '%s\n' "$w"
+}
+
+# the panel's site line is the truth for host names and tls mode: every
+# kit rewrite (lan name, mesh ip, edge chain) lands there first
+panel_site() {
+  awk -v p=":$PORT_EDGE4" 'index($0,"https://")==1 && index($0,p) && /[{][[:space:]]*$/ {print; exit}' "$CADDYFILE"
+}
+panel_tls() {
+  awk -v p=":$PORT_EDGE4" 'index($0,"https://")==1 && index($0,p) && /[{][[:space:]]*$/ {f=1; next}
+    f && /^[[:space:]]*tls[[:space:]]/ {sub(/^[[:space:]]+/,""); print; exit}
+    f && /^}/ {exit}' "$CADDYFILE"
+}
+render_site() {  # $1 = name
+  local door port site tls proxy
+  door=$(meta "$1" DOOR); port=$(meta "$1" PORT)
+  proxy=$(meta "$1" PROXY)
+  site=$(panel_site); tls=$(panel_tls)
+  [ -n "$site" ] && [ -n "$tls" ] || die "panel site not found in the Caddyfile: refusing to guess"
+  site=$(printf '%s' "$site" | sed -E "s/:${PORT_EDGE4}([, {])/:${door}\1/g")
+  if [ -n "$proxy" ]; then
+    # the mail project routes its door to the webmail container and
+    # keeps the store's admin path to private ranges only: the mesh
+    # cgnat block keeps the owner's tailnet working while the public
+    # internet still aborts on it. The X-Forwarded headers ride only
+    # this one verified hop, never the admin hop.
+    printf '# service %s, written by redoubt-svc (refresh rewrites it)\n%s\n\t%s\n\t@admin path /admin /admin/*\n\t@admins remote_ip 192.168.0.0/16 10.0.0.0/8 172.16.0.0/12 100.64.0.0/10 127.0.0.0/8 ::1 fc00::/7 fe80::/10\n\thandle @admin {\n\t\treverse_proxy @admins %s:8080\n\t\tabort 403\n\t}\n\thandle {\n\t\treverse_proxy %s:%s {\n\t\t\theader_up X-Forwarded-For {remote_host}\n\t\t\theader_up X-Forwarded-Proto https\n\t\t}\n\t}\n}\n' \
+      "$1" "$site" "$tls" "$1" "$proxy" "$port"
+  else
+    printf '# service %s, written by redoubt-svc (refresh rewrites it)\n%s\n\t%s\n\treverse_proxy svc-%s:%s\n}\n' \
+      "$1" "$site" "$tls" "$1" "$port"
+  fi
+}
+edge_apply() {
+  # validate inside the running edge first: a bad block must never take
+  # the photos and the panel down with it
+  docker exec "$EDGE" caddy validate --config /etc/caddy/Caddyfile --adapter caddyfile >/dev/null 2>&1 || return 1
+  docker exec "$EDGE" caddy reload --config /etc/caddy/Caddyfile --adapter caddyfile >/dev/null 2>&1 \
+    || docker restart "$EDGE" >/dev/null 2>&1
+}
+digest_ok() {  # the running container's image carries the pinned digest
+  local want cid iid
+  want=$(meta "$1" IMAGE); want=${want##*@}
+  cid=$(docker compose -f "$ROOT/$1/compose.yml" ps -q app 2>/dev/null)
+  [ -n "$cid" ] || return 1
+  iid=$(docker inspect -f '{{.Image}}' "$cid")
+  docker image inspect -f '{{range .RepoDigests}}{{println .}}{{end}}' "$iid" | grep -q "@${want}\$"
+}
+probe() {  # through the real edge, with the real CA, like the owner's browser
+  local door host code="" i
+  door=$(meta "$1" DOOR)
+  host=$(panel_site | grep -o 'https://[^:, ]*' | head -1); host=${host#https://}
+  for i in $(seq 1 30); do
+    code=$(curl -s -o /dev/null -w '%{http_code}' -m 5 --cacert "$CA" \
+      --resolve "$host:$door:127.0.0.1" "https://$host:$door/" || true)
+    case "$code" in [1-4]??) echo "$code"; return 0 ;; esac
+    sleep 2
+  done
+  echo "${code:-000}"; return 1
+}
+owner_val() {  # OWNER_USER or OWNER_PASS, read root-side, never printed
+  local raw
+  # same envelope as kit_decrypt; file: keeps the machine-id out of argv
+  if head -c 8 /etc/redoubt/redoubt.env | grep -q 'Salted__'; then
+    raw=$(openssl enc -d -aes-256-cbc -pbkdf2 -iter 200000 -pass file:/etc/machine-id -in /etc/redoubt/redoubt.env 2>/dev/null)
+  else
+    raw=$(cat /etc/redoubt/redoubt.env)
+  fi
+  printf '%s\n' "$raw" | sed -n "s/^$1=\"\{0,1\}\([^\"]*\)\"\{0,1\}\$/\1/p" | head -1
+}
+
+ROLLBACK=""
+rollback() {
+  [ -n "$ROLLBACK" ] || return 0
+  local n=$ROLLBACK; ROLLBACK=""
+  [ -f "$ROOT/$n/compose.yml" ] && docker compose -f "$ROOT/$n/compose.yml" down >/dev/null 2>&1 || true
+  rm -f "$SNIP/$n.caddy" "$SPOOL/$n.env"
+  rm -rf "${ROOT:?}/$n"
+  edge_apply >/dev/null 2>&1 || true
+}
+trap rollback EXIT
+
+cmd_resolve() {  # tag -> pinned digest, so create never runs on a tag
+  local ref=${1:-}
+  [[ $ref =~ ^[a-z0-9][a-z0-9._/:-]*$ ]] && [[ $ref != *..* ]] || die "bad image ref"
+  docker pull -q "$ref" >/dev/null || die "pull failed for $ref"
+  docker image inspect -f '{{range .RepoDigests}}{{println .}}{{end}}' "$ref" | head -1
+}
+
+cmd_create() {
+  local name=${1:-}; valid_name "$name"; shift
+  [ -n "$LO" ] && [ -n "$N" ] || die "no service doors on this box"
+  [ ! -e "$ROOT/$name" ] || die "$name exists (verify it, or remove it first)"
+  # the kit-approved catalog is the only source of recipes: a name that
+  # merely matches the regex proves nothing, so the root-owned entry
+  # itself must exist and byte-match its pin before anything is built
+  # (a compromised guardian could otherwise build anything at all)
+  [ -f "$CATALOG/$name/recipe" ] && [ -f "$CATALOG/$name/recipe.sha256" ] \
+    || die "$name is not in the kit-approved catalog (the kit owns the recipes)"
+  [ "$(sha "$CATALOG/$name/recipe")" = "$(cat "$CATALOG/$name/recipe.sha256")" ] \
+    || die "catalog entry for $name failed the byte check"
+  catimg=$(rv "$CATALOG/$name/recipe" IMAGE); catport=$(rv "$CATALOG/$name/recipe" PORT)
+  [ -n "$catimg" ] && [ -n "$catport" ] || die "catalog entry for $name is incomplete"
+  local img="" port="" tile="" icon="" ou="" op="" vols=() envs=() secs=()
+  while [ $# -gt 0 ]; do
+    case "$1" in
+      --image) img=$2; shift 2 ;;      --port) port=$2; shift 2 ;;
+      --data) vols+=("$2"); shift 2 ;; --env) envs+=("$2"); shift 2 ;;
+      --secret) secs+=("$2"); shift 2 ;;
+      --owner-user) ou=$2; shift 2 ;;  --owner-pass) op=$2; shift 2 ;;
+      --tile) tile=$2; shift 2 ;;      --icon) icon=$2; shift 2 ;;
+      *) die "unknown flag $1" ;;
+    esac
+  done
+  # the catalog fixes the recipe: image, port, env and volumes come
+  # from it. A caller may only confirm them, never diverge from them,
+  # so the defaults land before the shape checks below run.
+  [ -n "$img" ] || img="$catimg"
+  [ "$img" = "$catimg" ] || die "image must match the catalog pin"
+  [ -n "$port" ] || port="$catport"
+  [ "$port" = "$catport" ] || die "port must match the catalog pin"
+  [ ${#vols[@]} -eq 0 ] || die "catalog recipes fix their volumes"
+  [ ${#envs[@]} -eq 0 ] || die "catalog recipes fix their env"
+  [ ${#secs[@]} -eq 0 ] || die "catalog recipes fix their secrets"
+  [ -z "$ou" ] && [ -z "$op" ] || die "catalog recipes fix their login"
+  # the template has no slot for privileged, cap_add, devices, host
+  # network or a bind mount: what cannot be written cannot be smuggled
+  [[ $img =~ ^[a-z0-9][a-z0-9._/:-]*@sha256:[0-9a-f]{64}$ ]] && [[ $img != *..* ]] \
+    || die "image must be repo[:tag]@sha256:<64 hex> (use: resolve)"
+  [[ $port =~ ^[0-9]{1,5}$ ]] && [ "$port" -ge 1 ] && [ "$port" -le 65535 ] || die "port must be 1 to 65535"
+  local p kv k v
+  for p in "${vols[@]}"; do [[ $p =~ ^/[A-Za-z0-9._/-]{1,100}$ ]] && [[ $p != *..* ]] || die "bad data path $p"; done
+  for kv in "${envs[@]}"; do
+    k=${kv%%=*}; v=${kv#*=}
+    [[ $kv == *=* ]] && [[ $k =~ ^[A-Z_][A-Z0-9_]{0,63}$ ]] || die "bad env entry $k"
+    # compose interpolates $ in env files and a newline starts a new key
+    [[ $v != *$'\n'* && $v != *'$'* ]] || die "env values may not hold a newline or \$"
+  done
+  for k in "${secs[@]}" $ou $op; do [[ $k =~ ^[A-Z_][A-Z0-9_]{0,63}$ ]] || die "bad key $k"; done
+  [[ $tile =~ ^[A-Za-z0-9\ ._-]{0,40}$ ]] || die "tile title: letters, digits, space . _ - only"
+  [[ -z $icon || $icon =~ ^https://[A-Za-z0-9./_%-]{1,200}$ ]] || die "icon must be a plain https url"
+  # the recipe supplies the tile and icon when the caller does not: the
+  # defaults land after the shape checks so the recipe's local icon
+  # path is not judged by the caller's https-only rule
+  tile="${tile:-$(rv "$CATALOG/$name/recipe" TILE)}"
+  icon="${icon:-$(rv "$CATALOG/$name/recipe" ICON)}"
+
+  # the first free door in the kit's block
+  local m used="" d door=""
+  for m in "$ROOT"/*/meta; do used="$used $(sed -n 's/^DOOR=//p' "$m")"; done
+  for d in $(seq "$LO" $((LO + N - 1))); do [[ " $used " == *" $d "* ]] || { door=$d; break; }; done
+  [ -n "$door" ] || die "all $N service doors are taken"
+
+  # reuse the kit's credentials root-side: the owner's login opens the
+  # new app, and the guardian never reads the owner's password
+  local ouv="" opv="" seclines=()
+  if [ -n "$ou" ]; then ouv=$(owner_val OWNER_USER); [ -n "$ouv" ] || die "owner login unreadable"; fi
+  if [ -n "$op" ]; then opv=$(owner_val OWNER_PASS); [ -n "$opv" ] || die "owner password unreadable"; fi
+  for k in "${secs[@]}"; do seclines+=("$k=$(openssl rand -hex 24)"); done
+
+  local dir="$ROOT/$name" i code
+  mkdir -m 755 "$dir"; ROLLBACK=$name
+  printf 'NAME=%s\nIMAGE=%s\nPORT=%s\nDOOR=%s\nTILE=%s\nICON=%s\n' \
+    "$name" "$img" "$port" "$door" "${tile:-$name}" "$icon" | put "$dir/meta" 644 >/dev/null
+  # the fixed env and compose ride out of the recipe verbatim, and the
+  # byte check runs on every file before anything starts: the pins sit
+  # inside the recipe, which already matched its own pin above
+  sed -n '/^__APP_ENV__$/,/^__COMPOSE__$/p' "$CATALOG/$name/recipe" | sed '1d;$d' | put "$dir/app.env" 600 >/dev/null
+  sed -n '/^__COMPOSE__$/,$p' "$CATALOG/$name/recipe" | sed '1d' | put "$dir/compose.yml" 644 > "$dir/compose.sha256"
+  [ "$(sha "$dir/app.env")" = "$(rv "$CATALOG/$name/recipe" ENV_SHA)" ] || die "app.env failed the byte check"
+  [ "$(sha "$dir/compose.yml")" = "$(rv "$CATALOG/$name/recipe" COMPOSE_SHA)" ] || die "compose failed the byte check"
+
+  docker compose -f "$dir/compose.yml" config -q || die "compose rejected the file"
+  docker pull -q "$img" >/dev/null || die "pull failed for $img"
+  docker compose -f "$dir/compose.yml" up -d >/dev/null 2>&1 || die "compose up failed"
+  digest_ok "$name" || die "the running image is not $img"
+  if gate_off "$name"; then
+    # the firewall story keeps this door closed: no site file, so the
+    # edge aborts on the door until the gate lifts and refresh renders
+    rm -f "$SNIP/$name.caddy"
+    : > "$dir/site.sha256"
+  else
+    render_site "$name" | put "$SNIP/$name.caddy" 644 > "$dir/site.sha256"
+    edge_apply || die "the edge rejected the site block"
+    code=$(probe "$name") || die "no answer through the edge on door $door (last code $code)"
+  fi
+
+  # the generated secrets wait for the guardian's vault in a root-owned
+  # spool: the guardian reads them, only this script deletes them
+  if [ ${#seclines[@]} -gt 0 ]; then
+    printf '%s\n' "${seclines[@]}" | put "$SPOOL/$name.env" 640 >/dev/null
+    chown root:"$GU" "$SPOOL/$name.env"
+  fi
+  ROLLBACK=""
+  if gate_off "$name"; then
+    printf 'OK %s on door %s (gated off: the edge aborts until the firewall story opens)\n' "$name" "$door"
+  else
+    printf 'OK %s on door %s (edge answered %s)\n' "$name" "$door" "$code"
+  fi
+  printf 'TILE {"name":"%s","href":"%s:%s","iconUrl":"%s"}\n' "${tile:-$name}" "${PANEL_BASE%:*}" "$door" "$icon"
+  [ ${#seclines[@]} -eq 0 ] || echo "SECRETS waiting: run cerberus-vault store $name"
+}
+
+cmd_activate() {  # kit-only: build a service strictly from the catalog
+  local name=${1:-}; valid_name "$name"; shift
+  [ -n "$LO" ] && [ -n "$N" ] || die "no service doors on this box"
+  local door=""
+  while [ $# -gt 0 ]; do
+    case "$1" in
+      --door) door=$2; shift 2 ;;
+      *) die "unknown flag $1" ;;
+    esac
+  done
+  local cat="$CATALOG/$name" dir="$ROOT/$name"
+  [ -f "$cat/recipe" ] && [ -f "$cat/recipe.sha256" ] || die "$name is not in the kit-approved catalog"
+  [ "$(sha "$cat/recipe")" = "$(cat "$cat/recipe.sha256")" ] || die "catalog recipe for $name failed the byte check"
+  local img port tile icon
+  img=$(rv "$cat/recipe" IMAGE); port=$(rv "$cat/recipe" PORT)
+  tile=$(rv "$cat/recipe" TILE); icon=$(rv "$cat/recipe" ICON)
+  [ -n "$img" ] && [ -n "$port" ] || die "catalog recipe for $name is incomplete"
+  [ ! -e "$dir" ] || die "$name exists (verify it, or remove it first)"
+  # the door: honor the kit's reservation when it is still free, else
+  # the first free door in the block wins (all under the builder lock)
+  local m used="" d doorp=""
+  for m in "$ROOT"/*/meta; do used="$used $(sed -n 's/^DOOR=//p' "$m")"; done
+  if [ -n "$door" ]; then
+    [[ $door =~ ^[0-9]{1,5}$ ]] || die "bad door"
+    [ "$door" -ge "$LO" ] && [ "$door" -le $((LO + N - 1)) ] || die "door $door is outside the service block"
+    [[ " $used " == *" $door "* ]] && die "door $door is taken"
+    doorp=$door
+  else
+    for d in $(seq "$LO" $((LO + N - 1))); do [[ " $used " == *" $d "* ]] || { doorp=$d; break; }; done
+    [ -n "$doorp" ] || die "all $N service doors are taken"
+  fi
+  mkdir -m 755 "$dir"; ROLLBACK=$name
+  printf 'NAME=%s\nIMAGE=%s\nPORT=%s\nDOOR=%s\nTILE=%s\nICON=%s\n' \
+    "$name" "$img" "$port" "$doorp" "${tile:-$name}" "$icon" | put "$dir/meta" 644 >/dev/null
+  # the fixed env and compose ride out of the recipe verbatim; the
+  # byte check runs on every file before any start
+  sed -n '/^__APP_ENV__$/,/^__COMPOSE__$/p' "$cat/recipe" | sed '1d;$d' | put "$dir/app.env" 600 >/dev/null
+  sed -n '/^__COMPOSE__$/,$p' "$cat/recipe" | sed '1d' | put "$dir/compose.yml" 644 > "$dir/compose.sha256"
+  [ "$(sha "$dir/app.env")" = "$(rv "$cat/recipe" ENV_SHA)" ] || die "app.env failed the byte check"
+  [ "$(sha "$dir/compose.yml")" = "$(rv "$cat/recipe" COMPOSE_SHA)" ] || die "compose failed the byte check"
+  docker compose -f "$dir/compose.yml" config -q || die "compose rejected the file"
+  docker pull -q "$img" >/dev/null || die "pull failed for $img"
+  docker compose -f "$dir/compose.yml" up -d >/dev/null 2>&1 || die "compose up failed"
+  digest_ok "$name" || die "the running image is not $img"
+  # remember which recipe this build came from: the kit compares it
+  # before the next pass and rebuilds when the pin moved
+  cp "$cat/recipe.sha256" "$dir/recipe.sha256"
+  if gate_off "$name"; then
+    # the firewall story keeps this door closed: no site file, so the
+    # edge aborts on it until the gate lifts and refresh renders
+    rm -f "$SNIP/$name.caddy"
+    : > "$dir/site.sha256"
+    printf 'OK %s on door %s (gated off: the edge aborts until the firewall story opens)\n' "$name" "$doorp"
+  else
+    render_site "$name" | put "$SNIP/$name.caddy" 644 > "$dir/site.sha256"
+    edge_apply || die "the edge rejected the site block"
+    local code
+    code=$(probe "$name") || die "no answer through the edge on door $doorp (last code $code)"
+    printf 'OK %s on door %s (edge answered %s)\n' "$name" "$doorp" "$code"
+  fi
+  ROLLBACK=""
+  printf 'DOOR %s\n' "$doorp"
+}
+
+cmd_verify() {
+  local name=${1:-} dir bad=0 code
+  valid_name "$name"; dir="$ROOT/$name"
+  [ -f "$dir/meta" ] || die "no service $name"
+  if [ "$(sha "$dir/compose.yml")" = "$(cat "$dir/compose.sha256")" ]; then echo "OK   compose byte check"
+  else echo "FAIL compose.yml changed since redoubt-svc wrote it"; bad=1; fi
+  if gate_off "$name"; then echo "GATE site held off by the firewall story"
+  elif [ -f "$SNIP/$name.caddy" ] && [ "$(sha "$SNIP/$name.caddy")" = "$(cat "$dir/site.sha256")" ]; then echo "OK   site byte check"
+  else echo "FAIL site block missing or changed (refresh rewrites it)"; bad=1; fi
+  if docker compose -f "$dir/compose.yml" config -q 2>/dev/null; then echo "OK   compose config"
+  else echo "FAIL compose config"; bad=1; fi
+  if digest_ok "$name"; then echo "OK   image digest $(meta "$name" IMAGE | sed 's/.*@//')"
+  else echo "FAIL image digest or container not running"; bad=1; fi
+  if gate_off "$name"; then echo "GATE door closed by the firewall story"
+  elif code=$(probe "$name"); then echo "OK   edge door $(meta "$name" DOOR) answered $code"
+  else echo "FAIL edge door $(meta "$name" DOOR) ($code)"; bad=1; fi
+  return $bad
+}
+
+cmd_refresh() {  # the kit calls this every pass: site files follow its rewrites
+  local m n changed=0 new prev
+  for m in "$ROOT"/*/meta; do
+    n=$(sed -n 's/^NAME=//p' "$m")
+    if gate_off "$n"; then
+      # gated: the site file must not exist while the door is closed,
+      # so the edge keeps aborting on it until the gate lifts
+      if [ -f "$SNIP/$n.caddy" ]; then rm -f "$SNIP/$n.caddy"; changed=1; fi
+      continue
+    fi
+    new=$(render_site "$n" | sha256sum | cut -d' ' -f1)
+    if [ "$new" != "$(cat "$ROOT/$n/site.sha256" 2>/dev/null)" ] || [ ! -f "$SNIP/$n.caddy" ]; then
+      prev=""
+      if [ -n "$(meta "$n" PROXY)" ] && [ -f "$SNIP/$n.caddy" ]; then
+        cp -p "$SNIP/$n.caddy" "$SNIP/.$n.caddy.prev"; prev=1
+      fi
+      render_site "$n" | put "$SNIP/$n.caddy" 644 > "$ROOT/$n/site.sha256"
+      if [ "$prev" = "1" ]; then
+        # mail-style sites carry route blocks the generic render never
+        # did: validate inside the edge before keeping the new bytes,
+        # and roll back to the last good file (or to the closed door)
+        # when the edge rejects them
+        if ! docker exec "$EDGE" caddy validate --config /etc/caddy/Caddyfile --adapter caddyfile >/dev/null 2>&1; then
+          if [ -f "$SNIP/.$n.caddy.prev" ]; then
+            mv -f "$SNIP/.$n.caddy.prev" "$SNIP/$n.caddy"
+            sha "$SNIP/$n.caddy" > "$ROOT/$n/site.sha256"
+            echo "WARNING $n: the edge rejected the new site: rolled back to the last good one"
+          else
+            rm -f "$SNIP/$n.caddy"
+            : > "$ROOT/$n/site.sha256"
+            printf 'off\n' > "$GATES/$n"
+            chmod 644 "$GATES/$n" 2>/dev/null || true
+            echo "WARNING $n: the edge rejected the new site: door closed until a kit pass fixes it"
+          fi
+        else
+          rm -f "$SNIP/.$n.caddy.prev"
+        fi
+      fi
+      changed=1
+    fi
+    [ "$(sha "$ROOT/$n/compose.yml")" = "$(cat "$ROOT/$n/compose.sha256")" ] \
+      || echo "WARNING $n: compose.yml differs from what redoubt-svc wrote"
+  done
+  [ "$changed" = 0 ] || edge_apply || die "the edge rejected the refreshed sites"
+  echo ok
+}
+
+cmd_remove() {
+  local name=${1:-} dir
+  valid_name "$name"; dir="$ROOT/$name"
+  [ -f "$dir/meta" ] || die "no service $name"
+  docker compose -f "$dir/compose.yml" down >/dev/null 2>&1 || true
+  rm -f "$SNIP/$name.caddy"; edge_apply || true
+  # data volumes and app.env stay: removing a service never destroys data
+  mkdir -p "$ROOT/.removed"; mv "$dir" "$ROOT/.removed/$name-$(date +%Y%m%d%H%M%S)"
+  echo "OK $name stopped, data volumes kept, files in $ROOT/.removed"
+}
+
+case "${1:-help}" in
+  ping) echo ok ;;
+  resolve) cmd_resolve "${2:-}" ;;
+  create) shift; cmd_create "$@" ;;
+  activate) shift; cmd_activate "$@" ;;
+  verify) cmd_verify "${2:-}" ;;
+  refresh) cmd_refresh ;;
+  remove) cmd_remove "${2:-}" ;;
+  list) for m in "$ROOT"/*/meta; do printf '%s door %s %s\n' "$(sed -n 's/^NAME=//p' "$m")" "$(sed -n 's/^DOOR=//p' "$m")" "$(sed -n 's/^IMAGE=//p' "$m")"; done ;;
+  ps) docker ps -a --format '{{.Names}}\t{{.Status}}' ;;
+  logs) valid_name "${2:-}"; [[ ${3:-200} =~ ^[0-9]{1,4}$ ]] || die "tail must be a number"
+        [ -f "$ROOT/$2/meta" ] || die "logs only for services built here"
+        docker logs --tail "${3:-200}" "svc-$2" 2>&1 ;;
+  spool-done) valid_name "${2:-}"; rm -f "$SPOOL/$2.env"; echo ok ;;
+  help|*) cat <<'HELP'
+redoubt-svc: the service recipe Cerberus follows
+  1. resolve IMAGE:TAG         pull once, print IMAGE@sha256:... (the pin)
+  2. create NAME ...           build a kit-approved catalog service: the
+     root-owned catalog entry is the authority, the flags must match
+     its pin (image and port) or the build dies
+  2b. activate NAME [--door N] the kit builds its own service straight
+     from the catalog recipe: same checks as create, the reserved door
+     is honored when it is still free, the recipe is authoritative
+  3. verify NAME               byte checks, compose config, digest, door
+  4. cerberus-vault store NAME move generated secrets into the vault
+  5. panel tile: call the homarr MCP app tools with the TILE line
+  6. give the owner the href from the TILE line
+  also: list | ps | logs NAME [N] | refresh | remove NAME
+HELP
+  ;;
+esac
+SVC
+}
+
+install_cerberus_vault() {
+  # only the pinned gocryptfs ever sees the guardian's key
+  [ -x "$VAULT_BIN" ] && [ "$(sha256sum "$VAULT_BIN" | cut -d' ' -f1)" = "$VAULT_SHA" ] \
+    || { gbar "guardian: no pinned gocryptfs - the guardian vault stays off"; return 1; }
+  sed "s/@VAULT_SHA@/$VAULT_SHA/" <<'CVAULT' | kit_put_exec /usr/local/bin/cerberus-vault 755 || return 1
+#!/usr/bin/env bash
+# cerberus-vault: Cerberus' own encrypted store for the credentials it
+# creates. Closed at rest: each verb that needs it opens, works, closes.
+set -euo pipefail
+umask 077
+PATH=/usr/local/bin:/usr/bin:/bin
+die() { echo "cerberus-vault: $*" >&2; exit 1; }
+[ "$(id -un)" = guardian ] || die "this vault opens for the guardian only"
+G=/usr/local/bin/gocryptfs
+B="$HOME/.local/share/cerberus"
+KEY="$B/vault.key"; CONF="$B/vault.gocryptfs.conf"
+C="$HOME/.cerberus-vault.cipher"; M="$HOME/vault"
+SPOOL=/var/lib/redoubt/cerberus-spool
+# the kit's own pin: a swapped binary would read the key, so it never runs
+[ "$(sha256sum "$G" 2>/dev/null | cut -d' ' -f1)" = "@VAULT_SHA@" ] || die "gocryptfs does not match the kit pin"
+[ "$(stat -c '%U %a' "$KEY" 2>/dev/null)" = "guardian 600" ] || die "the key must be guardian 600"
+[ -f "$CONF" ] && [ -d "$C" ] || die "no vault yet: rerun the kit"
+# the mount table, not stat: a dead fuse answers stat with an error
+mounted() { awk -v m="$M" '$5==m && index($0," - fuse")' /proc/self/mountinfo | grep -q .; }
+unfuse() { fusermount3 -u "$@" "$M" 2>/dev/null || fusermount -u "$@" "$M" 2>/dev/null; }
+heal() {
+  # a gocryptfs that died leaves its mount in the table and every read
+  # fails with "transport endpoint is not connected": detach it lazily
+  if mounted && ! ls "$M" >/dev/null 2>&1; then unfuse -z || true; fi
+  if mounted && ! ls "$M" >/dev/null 2>&1; then die "a stale mount still holds $M"; fi
+  return 0
+}
+OPENED=0
+open() {
+  heal
+  mounted && return 0
+  mkdir -p "$M"
+  # -passfile: the key travels file to process, never argv, env or a pipe
+  "$G" -quiet -config "$CONF" -passfile "$KEY" "$C" "$M" >/dev/null 2>&1 || die "mount failed"
+  OPENED=1
+}
+close() { [ "$OPENED" = 1 ] || return 0; unfuse || unfuse -z || true; OPENED=0; }
+trap close EXIT
+valid() { [[ ${1:-} =~ ^[a-z][a-z0-9-]{1,23}$ ]] || die "bad name"; }
+case "${1:-status}" in
+  status) heal; if mounted; then echo open; else echo closed; fi ;;
+  heal) heal; echo ok ;;
+  open) open; OPENED=0; echo "open at $M (close with: cerberus-vault close)" ;;
+  close) OPENED=1; close; if mounted; then die "still mounted"; fi; echo closed ;;
+  store)
+    valid "${2:-}"; [ -r "$SPOOL/$2.env" ] || die "nothing spooled for $2"
+    open; mkdir -p "$M/services"
+    install -m 600 "$SPOOL/$2.env" "$M/services/$2.env"
+    cmp -s "$SPOOL/$2.env" "$M/services/$2.env" || die "byte check failed, the spool stays"
+    sudo -n /usr/local/sbin/redoubt-svc spool-done "$2" >/dev/null || die "stored, but the spool was not cleared"
+    echo "stored $2 (spool cleared)" ;;
+  # get prints a secret: only when the owner asks for it by name
+  get) valid "${2:-}"; open; cat "$M/services/$2.env" ;;
+  list) open; ls -1 "$M/services" 2>/dev/null | sed 's/\.env$//' ;;
+  *) echo "cerberus-vault [status|heal|open|close|store NAME|get NAME|list]"; exit 1 ;;
+esac
+CVAULT
+  # key and store are created by the guardian itself: root never holds the
+  # key in a variable, an argv or a log line. -init prints the master key
+  # on stdout, so stdout goes nowhere. Recovery is the key plus the conf,
+  # both copied into the owner's vault below.
+  su - "$GUARDIAN_USER" -c '
+    umask 077
+    B="$HOME/.local/share/cerberus"; C="$HOME/.cerberus-vault.cipher"
+    mkdir -p "$B" "$HOME/vault" && chmod 700 "$B" "$HOME/vault"
+    [ -s "$B/vault.key" ] || openssl rand -hex 32 > "$B/vault.key"
+    chmod 600 "$B/vault.key"
+    if [ ! -f "$B/vault.gocryptfs.conf" ]; then
+      mkdir -p "$C"
+      /usr/local/bin/gocryptfs -init -quiet -config "$B/vault.gocryptfs.conf" -passfile "$B/vault.key" "$C" >/dev/null 2>&1
+    fi
+    /usr/local/bin/cerberus-vault heal' >/dev/null 2>&1
+}
+
+guardian_services() {
+  local sud=/etc/sudoers.d/redoubt-guardian gb="/home/$GUARDIAN_USER/.local/share/cerberus" f
+  mkdir -p /opt/redoubt/services /var/lib/redoubt/cerberus-spool "$STACKDIR/caddy-services"
+  chmod 755 /opt/redoubt/services "$STACKDIR/caddy-services"
+  # root writes the spool and the guardian only reads it: a guardian-owned
+  # dir would let a planted symlink steer a root write anywhere
+  chown root:"$GUARDIAN_USER" /var/lib/redoubt/cerberus-spool
+  chmod 750 /var/lib/redoubt/cerberus-spool
+  # the helper's facts, rewritten every pass so a moved port follows
+  ( umask 077
+    printf 'STACKDIR=%s\nPORT_EDGE4=%s\nPANEL_BASE=%s\nSVC_PORT_LO=%s\nSVC_PORT_N=%s\nGUARDIAN_USER=%s\n' \
+      "$STACKDIR" "$PORT_EDGE4" "$PANEL_BASE" "${SVC_PORT_LO:-}" "${SVC_PORT_N:-}" "$GUARDIAN_USER" \
+      > /etc/redoubt/services.conf.tmp ) \
+    && mv -f /etc/redoubt/services.conf.tmp /etc/redoubt/services.conf || return 1
+  install_redoubt_svc || { gbar "guardian: redoubt-svc install failed the byte check"; return 1; }
+  install_cerberus_vault || { gbar "guardian: the guardian vault is not ready"; return 1; }
+
+  # the one grant: a fixed root-owned path whose every verb validates its
+  # input. sudo ignores drop-ins with a dot in the name, so the .tmp is
+  # inert until visudo has passed it.
+  printf '%s ALL=(root) NOPASSWD: /usr/local/sbin/redoubt-svc\n' "$GUARDIAN_USER" > "$sud.tmp"
+  chmod 440 "$sud.tmp"
+  if visudo -cf "$sud.tmp" >/dev/null 2>&1; then mv -f "$sud.tmp" "$sud"
+  else rm -f "$sud.tmp"; gbar "guardian: service grant failed visudo - not armed"; return 1; fi
+  visudo -c >/dev/null 2>&1 || { rm -f "$sud"; gbar "guardian: sudoers broke - grant pulled"; return 1; }
+
+  # proofs: each one fails the step instead of warning past it
+  if id -nG "$GUARDIAN_USER" | tr ' ' '\n' | grep -qx docker; then
+    gbar "guardian: still in the docker group - refusing to arm"; return 1
+  fi
+  if su - "$GUARDIAN_USER" -c 'docker info' >/dev/null 2>&1; then
+    gbar "guardian: the docker socket answers the guardian - refusing to arm"; return 1
+  fi
+  if sudo -l -U "$GUARDIAN_USER" 2>/dev/null | grep -Eq '\(ALL( : ALL)?\) (NOPASSWD: )?ALL$'; then
+    gbar "guardian: a blanket sudo grant exists for the guardian - refusing to arm"; return 1
+  fi
+  [ "$(su - "$GUARDIAN_USER" -c 'sudo -n /usr/local/sbin/redoubt-svc ping' 2>/dev/null)" = "ok" ] \
+    || { gbar "guardian: the service grant does not answer"; return 1; }
+
+  /usr/local/sbin/redoubt-svc refresh >> "$LOG" 2>&1 || gbar "guardian: WARNING service sites not refreshed"
+
+  # the owner must open Cerberus' vault without us: key and conf go into
+  # the owner's vault, only while root holds it this pass (same test as
+  # the welcome write), owned by the owner so their own mount reads them
+  if [ -n "${MYREDOUBT:-}" ] && [ -n "${OWNER_SYS_USER:-}" ] \
+     && mount | grep -q "$MYREDOUBT type fuse.*user_id=0"; then
+    install -d -o "$OWNER_SYS_USER" -m 700 "$MYREDOUBT/Cerberus vault"
+    for f in vault.key vault.gocryptfs.conf; do
+      cmp -s "$gb/$f" "$MYREDOUBT/Cerberus vault/$f" \
+        || install -o "$OWNER_SYS_USER" -m 600 "$gb/$f" "$MYREDOUBT/Cerberus vault/$f"
+    done
+  else
+    gbar "guardian: owner vault not held this pass - key copy retried next pass"
+  fi
+  gbar "guardian: service builder armed (redoubt-svc, cerberus-vault)"
+}
+
 guardian_bounce() {
   # The gateway's first real request can wedge on a stale auth lock and
   # then every request hangs without an answer, so the verify below
@@ -8412,6 +10226,12 @@ guardian() {
   guardian_console
   guardian_ufw
   guardian_wire_assistant
+  # after the panel seed (the key exists) and the gateway install (the
+  # profile config exists), before the warm-up whose restart loads it
+  guardian_wire_mcp || gbar "guardian: WARNING panel MCP not wired"
+  # after the MCP (the tile path exists) and before the warm-up, whose
+  # gateway restart drops any group the guardian lost this pass
+  guardian_services || gbar "guardian: WARNING service builder not armed"
   guardian_warmup
   guardian_bounce
   guardian_verify || gbar "guardian: WARNING the end-to-end check failed"
@@ -8479,6 +10299,20 @@ FW_WHY_POOL=(
 FW_U_ESS_RULES=( "tcp --dport 22" "tcp --dport 8390" "udp --dport 8390" "udp --dport 40002" "tcp --dport 8086" )
 FW_U_APP_PORTS="443 8443 8444 8445 8446 8447 33073"
 FW_F_APP_PORTS="443/tcp 8443-8447/tcp 33073/tcp"
+# the service doors ride the same model as the apps: open to the wifi,
+# mesh only, or closed, by the owner's saved answer. An empty door
+# aborts at the edge, so opening the block early exposes nothing.
+if [ -n "${SVC_PORT_LO:-}" ]; then
+  FW_U_APP_PORTS="$FW_U_APP_PORTS $(seq -s ' ' "$SVC_PORT_LO" $((SVC_PORT_LO + SVC_PORT_N - 1)))"
+  FW_F_APP_PORTS="$FW_F_APP_PORTS ${SVC_PORT_LO}-$((SVC_PORT_LO + SVC_PORT_N - 1))/tcp"
+fi
+# the remote desktop door opens only when the owner asked for it. The
+# append runs after both base lists exist: before, set -u aborts on the
+# firewalld list and the reassignment drops the door anyway.
+if [ "${REDOUBT_GUAC:-0}" = "1" ]; then
+  FW_U_APP_PORTS="$FW_U_APP_PORTS 8449"
+  FW_F_APP_PORTS="$FW_F_APP_PORTS 8449/tcp"
+fi
 # the NetBird console door is selfhost-only: cloud has no local
 # dashboard, so its firewall story stays exactly as it was
 if [ "$MESH_MODE" = "selfhost" ]; then
@@ -8893,6 +10727,1935 @@ else
   fi
 fi
 
+# 8b) Home Assistant reconcile: the early pass reserved the door and
+# seeded the tile; this late pass builds the service and opens or
+# closes its door to match the owner's saved firewall story and the
+# rules that are actually loaded. Runs on every pass with or without
+# the guardian, and the boot gate below re-applies the door after a
+# reboot. Anything unverified leaves the site file absent, and an
+# absent site file means the edge aborts on the door.
+ha_catalog_install() {
+  # the root-owned recipe the builder may deploy: the env and compose
+  # are fixed here and their shas are pinned inside the recipe, so the
+  # whole package verifies from the single recipe.sha256 pin. Fails
+  # closed: an unpinned or mismatched recipe never reaches a start.
+  [ -n "$HA_DIGEST" ] || return 1
+  local pin envsha composesha t w g
+  pin="${HA_IMAGE}@${HA_DIGEST}"
+  envsha=$(printf '%s\n' '# Home Assistant env, fixed by the kit recipe' | sha256sum | cut -d' ' -f1)
+  composesha=$(printf '%s\n' \
+    'services:' \
+    '  app:' \
+    "    image: $pin" \
+    '    container_name: svc-homeassistant' \
+    '    restart: unless-stopped' \
+    '    dns: [172.28.0.53, 127.0.0.11]' \
+    '    security_opt:' \
+    '      - no-new-privileges:true' \
+    '    environment:' \
+    '      TZ: UTC' \
+    '    volumes:' \
+    '      - ha-config:/config' \
+    '    networks:' \
+    '      - default' \
+    'networks:' \
+    '  default:' \
+    '    external: true' \
+    '    name: redoubt_default' \
+    'volumes:' \
+    '  ha-config:' | sha256sum | cut -d' ' -f1)
+  mkdir -p /opt/redoubt/catalog/homeassistant
+  t=$(mktemp /opt/redoubt/catalog/.recipe.XXXXXX)
+  {
+    printf 'NAME=homeassistant\nIMAGE=%s\nPORT=8123\nTILE=Home Assistant\nICON=/icons/home-assistant.svg\n' "$pin"
+    printf 'ENV_SHA=%s\nCOMPOSE_SHA=%s\n' "$envsha" "$composesha"
+    printf '%s\n' '__APP_ENV__'
+    printf '%s\n' '# Home Assistant env, fixed by the kit recipe'
+    printf '%s\n' '__COMPOSE__'
+    printf '%s\n' \
+      'services:' \
+      '  app:' \
+      "    image: $pin" \
+      '    container_name: svc-homeassistant' \
+      '    restart: unless-stopped' \
+      '    dns: [172.28.0.53, 127.0.0.11]' \
+      '    security_opt:' \
+      '      - no-new-privileges:true' \
+      '    environment:' \
+      '      TZ: UTC' \
+      '    volumes:' \
+      '      - ha-config:/config' \
+      '    networks:' \
+      '      - default' \
+      'networks:' \
+      '  default:' \
+      '    external: true' \
+      '    name: redoubt_default' \
+      'volumes:' \
+      '  ha-config:'
+  } > "$t"
+  chmod 644 "$t"; chown root:root "$t"
+  w=$(sha256sum "$t" | cut -d' ' -f1)
+  mv -f "$t" /opt/redoubt/catalog/homeassistant/recipe
+  g=$(sha256sum /opt/redoubt/catalog/homeassistant/recipe | cut -d' ' -f1)
+  [ "$w" = "$g" ] || { rm -f /opt/redoubt/catalog/homeassistant/recipe; return 1; }
+  printf '%s\n' "$g" > /opt/redoubt/catalog/homeassistant/recipe.sha256
+  chmod 644 /opt/redoubt/catalog/homeassistant/recipe.sha256
+  return 0
+}
+
+# true when the firewall-cmd port list (single ports and ranges alike)
+# covers the given port: the kit adds the whole service block as one
+# N-M/tcp range, so an exact "door/tcp" match would never see it
+fw_ports_cover() {
+  local p lo hi
+  for p in $1; do
+    p="${p%%/*}"
+    case "$p" in
+      *-*)
+        lo="${p%-*}"; hi="${p#*-}"
+        case "$lo$hi" in
+          ""|*[!0-9]*) ;;
+          *) [ "$2" -ge "$lo" ] && [ "$2" -le "$hi" ] && return 0 ;;
+        esac
+        ;;
+      *)
+        [ "$p" = "$2" ] && return 0
+        ;;
+    esac
+  done
+  return 1
+}
+
+ha_gate_eval() {  # $1 = the door; prints on|off
+  local door=$1 state="${FW_DECISION:-}" out=off
+  case "$state" in
+    on|on-nas)
+      if [ "$FW_KIND" = "ufw" ]; then
+        local r4 r6 need6=0
+        r4=$(cat /etc/ufw/user.rules 2>/dev/null || true)
+        r6=$(cat /etc/ufw/user6.rules 2>/dev/null || true)
+        # ipv6 only counts when ufw actually manages it
+        grep -q '^IPV6=yes' /etc/ufw/ufw.conf 2>/dev/null && need6=1
+        if [ "$state" = "on" ]; then
+          echo "$r4" | grep -q -- "--dport $door" \
+            && { [ "$need6" = "0" ] || echo "$r6" | grep -q -- "--dport $door"; } \
+            && out=on
+        else
+          echo "$r4" | grep -- "-i wt0" | grep -q -- "--dport $door" \
+            && { [ "$need6" = "0" ] || echo "$r6" | grep -- "-i wt0" | grep -q -- "--dport $door"; } \
+            && out=on
+        fi
+      elif [ "$FW_KIND" = "firewalld" ]; then
+        # firewalld drives nftables for both families: one ports list
+        # is the truth for ipv4 and ipv6 alike
+        local ports zports
+        ports=$(firewall-cmd --list-ports 2>/dev/null || true)
+        if [ "$state" = "on" ]; then
+          fw_ports_cover "$ports" "$door" && out=on
+        else
+          zports=$(firewall-cmd --zone=redoubt-mesh --list-ports 2>/dev/null || true)
+          fw_ports_cover "$zports" "$door" && out=on
+        fi
+      fi
+      ;;
+  esac
+  printf '%s\n' "$out"
+}
+
+ha_gate_install() {
+  # the boot gate: after a reboot the door may never be more open than
+  # the saved story and the loaded rules justify. The script only
+  # closes; re-opening always rides a kit pass that re-verifies first.
+  kit_put_exec /usr/local/sbin/redoubt-ha-gate 755 <<'HAGATE'
+#!/usr/bin/env bash
+# redoubt-ha-gate: re-applies the Home Assistant door gate at boot.
+# The saved firewall story plus the rules actually loaded decide; the
+# site file is the switch (absent means the edge aborts on the door).
+# This script only ever closes the door: re-opening needs a kit pass.
+set -euo pipefail
+umask 022
+PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
+CONF=/etc/redoubt/services.conf
+[ -s "$CONF" ] || exit 0
+cv() { sed -n "s/^$1=//p" "$CONF" | head -1; }
+STACKDIR=$(cv STACKDIR)
+META=/opt/redoubt/services/svc-homeassistant/meta
+[ -f "$META" ] || exit 0
+DOOR=$(sed -n 's/^DOOR=//p' "$META" | head -1)
+[ -n "$DOOR" ] || exit 0
+# the saved story rides the encrypted env: same envelope as the kit
+dec() {
+  if head -c 8 /etc/redoubt/redoubt.env | grep -q 'Salted__'; then
+    openssl enc -d -aes-256-cbc -pbkdf2 -iter 200000 -pass pass:"$(cat /etc/machine-id 2>/dev/null | tr -d '\n')" -in /etc/redoubt/redoubt.env 2>/dev/null
+  else
+    cat /etc/redoubt/redoubt.env
+  fi
+}
+FW=$(dec | sed -n 's/^FW_DECISION=//p' | head -1)
+GATE=on
+case "$FW" in on|on-nas) ;; *) GATE=off ;; esac
+if [ "$GATE" = "on" ] && command -v ufw >/dev/null 2>&1; then
+  R4=$(cat /etc/ufw/user.rules 2>/dev/null || true)
+  R6=$(cat /etc/ufw/user6.rules 2>/dev/null || true)
+  NEED6=0
+  grep -q '^IPV6=yes' /etc/ufw/ufw.conf 2>/dev/null && NEED6=1
+  if [ "$FW" = "on" ]; then
+    echo "$R4" | grep -q -- "--dport $DOOR" || GATE=off
+    if [ "$NEED6" = "1" ] && ! echo "$R6" | grep -q -- "--dport $DOOR"; then GATE=off; fi
+  else
+    echo "$R4" | grep -- "-i wt0" | grep -q -- "--dport $DOOR" || GATE=off
+    if [ "$NEED6" = "1" ] && ! echo "$R6" | grep -- "-i wt0" | grep -q -- "--dport $DOOR"; then GATE=off; fi
+  fi
+elif [ "$GATE" = "on" ] && command -v firewall-cmd >/dev/null 2>&1; then
+  # the service block rides as one N-M/tcp range: a listed range
+  # covers the door just like an exact port entry would
+  cover() {
+    for _p in $1; do
+      _p="${_p%%/*}"
+      case "$_p" in
+        *-*) _lo="${_p%-*}"; _hi="${_p#*-}"
+             case "$_lo$_hi" in
+               ""|*[!0-9]*) ;;
+               *) [ "$DOOR" -ge "$_lo" ] && [ "$DOOR" -le "$_hi" ] && return 0 ;;
+             esac ;;
+        *) [ "$_p" = "$DOOR" ] && return 0 ;;
+      esac
+    done
+    return 1
+  }
+  PORTS=$(firewall-cmd --list-ports 2>/dev/null || true)
+  if [ "$FW" = "on" ]; then
+    cover "$PORTS" || GATE=off
+  else
+    ZP=$(firewall-cmd --zone=redoubt-mesh --list-ports 2>/dev/null || true)
+    cover "$ZP" || GATE=off
+  fi
+elif [ "$GATE" = "on" ]; then
+  # no firewall tool left to verify the saved story against: the door
+  # stays closed until a kit pass re-verifies the loaded rules
+  GATE=off
+fi
+if [ "$GATE" = "on" ]; then
+  exit 0
+fi
+# close the door: drop the site file and reload the edge. A door with
+# no site behind it aborts at the edge.
+SITE="$STACKDIR/caddy-services/svc-homeassistant.caddy"
+if [ -f "$SITE" ]; then
+  rm -f "$SITE"
+  docker exec redoubt-edge-local-1 caddy reload --config /etc/caddy/Caddyfile --adapter caddyfile >/dev/null 2>&1 \
+    || docker restart redoubt-edge-local-1 >/dev/null 2>&1 || true
+fi
+exit 0
+HAGATE
+  cat > /etc/systemd/system/redoubt-ha-gate.service <<'HAUNIT'
+[Unit]
+Description=Redoubt Home Assistant door gate (closed unless verified)
+After=docker.service network-online.target
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+ExecStart=/usr/local/sbin/redoubt-ha-gate
+
+[Install]
+WantedBy=multi-user.target
+HAUNIT
+  chmod 644 /etc/systemd/system/redoubt-ha-gate.service
+  systemctl daemon-reload >/dev/null 2>&1 || true
+  systemctl enable redoubt-ha-gate.service >/dev/null 2>&1 || true
+}
+
+ha_reconcile() {
+  [ "${REDOUBT_HA:-0}" = "1" ] || return 0
+  [ -n "$HA_DIGEST" ] || { dbg "WARNING: Home Assistant stays off: HA_DIGEST is empty (no reviewed release pin yet)"; return 0; }
+  # the root-owned catalog is the only authority: it must byte-match
+  # its pin before the service may start, on every pass. A failed
+  # check also closes a door a previous pass had opened: the gate
+  # flips off and the refresh drops the site file behind it.
+  ha_catalog_install || {
+    dbg "WARNING: Home Assistant catalog failed the byte check: the service stays off"
+    mkdir -p "$HA_GATE_DIR"
+    printf 'off\n' > "$HA_GATE_DIR/svc-homeassistant"
+    chmod 644 "$HA_GATE_DIR/svc-homeassistant" 2>/dev/null || true
+    if [ -x /usr/local/sbin/redoubt-svc ]; then
+      /usr/local/sbin/redoubt-svc refresh >> "$LOG" 2>&1 || true
+    else
+      rm -f "$STACKDIR/caddy-services/svc-homeassistant.caddy" 2>/dev/null || true
+    fi
+    return 0
+  }
+  local door="${HA_DOOR:-}"
+  [ -n "$door" ] || { dbg "WARNING: Home Assistant has no reserved door: the service stays off"; return 0; }
+  # the gate is decided before anything starts, so a first activation
+  # never renders a site for an unverified firewall story: the saved
+  # story plus the rules that are really loaded decide, never the
+  # app-door list alone
+  local gate
+  gate=$(ha_gate_eval "$door")
+  mkdir -p "$HA_GATE_DIR"
+  printf '%s\n' "$gate" > "$HA_GATE_DIR/svc-homeassistant"
+  chmod 644 "$HA_GATE_DIR/svc-homeassistant" 2>/dev/null || true
+  # the project lives outside the stack recovery wildcards: its own
+  # compose file in its own directory, so the stack's profile-wide
+  # up and down never sees it
+  if [ ! -f "$HA_SVC_DIR/meta" ]; then
+    if [ -x /usr/local/sbin/redoubt-svc ]; then
+      # first activation: the builder builds from the recipe under its
+      # lock, honors the gate above, and rolls the whole thing back on
+      # any failure
+      if /usr/local/sbin/redoubt-svc activate homeassistant --door "$door" >> "$LOG" 2>&1; then
+        dbg "OK: Home Assistant built from the approved recipe"
+      else
+        dbg "WARNING: Home Assistant activation failed (see the log): rolled back, the door stays closed"
+        return 0
+      fi
+    else
+      dbg "WARNING: no service builder on this box: Home Assistant stays off"
+      return 0
+    fi
+  elif [ -f "$HA_CATALOG/recipe.sha256" ] && [ -f "$HA_SVC_DIR/recipe.sha256" ] \
+       && [ "$(cat "$HA_CATALOG/recipe.sha256" 2>/dev/null)" != "$(cat "$HA_SVC_DIR/recipe.sha256" 2>/dev/null)" ]; then
+    # the recipe pin moved: a new reviewed release rebuilds from the
+    # new recipe on the same door (the /config volume survives)
+    dbg "Home Assistant recipe pin moved: rebuilding from the reviewed release"
+    docker compose -f "$HA_SVC_DIR/compose.yml" down >/dev/null 2>&1 || true
+    rm -rf "${HA_SVC_DIR:?}"
+    if /usr/local/sbin/redoubt-svc activate homeassistant --door "$door" >> "$LOG" 2>&1; then
+      dbg "OK: Home Assistant rebuilt on the new pin"
+    else
+      dbg "WARNING: Home Assistant rebuild failed (see the log): rolled back, the door stays closed"
+      return 0
+    fi
+  fi
+  # the builder may have re-picked a door when the reservation was
+  # taken: its meta is the truth, the env and the gate follow it
+  _ha_act_door=$(sed -n 's/^DOOR=//p' "$HA_SVC_DIR/meta" 2>/dev/null || true)
+  if [ -n "$_ha_act_door" ] && [ "$_ha_act_door" != "$door" ]; then
+    sed -i '/^HA_DOOR=/d' "$_ENV_TMP"
+    echo "HA_DOOR=$_ha_act_door" >> "$_ENV_TMP"
+    kit_env_commit
+    door="$_ha_act_door"
+    gate=$(ha_gate_eval "$door")
+    printf '%s\n' "$gate" > "$HA_GATE_DIR/svc-homeassistant"
+  fi
+  if [ -x /usr/local/sbin/redoubt-svc ]; then
+    /usr/local/sbin/redoubt-svc refresh >> "$LOG" 2>&1 \
+      || dbg "WARNING: Home Assistant site refresh failed"
+  else
+    rm -f "$STACKDIR/caddy-services/svc-homeassistant.caddy" 2>/dev/null || true
+  fi
+  case "$gate" in
+    on) ;;
+    *)
+      if [ "$FW_ACTIVE" = "1" ]; then
+        case "${FW_DECISION:-}" in
+          on|on-nas) dbg "Home Assistant door $door stays closed: the saved story says ${FW_DECISION}, but the loaded rules do not show the door (both families)" ;;
+          on-nodoors) dbg "Home Assistant door $door stays closed: the saved firewall story is on-nodoors (no service exposure)" ;;
+          off) dbg "Home Assistant door $door stays closed: the saved firewall story is off" ;;
+          *) dbg "Home Assistant door $door stays closed: no saved firewall story yet (answer the firewall questions, or keep it box-only)" ;;
+        esac
+      else
+        dbg "Home Assistant door $door stays closed: no active firewall story was verified"
+      fi
+      return 0
+      ;;
+  esac
+  # the door may open, so prove the build again first: compose, site
+  # and the running digest must all byte-match their pins
+  if [ -x /usr/local/sbin/redoubt-svc ]; then
+    if ! /usr/local/sbin/redoubt-svc verify homeassistant >> "$LOG" 2>&1; then
+      dbg "WARNING: Home Assistant failed verification: the door stays closed"
+      printf 'off\n' > "$HA_GATE_DIR/svc-homeassistant"
+      /usr/local/sbin/redoubt-svc refresh >> "$LOG" 2>&1 || true
+      return 0
+    fi
+  fi
+  # proxy trust: Home Assistant reads client addresses from forwarded
+  # headers only when the sender is the edge itself. Three states: a
+  # fresh volume gets the kit's minimal config, the factory default
+  # (first boot wrote it before this pass could) gets the http block
+  # appended, and an owner-edited file is never rewritten. No trust is
+  # the safe state either way: without trusted_proxies the edge is the
+  # only client address Home Assistant ever sees.
+  local ha_edge_ip
+  ha_edge_ip=$(docker inspect -f '{{(index .NetworkSettings.Networks "redoubt_default").IPAddress}}' redoubt-edge-local-1 2>/dev/null || true)
+  if [ -z "$ha_edge_ip" ]; then
+    dbg "WARNING: the edge proxy address is unknown: Home Assistant trust config not written, the door stays closed"
+    printf 'off\n' > "$HA_GATE_DIR/svc-homeassistant"
+    return 0
+  fi
+  if docker exec svc-homeassistant sh -c '[ -s /config/configuration.yaml ]' >/dev/null 2>&1; then
+    # the factory template carries the default_config marker and no
+    # http: key of its own: Home Assistant wrote it itself on first
+    # boot (usually while the door was still gated), the owner has not
+    # touched it yet, so the kit may add the trust block. An owner
+    # file with its own http: key is left alone.
+    if docker exec svc-homeassistant sh -c 'grep -q "^default_config:" /config/configuration.yaml && ! grep -q "^http:" /config/configuration.yaml' >/dev/null 2>&1; then
+      # keep a copy so a failed append can restore byte for byte; the
+      # blank first line keeps the block off the tail of a file that
+      # does not end in a newline
+      docker exec svc-homeassistant sh -c 'cp -f /config/configuration.yaml /config/configuration.yaml.redoubt-bak' >/dev/null 2>&1
+      docker exec -i svc-homeassistant sh -c 'cat >> /config/configuration.yaml' <<HAHTTP
+
+http:
+  use_x_forwarded_for: true
+  trusted_proxies:
+    - ${ha_edge_ip}
+HAHTTP
+      if docker exec svc-homeassistant sh -c 'grep -q "trusted_proxies" /config/configuration.yaml' >/dev/null 2>&1; then
+        docker exec svc-homeassistant sh -c 'rm -f /config/configuration.yaml.redoubt-bak' >/dev/null 2>&1 || true
+        dbg "OK: Home Assistant http trust pinned to the edge proxy (appended to the factory config)"
+      else
+        docker exec svc-homeassistant sh -c 'mv -f /config/configuration.yaml.redoubt-bak /config/configuration.yaml' >/dev/null 2>&1 || true
+        dbg "WARNING: Home Assistant trust config did not land: the door stays closed"
+        printf 'off\n' > "$HA_GATE_DIR/svc-homeassistant"
+        return 0
+      fi
+    else
+      dbg "OK: Home Assistant configuration exists (owner-owned: the kit leaves it alone)"
+    fi
+  else
+    docker exec -i svc-homeassistant sh -c 'cat > /config/configuration.yaml' <<HAHTTP
+http:
+  use_x_forwarded_for: true
+  trusted_proxies:
+    - ${ha_edge_ip}
+HAHTTP
+    docker exec svc-homeassistant grep -q trusted_proxies /config/configuration.yaml 2>/dev/null \
+      && dbg "OK: Home Assistant http trust pinned to the edge proxy" \
+      || { dbg "WARNING: Home Assistant trust config did not land: the door stays closed"; printf 'off\n' > "$HA_GATE_DIR/svc-homeassistant"; return 0; }
+  fi
+  # before reporting success: the real https route, the websocket
+  # upgrade and the HA readiness endpoint all answer. A door answer
+  # alone proves the proxy; only /api/ proves Home Assistant itself.
+  local ha_host ha_code ha_ip ha_body i
+  ha_host=$(awk -v p=":$PORT_EDGE4" 'index($0,"https://")==1 && index($0,p) && /[{][[:space:]]*$/ {print; exit}' "$STACKDIR/local-caddy.Caddyfile" 2>/dev/null \
+    | grep -o 'https://[^:, ]*' | head -1 | sed 's|https://||')
+  _HA_HTTPS=0 _HA_WS=0 _HA_READY=0
+  if [ -n "$ha_host" ]; then
+    for i in $(seq 1 20); do
+      ha_code=$(curl -s -o /dev/null -w '%{http_code}' -m 5 --cacert /var/lib/redoubt/caddy-local/cert-share/root-ca.crt \
+        --resolve "$ha_host:$door:127.0.0.1" "https://$ha_host:$door/" 2>/dev/null || true)
+      case "$ha_code" in [1-4]??) _HA_HTTPS=1; break ;; esac
+      sleep 3
+    done
+    ha_code=$(curl -s -o /dev/null -w '%{http_code}' -m 5 --cacert /var/lib/redoubt/caddy-local/cert-share/root-ca.crt \
+      --resolve "$ha_host:$door:127.0.0.1" -H 'Connection: Upgrade' -H 'Upgrade: websocket' \
+      -H 'Sec-WebSocket-Version: 13' -H 'Sec-WebSocket-Key: dGhlIHNhbXBsZSBub25jZQ==' \
+      "https://$ha_host:$door/api/websocket" 2>/dev/null || true)
+    case "$ha_code" in [1-4]??) _HA_WS=1 ;; esac
+  fi
+  ha_ip=$(docker inspect -f '{{range .NetworkSettings.Networks}}{{.IPAddress}} {{end}}' svc-homeassistant 2>/dev/null | awk '{print $1}')
+  if [ -n "$ha_ip" ]; then
+    for i in $(seq 1 20); do
+      ha_body=$(curl -s -m 3 "http://$ha_ip:8123/api/" 2>/dev/null || true)
+      case "$ha_body" in *"API running"*) _HA_READY=1; break ;; esac
+      sleep 3
+    done
+  fi
+  if [ "$_HA_HTTPS" = "1" ] && [ "$_HA_WS" = "1" ] && [ "$_HA_READY" = "1" ]; then
+    dbg "OK: Home Assistant live on door $door (https, websocket and the readiness api all answer)"
+    dbg "Home Assistant widget: left pending on purpose - add it in panel edit mode with http://svc-homeassistant:8123 and a long-lived token created in Home Assistant (Settings, People). The kit never mints, logs or stores that token."
+    # the boot gate keeps the door honest across reboots: it can only
+    # ever close it, a kit pass re-opens after re-verification
+    ha_gate_install
+    if [ -t 3 ]; then
+      echo "Home Assistant is live: https://${SEED_HOST:-$LAN_IP}:${door}" >&3 2>/dev/null || true
+      echo "  Panel: the tile points here. The widget is not seeded on purpose:" >&3 2>/dev/null || true
+      echo "  add it in panel edit mode with http://svc-homeassistant:8123 and a" >&3 2>/dev/null || true
+      echo "  long-lived token you create in Home Assistant (Settings, People)." >&3 2>/dev/null || true
+      echo "  The kit never mints, logs or stores that token." >&3 2>/dev/null || true
+    fi
+  else
+    dbg "WARNING: Home Assistant checks failed (https=$_HA_HTTPS websocket=$_HA_WS ready=$_HA_READY): the door stays closed"
+    printf 'off\n' > "$HA_GATE_DIR/svc-homeassistant"
+    if [ -x /usr/local/sbin/redoubt-svc ]; then
+      /usr/local/sbin/redoubt-svc refresh >> "$LOG" 2>&1 || true
+    else
+      rm -f "$STACKDIR/caddy-services/svc-homeassistant.caddy" 2>/dev/null || true
+    fi
+  fi
+}
+ha_reconcile
+
+# 8d) Mail reconcile: the early pass reserved the door and seeded the
+# tile; this late pass builds the two-service project (Stalwart, the
+# store, fronted by Bulwark, the filter and dkim signer) strictly
+# from the reviewed catalog, provisions the administrator and the
+# family roster, and opens or closes the edge door to match the
+# owner's saved firewall story and the rules that are actually
+# loaded. Runs on every pass with or without the guardian. Anything
+# unverified leaves the site file absent, and an absent site file
+# means the edge aborts on the door. Every request that carries a
+# credential rides stdin or a protected file, never argv, logs, tile
+# urls or DNS output.
+
+# render to a tmp in the same dir, move it in, then prove the final
+# file is byte for byte what was rendered (the same discipline the
+# service builder applies, kit side)
+mail_put() {  # stdin -> $1 with mode $2
+  local _t _w _g
+  _t=$(mktemp "$(dirname "$1")/.mailput.XXXXXX")
+  cat > "$_t"; chmod "$2" "$_t"
+  _w=$(sha256sum "$_t" | cut -d' ' -f1); mv -f "$_t" "$1"; _g=$(sha256sum "$1" | cut -d' ' -f1)
+  [ "$_w" = "$_g" ] || { rm -f "$1"; return 1; }
+}
+
+mail_catalog_install() {  # $1 = space list of permitted smtp ports (empty = none), $2 = jmap url (empty = omit)
+  # the root-owned recipe the builder may deploy: the env and the
+  # two-service compose are fixed here and their shas are pinned
+  # inside the recipe, so the whole package verifies from the single
+  # recipe.sha256 pin. Fails closed: an unpinned or mismatched recipe
+  # never reaches a start. Only the SMTP ports the saved story and
+  # the loaded rules permitted may ride in as published ports.
+  [ -n "$MAIL_STALWART_DIGEST" ] && [ -n "$MAIL_BULWARK_DIGEST" ] \
+    && [ -n "$MAIL_STALWART_VERSION" ] && [ -n "$MAIL_BULWARK_VERSION" ] || return 1
+  local pin_s pin_b smtp="${1:-}" jmap="${2:-}" p envsha composesha t tw w g
+  pin_s="${MAIL_IMAGE_STALWART}:${MAIL_STALWART_VERSION}@${MAIL_STALWART_DIGEST}"
+  pin_b="${MAIL_IMAGE_BULWARK}:${MAIL_BULWARK_VERSION}@${MAIL_BULWARK_DIGEST}"
+  # the published set is whitelisted hard: docker published ports
+  # bypass the host firewall chains, so anything else would be a
+  # public door the decision never approved
+  for p in $smtp; do
+    case "$p" in 25|465|587|993) ;; *) return 1 ;; esac
+  done
+  envsha=$(printf '%s\n' '# Mail env, fixed by the kit recipe' | sha256sum | cut -d' ' -f1)
+  mkdir -p /opt/redoubt/catalog/mail
+  t=$(mktemp /opt/redoubt/catalog/.mailrecipe.XXXXXX)
+  tw=$(mktemp /opt/redoubt/catalog/.mailcompose.XXXXXX)
+  # the two-service project: its own name (a separate compose project
+  # the stack wildcards never see), its own internal bridge for the
+  # stalwart to bulwark hop, and only the stack's own external
+  # network for the edge door. No host network, no docker socket, no
+  # privileged flag, no bind mounts: the named volumes hold all
+  # state. The review confirms the bulwark state path and the
+  # stalwart http port against the pinned release docs before the
+  # first deployment. The door routes to the bulwark container, so it
+  # sits on the external network under its own alias; the store keeps
+  # its own alias for the private-range admin path only.
+  {
+    printf '%s\n' \
+      'name: svc-mail' \
+      'services:' \
+      '  stalwart:' \
+      "    image: $pin_s" \
+      '    container_name: svc-mail-stalwart' \
+      '    restart: unless-stopped' \
+      '    dns: [172.28.0.53, 127.0.0.11]' \
+      '    security_opt:' \
+      '      - no-new-privileges:true' \
+      '    environment:' \
+      '      TZ: UTC' \
+      '    volumes:' \
+      '      - stalwart-data:/opt/stalwart-mail'
+    if [ -n "$smtp" ]; then
+      # the published SMTP doors, only for the permitted set: each
+      # port is a public door by itself, and the docker forwarding
+      # rules are re-verified after every build and every boot
+      printf '    ports:\n'
+      for p in $smtp; do
+        printf '      - "%s:%s"\n' "$p" "$p"
+      done
+    fi
+    printf '%s\n' \
+      '    networks:' \
+      '      default:' \
+      '        aliases: [svc-mail]' \
+      '      mail-internal:' \
+      '  bulwark:' \
+      "    image: $pin_b" \
+      '    container_name: svc-mail-bulwark' \
+      '    restart: unless-stopped' \
+      '    dns: [172.28.0.53, 127.0.0.11]' \
+      '    security_opt:' \
+      '      - no-new-privileges:true' \
+      '    environment:' \
+      '      TZ: UTC'
+    if [ -n "$jmap" ]; then
+      # set before the first start so Bulwark skips its connection
+      # wizard: the door origin the owner's browser already trusts
+      # with the local CA
+      printf '      JMAP_SERVER_URL: %s\n' "$jmap"
+    fi
+    printf '%s\n' \
+      '    volumes:' \
+      '      - bulwark-state:/var/lib/bulwark' \
+      '    networks:' \
+      '      - mail-internal' \
+      '      default:' \
+      '        aliases: [svc-mail-web]' \
+      'networks:' \
+      '  default:' \
+      '    external: true' \
+      '    name: redoubt_default' \
+      '  mail-internal:' \
+      '    driver: bridge' \
+      'volumes:' \
+      '  stalwart-data:' \
+      '  bulwark-state:'
+  } > "$tw"
+  composesha=$(sha256sum "$tw" | cut -d' ' -f1)
+  {
+    printf 'NAME=svc-mail\nIMAGE=%s\nPORT=8080\nTILE=Mail\nICON=/icons/mail.svg\n' "$pin_s"
+    printf 'ENV_SHA=%s\nCOMPOSE_SHA=%s\n' "$envsha" "$composesha"
+    printf '%s\n' '__APP_ENV__'
+    printf '%s\n' '# Mail env, fixed by the kit recipe'
+    printf '%s\n' '__COMPOSE__'
+    cat "$tw"
+  } > "$t"
+  rm -f "$tw"
+  chmod 644 "$t"; chown root:root "$t"
+  w=$(sha256sum "$t" | cut -d' ' -f1)
+  mv -f "$t" /opt/redoubt/catalog/mail/recipe
+  g=$(sha256sum /opt/redoubt/catalog/mail/recipe | cut -d' ' -f1)
+  [ "$w" = "$g" ] || { rm -f /opt/redoubt/catalog/mail/recipe; return 1; }
+  printf '%s\n' "$g" > /opt/redoubt/catalog/mail/recipe.sha256
+  chmod 644 /opt/redoubt/catalog/mail/recipe.sha256
+  return 0
+}
+
+# the dkim selector the kit generates and signs with. Fixed per box:
+# rotating it would orphan the published DNS record
+MAIL_SELECTOR="redoubt"
+# delivery readiness is public DNS: 1 only when the authoritative
+# zone carries exactly the generated set (verified this pass)
+MAIL_DNS_READY=0
+# the release review confirms the Bulwark web login and JMAP API
+# paths and the saved-state config layout before any of the real
+# login and session checks below may pass. Until then the tier
+# reports the pending stage honestly and never fakes a passing check.
+MAIL_WEB_LOGIN_DOC=0
+MAIL_BULWARK_STATE_DOC=0
+
+mail_panel_host() {
+  # the panel's site host is the truth for host names: the mail door
+  # and the jmap url ride the same name the owner's browser already
+  # trusts with the local CA
+  awk -v p=":$PORT_EDGE4" 'index($0,"https://")==1 && index($0,p) && /[{][[:space:]]*$/ {print; exit}' "$STACKDIR/local-caddy.Caddyfile" 2>/dev/null \
+    | grep -o 'https://[^:, ]*' | head -1 | sed 's|https://||'
+}
+
+mail_dkim_keys() {
+  # the signing key lives and stays on the box: only the public p=
+  # value may ever leave it. Generated once, 2048 bit rsa, root-only.
+  mkdir -p "$MAIL_KEYS"
+  chmod 700 "$MAIL_KEYS" 2>/dev/null || true
+  if [ ! -f "$MAIL_KEYS/$MAIL_SELECTOR.key" ]; then
+    openssl genrsa -out "$MAIL_KEYS/$MAIL_SELECTOR.key" 2048 2>/dev/null || return 1
+    chmod 600 "$MAIL_KEYS/$MAIL_SELECTOR.key"
+  fi
+  [ "$(stat -c '%u %a' "$MAIL_KEYS/$MAIL_SELECTOR.key" 2>/dev/null)" = "0 600" ] || return 1
+}
+
+mail_spf_value() {
+  # exactly one SPF record may exist: a published v=spf1 merges into
+  # the kit's single record (its mechanisms join the kit's mx, its
+  # all qualifier is kept), never a second TXT
+  local cur t all out
+  cur=$(dig +short TXT "$MAIL_DOMAIN" 2>/dev/null | tr -d '"' | grep '^v=spf1 ' | head -1 || true)
+  out="v=spf1 mx"
+  all="-all"
+  if [ -n "$cur" ]; then
+    for t in ${cur#v=spf1 }; do
+      case "$t" in all|+all|-all|~all|?all) all="$t" ;; *) out="$out $t" ;; esac
+    done
+  fi
+  printf '%s %s\n' "$out" "$all"
+}
+
+mail_dns_records() {
+  # the approved zone set: exactly the records the kit owns. MX and
+  # the A/AAAA pairs are the only lines that move delivery, so the
+  # cutover confirmation and the owner's public addresses gate them.
+  # One line per record: TYPE|NAME|TTL|VALUE. The dkim private key
+  # never leaves the box; only its public p= value is printed.
+  local spf dmarc dkim
+  [ -n "$MAIL_DOMAIN" ] && mail_domain_ok "$MAIL_DOMAIN" || return 1
+  mail_dkim_keys || return 1
+  dkim=$(openssl pkey -in "$MAIL_KEYS/$MAIL_SELECTOR.key" -pubout 2>/dev/null \
+    | grep -v -- '-----' | tr -d '\n' || true)
+  [ -n "$dkim" ] || return 1
+  spf=$(mail_spf_value)
+  dmarc="v=DMARC1; p=quarantine; adkim=s; aspf=s"
+  printf 'MX|%s|300|10 %s\n' "$MAIL_DOMAIN" "$MAIL_HOST"
+  printf 'TXT|%s|300|%s\n' "$MAIL_DOMAIN" "$spf"
+  printf 'TXT|%s._domainkey.%s|300|v=DKIM1; k=rsa; p=%s\n' "$MAIL_SELECTOR" "$MAIL_DOMAIN" "$dkim"
+  printf 'TXT|_dmarc.%s|300|%s\n' "$MAIL_DOMAIN" "$dmarc"
+  [ -n "$MAIL_PUB4" ] && printf 'A|%s|300|%s\n' "$MAIL_HOST" "$MAIL_PUB4"
+  [ -n "$MAIL_PUB6" ] && printf 'AAAA|%s|300|%s\n' "$MAIL_HOST" "$MAIL_PUB6"
+}
+
+mail_dns_provider_ok() {
+  # the owner's provider adapter, the only piece that holds a provider
+  # credential: root-owned, closed to others, a fixed path with no
+  # directory tricks. The kit feeds it only the approved records on
+  # stdin and never calls a provider API itself.
+  local f=/etc/redoubt/mail-dns-provider.sh
+  [ -f "$f" ] || return 1
+  case "$(stat -c '%u %a' "$f" 2>/dev/null)" in "0 700"|"0 750") : ;; *) return 1 ;; esac
+}
+
+mail_dns_verify() {
+  # the zone's own authoritative servers answer, never the resolver's
+  # cache: NS discovery first, then direct queries. MAIL_DNS_READY
+  # turns 1 only when every generated record is present and matching.
+  local ns mx spf dkim dmarc a4 a6 out
+  MAIL_DNS_READY=0
+  command -v dig >/dev/null 2>&1 || { dbg "mail dns: dig is missing: delivery readiness cannot be verified"; return 1; }
+  ns=$(dig +short NS "$MAIL_DOMAIN" 2>/dev/null | head -1 || true)
+  [ -n "$ns" ] || { dbg "mail dns: no authoritative NS for $MAIL_DOMAIN: nothing to verify against"; return 1; }
+  mx=$(dig +short MX "$MAIL_DOMAIN" @"$ns" 2>/dev/null | head -1 || true); mx="${mx%.}"
+  spf=$(dig +short TXT "$MAIL_DOMAIN" @"$ns" 2>/dev/null | tr -d '"' | grep '^v=spf1 ' | head -1 || true)
+  dkim=$(dig +short TXT "$MAIL_SELECTOR._domainkey.$MAIL_DOMAIN" @"$ns" 2>/dev/null | tr -d '"' | head -1 || true)
+  dmarc=$(dig +short TXT "_dmarc.$MAIL_DOMAIN" @"$ns" 2>/dev/null | tr -d '"' | head -1 || true)
+  a4=$(dig +short A "$MAIL_HOST" @"$ns" 2>/dev/null | head -1 || true)
+  a6=$(dig +short AAAA "$MAIL_HOST" @"$ns" 2>/dev/null | head -1 || true)
+  out=""
+  [ "$mx" = "10 $MAIL_HOST" ] || out="$out MX"
+  [ "$spf" = "$(mail_spf_value)" ] || out="$out SPF"
+  case "$dkim" in "v=DKIM1; k=rsa; p="*) : ;; *) out="$out DKIM" ;; esac
+  case "$dmarc" in v=DMARC1*) : ;; *) out="$out DMARC" ;; esac
+  if [ -n "$MAIL_PUB4" ] && [ "$a4" != "$MAIL_PUB4" ]; then out="$out A"; fi
+  if [ -n "$MAIL_PUB6" ] && [ "$a6" != "$MAIL_PUB6" ]; then out="$out AAAA"; fi
+  if [ -n "$out" ]; then
+    dbg "mail dns: the authoritative zone still differs ($out): delivery is not ready and the kit never claims it is"
+    return 1
+  fi
+  MAIL_DNS_READY=1
+  dbg "OK: mail dns: the authoritative zone for $MAIL_DOMAIN carries the kit's MX, SPF, DKIM and DMARC records"
+  return 0
+}
+
+mail_dns_reconcile() {
+  # delivery readiness is DNS: generate the approved set, reconcile it
+  # (managed: through the owner's adapter; paste: as a printed list
+  # the owner applies by hand), and verify against the authoritative
+  # zone. The MX line moves only at the confirmed cutover, in either
+  # mode. Propagation is the provider's: an immediate miss just means
+  # the next pass re-verifies.
+  local recs out
+  [ -n "$MAIL_DOMAIN" ] && mail_domain_ok "$MAIL_DOMAIN" || return 0
+  recs=$(mail_dns_records) || { dbg "WARNING: mail dns: the zone records could not be generated: delivery stays unready"; return 0; }
+  if [ "$MAIL_DNS_MODE" = "managed" ]; then
+    if ! mail_dns_provider_ok; then
+      dbg "mail dns: managed mode needs the owner's provider adapter at /etc/redoubt/mail-dns-provider.sh (root-owned 700): it alone holds the scoped provider credential; until it exists the zone is not reconciled"
+      return 0
+    fi
+    # the approved records only, one line each (TYPE|NAME|TTL|VALUE),
+    # and the MX line strictly at the confirmed cutover: the adapter
+    # must reconcile exactly this set with its narrowly scoped
+    # credential and touch nothing else in the zone
+    out=$(printf '%s\n' "$recs" | grep -v '^MX|')
+    if [ "$REDOUBT_MAIL_MX_CUTOVER" = "1" ]; then
+      out="$out
+$(printf '%s\n' "$recs" | grep '^MX|')"
+    else
+      dbg "mail dns: MX publication waits for the cutover confirmation (REDOUBT_MAIL_MX_CUTOVER=1): the adapter received the other records only"
+    fi
+    printf '%s\n' "$out" | /etc/redoubt/mail-dns-provider.sh >> "$LOG" 2>&1 \
+      || dbg "WARNING: mail dns: the provider adapter reported a failure: the zone may be unreconciled (see the log)"
+  else
+    # paste mode prints the set without private keys. This list is
+    # not applied automatically: pasting is the owner's own act, and
+    # the MX line is the owner's own planned cutover.
+    dbg "mail dns: paste these records into the $MAIL_DOMAIN zone (the printed list is not applied automatically):"
+    printf '%s\n' "$recs" | while IFS='|' read -r _mr _mn _mt _mv; do
+      [ -n "$_mr" ] || continue
+      if [ "$_mr" = "MX" ]; then
+        log "mail dns paste: $_mr $_mn -> $_mv (paste MX only at your planned cutover; set REDOUBT_MAIL_MX_CUTOVER=1 to record the confirmation)"
+      else
+        log "mail dns paste: $_mr $_mn -> $_mv"
+      fi
+    done
+  fi
+  mail_dns_verify || return 0
+  return 0
+}
+
+mail_smtp_ports() {
+  # the ports the saved exposure decision and the owner's selection
+  # permit: inbound 25 for on, submission 587 and IMAP 993 only when
+  # selected, 465 never (legacy implicit TLS; submission is the real
+  # door). relay means outbound through the owner's relay only: no
+  # published port at all.
+  local out=""
+  [ "$MAIL_EXPOSE" = "on" ] || return 0
+  out="25"
+  [ "$REDOUBT_MAIL_SUBMIT" = "1" ] && out="$out 587"
+  [ "$REDOUBT_MAIL_IMAP" = "1" ] && out="$out 993"
+  printf '%s\n' "$out"
+}
+
+mail_smtp_rules() {  # $1 = permitted port list (empty removes the kit's rules)
+  # the kit-managed host rules for the SMTP doors. Both forms are
+  # cleaned first so a flipped decision never leaves the old form
+  # behind, exactly like the app-door apply above. Public exposure
+  # needs the plain on story: a mesh-only story never gets SMTP.
+  local p
+  for p in 25 587 465 993; do
+    if [ "$FW_KIND" = "ufw" ]; then
+      ufw delete allow "$p/tcp" >/dev/null 2>&1 || true
+      ufw delete allow in on wt0 to any port "$p" proto tcp >/dev/null 2>&1 || true
+    elif [ "$FW_KIND" = "firewalld" ]; then
+      firewall-cmd --permanent --remove-port="$p/tcp" >/dev/null 2>&1 || true
+      firewall-cmd --permanent --zone=redoubt-mesh --remove-port="$p/tcp" >/dev/null 2>&1 || true
+    fi
+  done
+  for p in $1; do
+    case "$p" in 25|587|993) : ;; *) continue ;; esac
+    if [ "$FW_KIND" = "ufw" ]; then
+      ufw allow "$p/tcp" >/dev/null 2>&1 || true
+    elif [ "$FW_KIND" = "firewalld" ]; then
+      firewall-cmd --permanent --add-port="$p/tcp" >/dev/null 2>&1 || true
+    fi
+  done
+  [ "$FW_KIND" = "firewalld" ] && firewall-cmd --reload >/dev/null 2>&1 || true
+}
+
+mail_smtp_rules_live() {  # true when every port in $1 is open in the loaded rules
+  local p
+  for p in $1; do
+    if [ "$FW_KIND" = "ufw" ]; then
+      cat /etc/ufw/user.rules 2>/dev/null | grep -qE -- "--dport $p([[:space:]]|$)" || return 1
+      if grep -q '^IPV6=yes' /etc/ufw/ufw.conf 2>/dev/null; then
+        cat /etc/ufw/user6.rules 2>/dev/null | grep -qE -- "--dport $p([[:space:]]|$)" || return 1
+      fi
+    elif [ "$FW_KIND" = "firewalld" ]; then
+      fw_ports_cover "$(firewall-cmd --list-ports 2>/dev/null || true)" "$p" || return 1
+    else
+      return 1
+    fi
+  done
+  return 0
+}
+
+mail_docker_fwd() {  # true when docker forwards every port in $1 (v4, and v6 when docker manages it)
+  local p v4 v6
+  v4=$(iptables -t nat -S DOCKER 2>/dev/null || true)
+  v6=$(ip6tables -t nat -S DOCKER 2>/dev/null || true)
+  for p in $1; do
+    printf '%s\n' "$v4" | grep -qE -- "--dport $p -j DNAT" || return 1
+    # docker publishes to both families only when the daemon manages
+    # ipv6: an empty v6 chain means v4 is the whole story
+    if [ -n "$v6" ]; then
+      printf '%s\n' "$v6" | grep -qE -- "--dport $p -j DNAT" || return 1
+    fi
+  done
+  return 0
+}
+
+mail_expose_eval() {  # $1 = the permitted plan; proves docker forwarding, writes the boot story
+  local want="$1" story="off"
+  if [ -n "$want" ] && mail_docker_fwd "$want"; then
+    story="$want"
+  elif [ -n "$want" ]; then
+    dbg "mail smtp doors stay closed: the published ports ($want) lack the docker forwarding rules to prove them (the daemon's nat chains bypass the host firewall paths, so unproven ports never count as open)"
+  fi
+  printf '%s\n' "$story" > "$MAIL_GATE_DIR/svc-mail-smtp"
+  chmod 644 "$MAIL_GATE_DIR/svc-mail-smtp" 2>/dev/null || true
+  printf '%s\n' "$story"
+}
+
+mail_web_verify() {  # $1 = door, $2 = host; the strict door check, never the generic probe alone
+  local door=$1 host=$2 i code
+  code=""
+  for i in $(seq 1 20); do
+    code=$(curl -s -o /dev/null -w '%{http_code}' -m 5 --cacert /var/lib/redoubt/caddy-local/cert-share/root-ca.crt \
+      --resolve "$host:$door:127.0.0.1" "https://$host:$door/" 2>/dev/null || true)
+    case "$code" in [1-4]??) break ;; esac
+    sleep 3
+  done
+  case "$code" in [1-4]??) : ;; *) return 1 ;; esac
+  # the generic probe above proves only that something answers. The
+  # design requires a real login and a real JMAP session before the
+  # door opens: the exact Bulwark login and JMAP API paths belong to
+  # the pinned release, and the release review pins them here. Until
+  # then the tier honestly reports the pending stage and never fakes
+  # a passing check.
+  if [ "$MAIL_WEB_LOGIN_DOC" != "1" ]; then
+    dbg "mail tier: web door answers $code, but the real login and JMAP session check is stage pending (the release review pins the Bulwark login and JMAP paths first; an answering page is not readiness)"
+    return 1
+  fi
+  # the review lands the documented calls here: a login request with
+  # the administrator credential from $MAIL_CREDS riding stdin (never
+  # argv), the session token out of the response, then a JMAP
+  # Core/echo through the same door, and only a valid RFC 8620
+  # session passes. Bulwark's 1.18 OAuth auto-configure step stays
+  # with the owner's admin step either way: the kit never claims that
+  # automation.
+  return 1
+}
+
+mail_bulwark_state_check() {
+  # Bulwark persists its admin choices in its state volume, and a
+  # saved value overrides the environment values the recipe set. The
+  # deployment is only immutable after that persisted state is read
+  # and compared, so a conflict cannot ride silently.
+  [ "$MAIL_BULWARK_STATE_DOC" = "1" ] || {
+    dbg "mail tier: stage pending (the Bulwark saved-state path is not yet confirmed by the release review: the persisted admin config can override the environment values, and the kit will not call the deployment immutable until the conflict check is real)"
+    return 1
+  }
+  local mp
+  mp=$(docker volume inspect -f '{{.Mountpoint}}' svc-mail_bulwark-state 2>/dev/null || true)
+  [ -n "$mp" ] && [ -n "$(find "$mp" -mindepth 1 -maxdepth 1 2>/dev/null | head -1)" ] || return 0
+  # the review lands the config file and key names here: compare the
+  # saved JMAP server and admin choices against the recipe values and
+  # fail closed on any difference
+  return 1
+}
+
+# the release review flips this to 1 only after the pinned Stalwart
+# release's documented bootstrap path is confirmed. Until then the
+# tier reports the stage pending and never claims a zero-step setup:
+# Stalwart's first start prints a temporary admin password and a
+# wizard, and no unattended path may be invented.
+MAIL_BOOTSTRAP_DOC=0
+
+mail_digest_ok() {
+  # every running mail container carries its pinned digest
+  local cid iid
+  cid=$(docker compose -p svc-mail -f "$MAIL_SVC_DIR/compose.yml" ps -q stalwart 2>/dev/null)
+  [ -n "$cid" ] || return 1
+  iid=$(docker inspect -f '{{.Image}}' "$cid" 2>/dev/null)
+  docker image inspect -f '{{range .RepoDigests}}{{println .}}{{end}}' "$iid" 2>/dev/null | grep -q "@${MAIL_STALWART_DIGEST}$" || return 1
+  cid=$(docker compose -p svc-mail -f "$MAIL_SVC_DIR/compose.yml" ps -q bulwark 2>/dev/null)
+  [ -n "$cid" ] || return 1
+  iid=$(docker inspect -f '{{.Image}}' "$cid" 2>/dev/null)
+  docker image inspect -f '{{range .RepoDigests}}{{println .}}{{end}}' "$iid" 2>/dev/null | grep -q "@${MAIL_BULWARK_DIGEST}$" || return 1
+}
+
+mail_build() {  # $1 = the door; renders from the recipe with byte checks
+  local door=$1 pin_s dir="$MAIL_SVC_DIR" csha esha
+  pin_s="${MAIL_IMAGE_STALWART}:${MAIL_STALWART_VERSION}@${MAIL_STALWART_DIGEST}"
+  esha=$(sed -n 's/^ENV_SHA=//p' "$MAIL_CATALOG/recipe" | head -1)
+  csha=$(sed -n 's/^COMPOSE_SHA=//p' "$MAIL_CATALOG/recipe" | head -1)
+  mkdir -p "$dir"
+  # the door routes to the Bulwark webmail container, not the store:
+  # the PROXY key makes the site renderer target the svc-mail-web
+  # alias, while the store keeps its own alias for the private-range
+  # admin path only
+  printf 'NAME=%s\nIMAGE=%s\nPORT=8080\nDOOR=%s\nPROXY=svc-mail-web\nTILE=Mail\nICON=/icons/mail.svg\n' \
+    "svc-mail" "$pin_s" "$door" | mail_put "$dir/meta" 644 || return 1
+  # the fixed env and compose ride out of the recipe verbatim; the
+  # byte check runs on every file before anything starts
+  sed -n '/^__APP_ENV__$/,/^__COMPOSE__$/p' "$MAIL_CATALOG/recipe" | sed '1d;$d' | mail_put "$dir/app.env" 600 || return 1
+  sed -n '/^__COMPOSE__$/,$p' "$MAIL_CATALOG/recipe" | sed '1d' | mail_put "$dir/compose.yml" 644 || return 1
+  [ "$(sha256sum "$dir/app.env" | cut -d' ' -f1)" = "$esha" ] || { dbg "WARNING: mail app.env failed the byte check"; return 1; }
+  [ "$(sha256sum "$dir/compose.yml" | cut -d' ' -f1)" = "$csha" ] || { dbg "WARNING: mail compose failed the byte check"; return 1; }
+  cp "$MAIL_CATALOG/recipe.sha256" "$dir/recipe.sha256"
+  sha256sum "$dir/compose.yml" | cut -d' ' -f1 > "$dir/compose.sha256"
+  docker compose -p svc-mail -f "$dir/compose.yml" config -q || { dbg "WARNING: compose rejected the mail project"; return 1; }
+  docker pull -q "$pin_s" >/dev/null || { dbg "WARNING: pull failed for $pin_s"; return 1; }
+  docker pull -q "${MAIL_IMAGE_BULWARK}:${MAIL_BULWARK_VERSION}@${MAIL_BULWARK_DIGEST}" >/dev/null || { dbg "WARNING: pull failed for the Bulwark pin"; return 1; }
+  docker compose -p svc-mail -f "$dir/compose.yml" up -d >/dev/null 2>&1 || { dbg "WARNING: mail compose up failed"; return 1; }
+  mail_digest_ok || { dbg "WARNING: a mail container is not running its pinned image"; return 1; }
+  return 0
+}
+
+mail_verify() {
+  # recipe bytes, compose config, both running digests and the site
+  # file must all check out before the door may open
+  local esha csha
+  esha=$(sed -n 's/^ENV_SHA=//p' "$MAIL_CATALOG/recipe" | head -1)
+  csha=$(sed -n 's/^COMPOSE_SHA=//p' "$MAIL_CATALOG/recipe" | head -1)
+  [ -f "$MAIL_SVC_DIR/app.env" ] && [ "$(sha256sum "$MAIL_SVC_DIR/app.env" | cut -d' ' -f1)" = "$esha" ] || return 1
+  [ -f "$MAIL_SVC_DIR/compose.yml" ] && [ "$(sha256sum "$MAIL_SVC_DIR/compose.yml" | cut -d' ' -f1)" = "$csha" ] || return 1
+  [ "$(sha256sum "$MAIL_SVC_DIR/compose.yml" | cut -d' ' -f1)" = "$(cat "$MAIL_SVC_DIR/compose.sha256" 2>/dev/null)" ] || return 1
+  docker compose -p svc-mail -f "$MAIL_SVC_DIR/compose.yml" config -q 2>/dev/null || return 1
+  mail_digest_ok || return 1
+  [ -f "$STACKDIR/caddy-services/svc-mail.caddy" ] || return 1
+  [ "$(sha256sum "$STACKDIR/caddy-services/svc-mail.caddy" | cut -d' ' -f1)" = "$(cat "$MAIL_SVC_DIR/site.sha256" 2>/dev/null)" ] || return 1
+}
+
+mail_credentials() {
+  # distinct credentials for the administrator and every roster entry,
+  # minted here, written only to the protected file, never to argv,
+  # logs, tile urls or DNS output. Existing lines are kept, so a
+  # re-run never re-rolls a live mailbox password.
+  mkdir -p /etc/redoubt
+  [ -f "$MAIL_CREDS" ] || { : > "$MAIL_CREDS"; chmod 600 "$MAIL_CREDS"; }
+  [ "$(stat -c '%u %a' "$MAIL_CREDS" 2>/dev/null)" = "0 600" ] || { dbg "WARNING: $MAIL_CREDS must be root-owned 600"; return 1; }
+  local l pw
+  if ! grep -qs '^admin=' "$MAIL_CREDS"; then
+    pw=$(openssl rand -hex 24) || return 1
+    printf 'admin=%s\n' "$pw" >> "$MAIL_CREDS"
+  fi
+  while IFS= read -r l; do
+    case "$l" in ''|\#*) continue ;; esac
+    l="${l#"${l%%[![:space:]]*}"}"
+    l="${l%"${l##*[![:space:]]}"}"
+    [ -n "$l" ] || continue
+    grep -qsF -- "${l}@" "$MAIL_CREDS" || {
+      pw=$(openssl rand -hex 24) || return 1
+      printf '%s@%s=%s\n' "$l" "$MAIL_DOMAIN" "$pw" >> "$MAIL_CREDS"
+    }
+  done < "$MAIL_ROSTER"
+  chmod 600 "$MAIL_CREDS"
+  return 0
+}
+
+mail_bootstrap() {
+  # Stalwart's first start prints a temporary admin password and a
+  # wizard. The unattended path exists only where the pinned
+  # release's documentation describes it; the kit never fakes it.
+  [ "$MAIL_BOOTSTRAP_DOC" = "1" ] || {
+    dbg "mail tier: stage pending (the pinned release documents no unattended bootstrap: provision the Stalwart administrator and the roster accounts through its wizard; pre-minted credentials wait in $MAIL_CREDS, readable only as root)"
+    return 1
+  }
+  # the release review lands the documented bootstrap and management
+  # API calls here. Every request must ride stdin or a protected file
+  # (--data-binary @file or a here-doc pipe), never argv, and the
+  # responses never reach the log, tile urls or DNS output. The
+  # bootstrap listener stays on the internal networks only (the
+  # recipe publishes no host port) until ownership is verified.
+  return 1
+}
+
+mail_gate_install() {
+  # the boot gate: after a reboot the mail door may never be more open
+  # than the saved story and the loaded rules justify. The script only
+  # closes; re-opening always rides a kit pass that re-verifies first.
+  # The story the boot gate reads is the kit's own last evaluation
+  # (the svc-gates file): the encrypted env's passphrase is never
+  # repeated outside the kit's own heredocs, so the gate trusts the
+  # file the kit pass just wrote instead of re-decrypting.
+  kit_put_exec /usr/local/sbin/redoubt-mail-gate 755 <<'MAILGATE'
+#!/usr/bin/env bash
+# redoubt-mail-gate: re-applies the mail door gate at boot.
+# The kit's last evaluation plus the rules actually loaded decide; the
+# site file is the switch (absent means the edge aborts on the door).
+# This script only ever closes the door: re-opening needs a kit pass.
+# A mesh-only door (the on-nas story) reads as closed here: closing a
+# door the story allowed is safe, the next kit pass re-opens it.
+set -euo pipefail
+umask 022
+PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
+CONF=/etc/redoubt/services.conf
+[ -s "$CONF" ] || exit 0
+cv() { sed -n "s/^$1=//p" "$CONF" | head -1; }
+STACKDIR=$(cv STACKDIR)
+META=/opt/redoubt/services/svc-mail/meta
+[ -f "$META" ] || exit 0
+DOOR=$(sed -n 's/^DOOR=//p' "$META" | head -1)
+[ -n "$DOOR" ] || exit 0
+STORY=/etc/redoubt/svc-gates/svc-mail
+[ -f "$STORY" ] || exit 0
+FW=$(cat "$STORY")
+GATE=on
+case "$FW" in on|on-nas) ;; *) GATE=off ;; esac
+if [ "$GATE" = "on" ] && command -v ufw >/dev/null 2>&1; then
+  R4=$(cat /etc/ufw/user.rules 2>/dev/null || true)
+  R6=$(cat /etc/ufw/user6.rules 2>/dev/null || true)
+  NEED6=0
+  grep -q '^IPV6=yes' /etc/ufw/ufw.conf 2>/dev/null && NEED6=1
+  if [ "$FW" = "on" ]; then
+    echo "$R4" | grep -q -- "--dport $DOOR" || GATE=off
+    if [ "$NEED6" = "1" ] && ! echo "$R6" | grep -q -- "--dport $DOOR"; then GATE=off; fi
+  else
+    echo "$R4" | grep -- "-i wt0" | grep -q -- "--dport $DOOR" || GATE=off
+    if [ "$NEED6" = "1" ] && ! echo "$R6" | grep -- "-i wt0" | grep -q -- "--dport $DOOR"; then GATE=off; fi
+  fi
+elif [ "$GATE" = "on" ] && command -v firewall-cmd >/dev/null 2>&1; then
+  # the service block rides as one N-M/tcp range: a listed range
+  # covers the door just like an exact port entry would
+  cover() {
+    for _p in $1; do
+      _p="${_p%%/*}"
+      case "$_p" in
+        *-*) _lo="${_p%-*}"; _hi="${_p#*-}"
+             case "$_lo$_hi" in
+               ""|*[!0-9]*) ;;
+               *) [ "$DOOR" -ge "$_lo" ] && [ "$DOOR" -le "$_hi" ] && return 0 ;;
+             esac ;;
+        *) [ "$_p" = "$DOOR" ] && return 0 ;;
+      esac
+    done
+    return 1
+  }
+  PORTS=$(firewall-cmd --list-ports 2>/dev/null || true)
+  if [ "$FW" = "on" ]; then
+    cover "$PORTS" || GATE=off
+  else
+    ZP=$(firewall-cmd --zone=redoubt-mesh --list-ports 2>/dev/null || true)
+    cover "$ZP" || GATE=off
+  fi
+elif [ "$GATE" = "on" ]; then
+  # no firewall tool left to verify the saved story against: the door
+  # stays closed until a kit pass re-verifies the loaded rules
+  GATE=off
+fi
+if [ "$GATE" = "on" ]; then
+  exit 0
+fi
+# close the door: drop the site file and reload the edge. A door with
+# no site behind it aborts at the edge.
+SITE="$STACKDIR/caddy-services/svc-mail.caddy"
+if [ -f "$SITE" ]; then
+  rm -f "$SITE"
+  docker exec redoubt-edge-local-1 caddy reload --config /etc/caddy/Caddyfile --adapter caddyfile >/dev/null 2>&1 \
+    || docker restart redoubt-edge-local-1 >/dev/null 2>&1 || true
+fi
+# the SMTP doors recheck after reboot: the kit's last evaluation plus
+# the docker forwarding rules decide. Published ports ride the
+# daemon's nat chains and bypass the host firewall paths, so after a
+# reboot the story must match the rules actually loaded before docker
+# is trusted again. This gate only ever closes: it stops the project
+# or writes the story off, and a kit pass re-opens after
+# re-verification.
+SMTPS=/etc/redoubt/svc-gates/svc-mail-smtp
+SSTORY=$(cat "$SMTPS" 2>/dev/null || true)
+[ -n "$SSTORY" ] || SSTORY=off
+COMPOSE=/opt/redoubt/services/svc-mail/compose.yml
+# wait a bounded while for docker to bring the containers (and their
+# nat rules) back, so a slow boot is not read as an open door
+for _w in $(seq 1 12); do
+  [ -f "$COMPOSE" ] || break
+  [ "$(docker compose -p svc-mail -f "$COMPOSE" ps -q 2>/dev/null | wc -l)" -gt 0 ] && break
+  sleep 5
+done
+fwd() {  # true when docker forwards the port (v4, and v6 when docker manages it)
+  iptables -t nat -S DOCKER 2>/dev/null | grep -qE -- "--dport $1 -j DNAT" || return 1
+  if [ -n "$(ip6tables -t nat -S DOCKER 2>/dev/null || true)" ]; then
+    ip6tables -t nat -S DOCKER 2>/dev/null | grep -qE -- "--dport $1 -j DNAT" || return 1
+  fi
+  return 0
+}
+if [ "$SSTORY" = "off" ]; then
+  # the saved story says closed: a live forwarding rule for any SMTP
+  # port is a door the story never approved, and a compose file that
+  # still publishes one must not start either, so the project stops
+  # until a kit pass reconciles the truth
+  if [ -f "$COMPOSE" ] && grep -qE '^[[:space:]]*-[[:space:]]*"(25|587|465|993):' "$COMPOSE"; then
+    docker compose -p svc-mail -f "$COMPOSE" down >/dev/null 2>&1 || true
+  else
+    for _p in 25 587 465 993; do
+      if fwd "$_p"; then
+        docker compose -p svc-mail -f "$COMPOSE" down >/dev/null 2>&1 || true
+        printf 'off\n' > "$STORY"
+        break
+      fi
+    done
+  fi
+else
+  # the story says open: every port in it must show in the host rules
+  # and in the docker forwarding, both families, or everything closes
+  GATESMTP=on
+  for _p in $SSTORY; do
+    case "$_p" in 25|587|993) : ;; *) GATESMTP=off ;; esac
+    if [ "$GATESMTP" = "on" ]; then
+      if command -v ufw >/dev/null 2>&1; then
+        cat /etc/ufw/user.rules 2>/dev/null | grep -qE -- "--dport $_p([[:space:]]|$)" || GATESMTP=off
+        if [ "$GATESMTP" = "on" ] && grep -q '^IPV6=yes' /etc/ufw/ufw.conf 2>/dev/null; then
+          cat /etc/ufw/user6.rules 2>/dev/null | grep -qE -- "--dport $_p([[:space:]]|$)" || GATESMTP=off
+        fi
+      elif command -v firewall-cmd >/dev/null 2>&1; then
+        cover() {
+          for _z in $1; do
+            _z="${_z%%/*}"
+            case "$_z" in
+              *-*) _zl="${_z%-*}"; _zh="${_z#*-}"
+                   case "$_zl$_zh" in
+                     ""|*[!0-9]*) ;;
+                     *) [ "$2" -ge "$_zl" ] && [ "$2" -le "$_zh" ] && return 0 ;;
+                   esac ;;
+              *) [ "$_z" = "$2" ] && return 0 ;;
+            esac
+          done
+          return 1
+        }
+        cover "$(firewall-cmd --list-ports 2>/dev/null || true)" "$_p" || GATESMTP=off
+      else
+        GATESMTP=off
+      fi
+      [ "$GATESMTP" = "on" ] && fwd "$_p" || GATESMTP=off
+    fi
+  done
+  if [ "$GATESMTP" != "on" ]; then
+    docker compose -p svc-mail -f "$COMPOSE" down >/dev/null 2>&1 || true
+    printf 'off\n' > "$SMTPS"
+  fi
+fi
+exit 0
+MAILGATE
+  cat > /etc/systemd/system/redoubt-mail-gate.service <<'MAILUNIT'
+[Unit]
+Description=Redoubt mail door gate (closed unless verified)
+After=docker.service network-online.target
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+ExecStart=/usr/local/sbin/redoubt-mail-gate
+
+[Install]
+WantedBy=multi-user.target
+MAILUNIT
+  chmod 644 /etc/systemd/system/redoubt-mail-gate.service
+  systemctl daemon-reload >/dev/null 2>&1 || true
+  systemctl enable redoubt-mail-gate.service >/dev/null 2>&1 || true
+}
+
+mail_reconcile() {
+  [ "${REDOUBT_MAIL:-0}" = "1" ] || return 0
+  if [ -z "$MAIL_STALWART_DIGEST" ] || [ -z "$MAIL_BULWARK_DIGEST" ] \
+     || [ -z "$MAIL_STALWART_VERSION" ] || [ -z "$MAIL_BULWARK_VERSION" ]; then
+    # unreviewed releases: the tier stays off and says exactly why
+    dbg "mail tier: stage pending (no reviewed release pins yet: MAIL_STALWART_DIGEST and MAIL_BULWARK_DIGEST are empty until the release review fills them; digests are never guessed)"
+    return 0
+  fi
+  local door="${MAIL_DOOR:-}"
+  [ -n "$door" ] || { dbg "WARNING: the mail tier has no reserved door: the tier stays off"; return 0; }
+  # the SMTP door plan is decided before the recipe renders: docker
+  # published ports ride the daemon's own nat chains and bypass the
+  # host firewall paths, so only the plan that the saved story and
+  # the loaded rules actually permit may ride into the compose file
+  local smtp_plan
+  smtp_plan=$(mail_smtp_ports)
+  if [ -n "$smtp_plan" ] && [ "$FW_ACTIVE" = "1" ] && [ "${FW_DECISION:-}" = "on" ]; then
+    mail_smtp_rules "$smtp_plan"
+    if ! mail_smtp_rules_live "$smtp_plan"; then
+      dbg "mail smtp doors stay closed: the saved firewall story is on, but the loaded rules do not show $(printf '%s' "$smtp_plan") (both families)"
+      smtp_plan=""
+    fi
+  else
+    if [ -n "$smtp_plan" ]; then
+      dbg "mail smtp doors stay closed: public inbound mail needs the on firewall story and an active firewall (saved ${FW_DECISION:-none}, active $FW_ACTIVE)"
+      smtp_plan=""
+    fi
+    mail_smtp_rules ""
+  fi
+  local jmap_url="" mail_site_host
+  mail_site_host=$(mail_panel_host)
+  [ -n "$mail_site_host" ] && jmap_url="https://$mail_site_host:$door"
+  mail_catalog_install "$smtp_plan" "$jmap_url" || {
+    dbg "WARNING: mail catalog failed the byte check: the tier stays off"
+    mkdir -p "$MAIL_GATE_DIR"
+    printf 'off\n' > "$MAIL_GATE_DIR/svc-mail"
+    chmod 644 "$MAIL_GATE_DIR/svc-mail" 2>/dev/null || true
+    printf 'off\n' > "$MAIL_GATE_DIR/svc-mail-smtp"
+    chmod 644 "$MAIL_GATE_DIR/svc-mail-smtp" 2>/dev/null || true
+    if [ -x /usr/local/sbin/redoubt-svc ]; then
+      /usr/local/sbin/redoubt-svc refresh >> "$LOG" 2>&1 || true
+    else
+      rm -f "$STACKDIR/caddy-services/svc-mail.caddy" 2>/dev/null || true
+    fi
+    return 0
+  }
+  # the gate is decided before anything starts, so a first activation
+  # never renders a site for an unverified firewall story: the saved
+  # story plus the rules that are really loaded decide, never the
+  # app-door list alone
+  local gate
+  gate=$(ha_gate_eval "$door")
+  mkdir -p "$MAIL_GATE_DIR"
+  printf '%s\n' "$gate" > "$MAIL_GATE_DIR/svc-mail"
+  chmod 644 "$MAIL_GATE_DIR/svc-mail" 2>/dev/null || true
+  # the SMTP story starts closed: it flips on only after the build
+  # proved the docker forwarding rules for every published port, and
+  # a half-finished build never leaves a story the rules cannot back
+  printf 'off\n' > "$MAIL_GATE_DIR/svc-mail-smtp"
+  chmod 644 "$MAIL_GATE_DIR/svc-mail-smtp" 2>/dev/null || true
+  # the project lives outside the stack recovery wildcards: its own
+  # compose file in its own directory, its own project name, so the
+  # stack's profile-wide up and down never sees it
+  if [ ! -f "$MAIL_SVC_DIR/meta" ]; then
+    # first activation: build from the recipe under the builder's own
+    # byte checks, honor the gate above, and hold the door on any
+    # failure
+    if mail_build "$door" >> "$LOG" 2>&1; then
+      dbg "OK: mail project built from the approved recipe"
+    else
+      dbg "WARNING: mail build failed (see the log): the tier stays off"
+      printf 'off\n' > "$MAIL_GATE_DIR/svc-mail"
+      if [ -x /usr/local/sbin/redoubt-svc ]; then
+        /usr/local/sbin/redoubt-svc refresh >> "$LOG" 2>&1 || true
+      fi
+      return 0
+    fi
+  elif [ -f "$MAIL_CATALOG/recipe.sha256" ] && [ -f "$MAIL_SVC_DIR/recipe.sha256" ] \
+       && [ "$(cat "$MAIL_CATALOG/recipe.sha256" 2>/dev/null)" != "$(cat "$MAIL_SVC_DIR/recipe.sha256" 2>/dev/null)" ]; then
+    # the recipe pin moved: a new reviewed release rebuilds from the
+    # new recipe on the same door (the data volumes survive a down)
+    dbg "mail recipe pin moved: rebuilding from the reviewed release"
+    docker compose -p svc-mail -f "$MAIL_SVC_DIR/compose.yml" down >/dev/null 2>&1 || true
+    rm -rf "${MAIL_SVC_DIR:?}"
+    if mail_build "$door" >> "$LOG" 2>&1; then
+      dbg "OK: mail project rebuilt on the new pin"
+    else
+      dbg "WARNING: mail rebuild failed (see the log): the tier stays off"
+      printf 'off\n' > "$MAIL_GATE_DIR/svc-mail"
+      if [ -x /usr/local/sbin/redoubt-svc ]; then
+        /usr/local/sbin/redoubt-svc refresh >> "$LOG" 2>&1 || true
+      fi
+      return 0
+    fi
+  fi
+  # the builder may have re-picked a door when the reservation was
+  # taken: its meta is the truth, the env and the gate follow it
+  local _mail_act_door
+  _mail_act_door=$(sed -n 's/^DOOR=//p' "$MAIL_SVC_DIR/meta" 2>/dev/null || true)
+  if [ -n "$_mail_act_door" ] && [ "$_mail_act_door" != "$door" ]; then
+    sed -i '/^MAIL_DOOR=/d' "$_ENV_TMP"
+    echo "MAIL_DOOR=$_mail_act_door" >> "$_ENV_TMP"
+    kit_env_commit
+    door="$_mail_act_door"
+    gate=$(ha_gate_eval "$door")
+    printf '%s\n' "$gate" > "$MAIL_GATE_DIR/svc-mail"
+    # the door moved, so the recipe (and the jmap url baked into it)
+    # must follow: re-render and rebuild exactly like the pin-moved
+    # path above, or the containers would keep the old door's url
+    mail_site_host=$(mail_panel_host)
+    jmap_url=""
+    [ -n "$mail_site_host" ] && jmap_url="https://$mail_site_host:$door"
+    if mail_catalog_install "$smtp_plan" "$jmap_url" \
+       && [ "$(cat "$MAIL_CATALOG/recipe.sha256" 2>/dev/null)" != "$(cat "$MAIL_SVC_DIR/recipe.sha256" 2>/dev/null)" ]; then
+      dbg "mail door moved: rebuilding on the new door"
+      docker compose -p svc-mail -f "$MAIL_SVC_DIR/compose.yml" down >/dev/null 2>&1 || true
+      rm -rf "${MAIL_SVC_DIR:?}"
+      mail_build "$door" >> "$LOG" 2>&1 \
+        || dbg "WARNING: mail rebuild after the door move failed: the tier stays off"
+    fi
+  fi
+  if [ -x /usr/local/sbin/redoubt-svc ]; then
+    /usr/local/sbin/redoubt-svc refresh >> "$LOG" 2>&1 \
+      || dbg "WARNING: mail site refresh failed"
+  else
+    rm -f "$STACKDIR/caddy-services/svc-mail.caddy" 2>/dev/null || true
+  fi
+  # delivery readiness is public DNS: reconcile the zone (managed
+  # through the owner's adapter, paste as a printed list) and verify
+  # against the authoritative servers before any readiness claim
+  mail_dns_reconcile
+  # the SMTP doors: the story above is closed until the docker
+  # forwarding rules prove every published port on both families,
+  # because those rules are the real door and they bypass the host
+  # firewall paths
+  if [ "$(mail_expose_eval "$smtp_plan")" != "off" ]; then
+    dbg "OK: mail smtp doors open ($smtp_plan): host rules and docker forwarding verified"
+  fi
+  # what the kit can never verify: router forwarding, ISP port-25
+  # policy, public addressing and reverse DNS all live outside this
+  # box. The kit proves only what it controls: the host rules, the
+  # docker forwarding and the published ports. A relay or the owner's
+  # provider covers what the box cannot prove.
+  dbg "mail delivery boundary: router forwarding, ISP policy, public addressing and reverse DNS stay outside the kit's control"
+  if [ "$MAIL_EXPOSE" = "relay" ]; then
+    dbg "mail outbound: relay mode publishes no inbound SMTP door; the relay wiring rides the review-documented Stalwart config path (${MAIL_RELAY:-no relay host saved yet})"
+  elif [ "$MAIL_EXPOSE" = "on" ] && [ -z "$smtp_plan" ]; then
+    dbg "mail outbound: direct port 25 egress from this box is not verifiable here; a saved relay would be the provable path"
+  fi
+  case "$gate" in
+    on) ;;
+    *)
+      if [ "$FW_ACTIVE" = "1" ]; then
+        case "${FW_DECISION:-}" in
+          on|on-nas) dbg "mail door $door stays closed: the saved story says ${FW_DECISION}, but the loaded rules do not show the door (both families)" ;;
+          on-nodoors) dbg "mail door $door stays closed: the saved firewall story is on-nodoors (no service exposure)" ;;
+          off) dbg "mail door $door stays closed: the saved firewall story is off" ;;
+          *) dbg "mail door $door stays closed: no saved firewall story yet (answer the firewall questions, or keep it box-only)" ;;
+        esac
+      else
+        dbg "mail door $door stays closed: no active firewall story was verified"
+      fi
+      return 0
+      ;;
+  esac
+  # the door may open, so prove the build again first: recipe bytes,
+  # compose config, both running digests and the site file
+  mail_verify >> "$LOG" 2>&1 || {
+    dbg "WARNING: mail verification failed: the door stays closed"
+    printf 'off\n' > "$MAIL_GATE_DIR/svc-mail"
+    if [ -x /usr/local/sbin/redoubt-svc ]; then
+      /usr/local/sbin/redoubt-svc refresh >> "$LOG" 2>&1 || true
+    fi
+    return 0
+  }
+  # before anything opens: the served app answers on the door with
+  # the local CA, like the owner's browser, and the real login and
+  # JMAP session checks pass once the review pinned their paths
+  mail_site_host=$(mail_panel_host)
+  if [ -z "$mail_site_host" ] || ! mail_web_verify "$door" "$mail_site_host"; then
+    dbg "WARNING: mail door $door did not pass the web check: the door stays closed"
+    printf 'off\n' > "$MAIL_GATE_DIR/svc-mail"
+    if [ -x /usr/local/sbin/redoubt-svc ]; then
+      /usr/local/sbin/redoubt-svc refresh >> "$LOG" 2>&1 || true
+    fi
+    return 0
+  fi
+  # the bootstrap listener stays private until ownership is verified:
+  # the recipe publishes no host port, and the site above rendered
+  # only after the byte checks and digests passed
+  mail_credentials || {
+    dbg "WARNING: mail credentials could not be written: the door stays closed"
+    printf 'off\n' > "$MAIL_GATE_DIR/svc-mail"
+    if [ -x /usr/local/sbin/redoubt-svc ]; then
+      /usr/local/sbin/redoubt-svc refresh >> "$LOG" 2>&1 || true
+    fi
+    return 0
+  }
+  mail_bootstrap || {
+    dbg "mail tier: accounts left pending (see above): the door stays closed until the owner provisions through the wizard or the release review documents the unattended bootstrap"
+    dbg "mail tier: Bulwark 1.18 OAuth auto-configure and its connection wizard stay with the owner's admin step: the kit never claims full automation"
+    printf 'off\n' > "$MAIL_GATE_DIR/svc-mail"
+    if [ -x /usr/local/sbin/redoubt-svc ]; then
+      /usr/local/sbin/redoubt-svc refresh >> "$LOG" 2>&1 || true
+    fi
+    return 0
+  }
+  # Bulwark keeps its saved admin config in its state volume: a
+  # persisted choice overrides the environment values, so a conflict
+  # must be reported before the deployment counts as immutable
+  mail_bulwark_state_check || {
+    dbg "mail tier: the Bulwark saved state could not be cleared for conflicts: the door stays closed"
+    printf 'off\n' > "$MAIL_GATE_DIR/svc-mail"
+    if [ -x /usr/local/sbin/redoubt-svc ]; then
+      /usr/local/sbin/redoubt-svc refresh >> "$LOG" 2>&1 || true
+    fi
+    return 0
+  }
+  # the boot gate keeps the door honest across reboots: it can only
+  # ever close it, a kit pass re-opens after re-verification
+  mail_gate_install
+  dbg "OK: mail tier live on door $door for $MAIL_DOMAIN (the kit never changes MX records: point them at $MAIL_HOST)"
+  # the web door and the dns state are separate facts: report them
+  # separately, never one folded into the other
+  if [ "$MAIL_DNS_READY" = "1" ]; then
+    dbg "OK: mail delivery ready: the authoritative zone carries the kit's records"
+  else
+    dbg "mail delivery: not ready yet (see the dns lines above: the zone or the cutover is still pending, or paste mode awaits the owner)"
+  fi
+}
+mail_reconcile
+
+# 8e) Media reconcile: the early pass reserved the doors and seeded the
+# tile; this late pass builds Jellyfin alone strictly from the reviewed
+# catalog, pins its proxy trust to the edge, and opens or closes its
+# door to match the owner's saved firewall story and the rules that
+# are actually loaded. Reiverr stays reserved and closed: its workflow
+# lands only after a specific release is selected and tested. Runs on
+# every pass with or without the guardian. Anything unverified leaves
+# the site file absent, and an absent site file means the edge aborts
+# on the door.
+
+# render to a tmp in the same dir, move it in, then prove the final
+# file is byte for byte what was rendered (the same discipline the
+# service builder applies, kit side)
+media_put() {  # stdin -> $1 with mode $2
+  local _t _w _g
+  _t=$(mktemp "$(dirname "$1")/.mediaput.XXXXXX")
+  cat > "$_t"; chmod "$2" "$_t"
+  _w=$(sha256sum "$_t" | cut -d' ' -f1); mv -f "$_t" "$1"; _g=$(sha256sum "$1" | cut -d' ' -f1)
+  [ "$_w" = "$_g" ] || { rm -f "$1"; return 1; }
+}
+
+media_hwacc_probe() {  # prints DEVICE|GID for a detected render node, else nothing
+  # only a specific render node for a detected intel or amd gpu may be
+  # granted, and only when the owner opted in: no wholesale /dev/dri,
+  # no other device classes, no privileged flag anywhere
+  local node vendor gid
+  [ "${REDOUBT_MEDIA_HWACC:-0}" = "1" ] || return 0
+  for node in /dev/dri/renderD128 /dev/dri/renderD129; do
+    [ -e "$node" ] || continue
+    vendor=$(cat "/sys/class/drm/$(basename "$node")/device/vendor" 2>/dev/null || true)
+    case "$vendor" in
+      0x8086|0x1002)
+        gid=$(stat -c %g "$node" 2>/dev/null || true)
+        [ -n "$gid" ] && { printf '%s|%s\n' "$node" "$gid"; return 0; }
+        ;;
+    esac
+  done
+  return 0
+}
+
+media_catalog_install() {
+  # the root-owned Jellyfin recipe the builder may deploy: the env and
+  # compose are fixed here and their shas are pinned inside the recipe,
+  # so the whole package verifies from the single recipe.sha256 pin.
+  # Fails closed: an unpinned or mismatched recipe never reaches a
+  # start. The library path and the hardware acceleration grant are
+  # the only inputs, and both are kit-validated. The Reiverr entry
+  # keeps its own reviewed image reference and pin variables (see the
+  # early pass), but its recipe lands with the workflow: nothing here
+  # renders or activates it.
+  [ -n "$MEDIA_JELLYFIN_DIGEST" ] && [ -n "$MEDIA_JELLYFIN_VERSION" ] || return 1
+  media_path_ok || return 1
+  local pin node gid envsha composesha t tw w g _mj_hw
+  pin="${MEDIA_JELLYFIN_IMAGE}:${MEDIA_JELLYFIN_VERSION}@${MEDIA_JELLYFIN_DIGEST}"
+  node=""; gid=""
+  if [ "${REDOUBT_MEDIA_HWACC:-0}" = "1" ]; then
+    _mj_hw=$(media_hwacc_probe)
+    if [ -n "$_mj_hw" ]; then
+      node="${_mj_hw%%|*}"; gid="${_mj_hw##*|}"
+    else
+      dbg "media tier: REDOUBT_MEDIA_HWACC=1 but no supported render device was detected: hardware transcoding stays off this pass"
+    fi
+  fi
+  envsha=$(printf '%s\n' '# Jellyfin env, fixed by the kit recipe' | sha256sum | cut -d' ' -f1)
+  mkdir -p /opt/redoubt/catalog/jellyfin
+  t=$(mktemp /opt/redoubt/catalog/.mjrecipe.XXXXXX)
+  tw=$(mktemp /opt/redoubt/catalog/.mjcompose.XXXXXX)
+  # the single-service project: its own directory (outside the stack's
+  # profile wildcards), only the stack's own external network for the
+  # edge door, no published ports (the door is the edge), no host
+  # network, no docker socket, no privileged flag. The named volume
+  # holds all Jellyfin state; the library rides the validated owner
+  # path read-only, so Jellyfin can never write the library. Software
+  # transcoding runs inside the resource limits; the hardware grant
+  # below is the only device ever added, and only for the detected
+  # render node.
+  {
+    printf '%s\n' \
+      'services:' \
+      '  app:' \
+      "    image: $pin" \
+      '    container_name: svc-jellyfin' \
+      '    restart: unless-stopped' \
+      '    dns: [172.28.0.53, 127.0.0.11]' \
+      '    security_opt:' \
+      '      - no-new-privileges:true' \
+      '    environment:' \
+      '      TZ: UTC' \
+      '    volumes:' \
+      '      - jellyfin-config:/config' \
+      "      - \"$MEDIA_PATH:/media:ro\"" \
+      '    mem_limit: 4g' \
+      '    pids_limit: 256' \
+      '    cpus: "2.0"'
+    if [ -n "$node" ]; then
+      # the owner's opt-in plus a detected render node: grant exactly
+      # this one device, plus its host group so a non-root container
+      # user may open it. Nothing else rides in.
+      printf '    devices:\n      - %s:%s\n' "$node" "$node"
+      printf '    group_add:\n      - "%s"\n' "$gid"
+    fi
+    printf '%s\n' \
+      '    networks:' \
+      '      - default' \
+      'networks:' \
+      '  default:' \
+      '    external: true' \
+      '    name: redoubt_default' \
+      'volumes:' \
+      '  jellyfin-config:'
+  } > "$tw"
+  composesha=$(sha256sum "$tw" | cut -d' ' -f1)
+  {
+    printf 'NAME=jellyfin\nIMAGE=%s\nPORT=8096\nTILE=Jellyfin\nICON=/icons/jellyfin.svg\n' "$pin"
+    printf 'ENV_SHA=%s\nCOMPOSE_SHA=%s\n' "$envsha" "$composesha"
+    printf '%s\n' '__APP_ENV__'
+    printf '%s\n' '# Jellyfin env, fixed by the kit recipe'
+    printf '%s\n' '__COMPOSE__'
+    cat "$tw"
+  } > "$t"
+  rm -f "$tw"
+  chmod 644 "$t"; chown root:root "$t"
+  w=$(sha256sum "$t" | cut -d' ' -f1)
+  mv -f "$t" /opt/redoubt/catalog/jellyfin/recipe
+  g=$(sha256sum /opt/redoubt/catalog/jellyfin/recipe | cut -d' ' -f1)
+  [ "$w" = "$g" ] || { rm -f /opt/redoubt/catalog/jellyfin/recipe; return 1; }
+  printf '%s\n' "$g" > /opt/redoubt/catalog/jellyfin/recipe.sha256
+  chmod 644 /opt/redoubt/catalog/jellyfin/recipe.sha256
+  return 0
+}
+
+# the release review flips these to 1 only after the pinned release's
+# documented paths are confirmed. Until then the tier reports the
+# stage pending and never fakes a passing check: an answering page is
+# not a login, and a login is not playback.
+MEDIA_JELLYFIN_LOGIN_DOC=0
+MEDIA_JELLYFIN_PLAYBACK_DOC=0
+MEDIA_JELLYFIN_HWACC_DOC=0
+
+media_login_check() {  # $1 = door, $2 = host; the real login through the real route
+  [ "$MEDIA_JELLYFIN_LOGIN_DOC" = "1" ] || {
+    dbg "media tier: login check stage pending (the release review pins the documented Jellyfin login path for the pinned release first; the first administrator is provisioned through the setup wizard, the kit never invents an unattended path)"
+    return 1
+  }
+  # the review lands the documented call here: an AuthenticateByName
+  # request through the door with the owner's Jellyfin credential
+  # riding stdin (never argv), and only a valid session passes. The
+  # credential the kit checks is the one the owner provisioned in the
+  # setup wizard: the kit never mints, logs or stores it.
+  return 1
+}
+
+media_playback_check() {  # $1 = door, $2 = host; real playback through the real route
+  [ "$MEDIA_JELLYFIN_PLAYBACK_DOC" = "1" ] || {
+    dbg "media tier: playback check stage pending (the release review pins the documented playback route for the pinned release first; playback proof needs a library item, an answering page is not a stream)"
+    return 1
+  }
+  # the review lands the documented call here: a stream or media-info
+  # request through the door with the session token from the login
+  # check, and only a real media response passes.
+  return 1
+}
+
+media_gate_install() {
+  # the boot gate: after a reboot the Jellyfin door may never be more
+  # open than the saved story and the loaded rules justify. The script
+  # only closes; re-opening always rides a kit pass that re-verifies
+  # first. The story the boot gate reads is the kit's own last
+  # evaluation (the svc-gates file): the encrypted env's passphrase is
+  # never repeated outside the kit's own heredocs.
+  kit_put_exec /usr/local/sbin/redoubt-media-gate 755 <<'MEDIAGATE'
+#!/usr/bin/env bash
+# redoubt-media-gate: re-applies the Jellyfin door gate at boot.
+# The kit's last evaluation plus the rules actually loaded decide; the
+# site file is the switch (absent means the edge aborts on the door).
+# This script only ever closes the door: re-opening needs a kit pass.
+# A mesh-only door (the on-nas story) reads as closed here: closing a
+# door the story allowed is safe, the next kit pass re-opens it.
+set -euo pipefail
+umask 022
+PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
+CONF=/etc/redoubt/services.conf
+[ -s "$CONF" ] || exit 0
+cv() { sed -n "s/^$1=//p" "$CONF" | head -1; }
+STACKDIR=$(cv STACKDIR)
+META=/opt/redoubt/services/jellyfin/meta
+[ -f "$META" ] || exit 0
+DOOR=$(sed -n 's/^DOOR=//p' "$META" | head -1)
+[ -n "$DOOR" ] || exit 0
+STORY=/etc/redoubt/svc-gates/jellyfin
+[ -f "$STORY" ] || exit 0
+FW=$(cat "$STORY")
+GATE=on
+case "$FW" in on|on-nas) ;; *) GATE=off ;; esac
+if [ "$GATE" = "on" ] && command -v ufw >/dev/null 2>&1; then
+  R4=$(cat /etc/ufw/user.rules 2>/dev/null || true)
+  R6=$(cat /etc/ufw/user6.rules 2>/dev/null || true)
+  NEED6=0
+  grep -q '^IPV6=yes' /etc/ufw/ufw.conf 2>/dev/null && NEED6=1
+  if [ "$FW" = "on" ]; then
+    echo "$R4" | grep -q -- "--dport $DOOR" || GATE=off
+    if [ "$NEED6" = "1" ] && ! echo "$R6" | grep -q -- "--dport $DOOR"; then GATE=off; fi
+  else
+    echo "$R4" | grep -- "-i wt0" | grep -q -- "--dport $DOOR" || GATE=off
+    if [ "$NEED6" = "1" ] && ! echo "$R6" | grep -- "-i wt0" | grep -q -- "--dport $DOOR"; then GATE=off; fi
+  fi
+elif [ "$GATE" = "on" ] && command -v firewall-cmd >/dev/null 2>&1; then
+  # the service block rides as one N-M/tcp range: a listed range
+  # covers the door just like an exact port entry would
+  cover() {
+    for _p in $1; do
+      _p="${_p%%/*}"
+      case "$_p" in
+        *-*) _lo="${_p%-*}"; _hi="${_p#*-}"
+             case "$_lo$_hi" in
+               ""|*[!0-9]*) ;;
+               *) [ "$DOOR" -ge "$_lo" ] && [ "$DOOR" -le "$_hi" ] && return 0 ;;
+             esac ;;
+        *) [ "$_p" = "$DOOR" ] && return 0 ;;
+      esac
+    done
+    return 1
+  }
+  PORTS=$(firewall-cmd --list-ports 2>/dev/null || true)
+  if [ "$FW" = "on" ]; then
+    cover "$PORTS" || GATE=off
+  else
+    ZP=$(firewall-cmd --zone=redoubt-mesh --list-ports 2>/dev/null || true)
+    cover "$ZP" || GATE=off
+  fi
+elif [ "$GATE" = "on" ]; then
+  # no firewall tool left to verify the saved story against: the door
+  # stays closed until a kit pass re-verifies the loaded rules
+  GATE=off
+fi
+if [ "$GATE" = "on" ]; then
+  exit 0
+fi
+# close the door: drop the site file and reload the edge. A door with
+# no site behind it aborts at the edge.
+SITE="$STACKDIR/caddy-services/jellyfin.caddy"
+if [ -f "$SITE" ]; then
+  rm -f "$SITE"
+  docker exec redoubt-edge-local-1 caddy reload --config /etc/caddy/Caddyfile --adapter caddyfile >/dev/null 2>&1 \
+    || docker restart redoubt-edge-local-1 >/dev/null 2>&1 || true
+fi
+exit 0
+MEDIAGATE
+  cat > /etc/systemd/system/redoubt-media-gate.service <<'MEDIAUNIT'
+[Unit]
+Description=Redoubt media door gate (closed unless verified)
+After=docker.service network-online.target
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+ExecStart=/usr/local/sbin/redoubt-media-gate
+
+[Install]
+WantedBy=multi-user.target
+MEDIAUNIT
+  chmod 644 /etc/systemd/system/redoubt-media-gate.service
+  systemctl daemon-reload >/dev/null 2>&1 || true
+  systemctl enable redoubt-media-gate.service >/dev/null 2>&1 || true
+}
+
+media_reconcile() {
+  [ "${REDOUBT_MEDIA:-0}" = "1" ] || return 0
+  # the honest partial report, every pass: the tier is two services
+  # and only one of them is wired
+  dbg "media tier: partial on purpose: Jellyfin activates alone; Reiverr stays pending ($MEDIA_REIVERR_REASON)"
+  dbg "media tier: no torrent client, no port-forwarding, no plugin or automatic-library-deletion defaults: those stay behind a separate owner decision and are not enabled"
+  if [ "${REDOUBT_MEDIA_HWACC:-0}" != "1" ]; then
+    dbg "media tier: transcode check: pending (REDOUBT_MEDIA_HWACC is off: software transcoding stays the default, inside the recipe's resource limits)"
+  fi
+  if [ -z "$MEDIA_JELLYFIN_DIGEST" ] || [ -z "$MEDIA_JELLYFIN_VERSION" ]; then
+    dbg "media tier: Jellyfin stage pending (MEDIA_JELLYFIN_DIGEST is empty until the release review fills it; digests are never guessed)"
+    return 0
+  fi
+  if ! media_path_ok; then
+    dbg "media tier: Jellyfin stage pending (REDOUBT_MEDIA_PATH missing or not a safe owner path: the kit never guesses a library location)"
+    return 0
+  fi
+  local door="${MEDIA_JELLYFIN_DOOR:-}"
+  [ -n "$door" ] || { dbg "WARNING: the media tier has no reserved door: the tier stays off"; return 0; }
+  media_catalog_install || {
+    dbg "WARNING: media catalog failed the byte check: the tier stays off"
+    mkdir -p "$MEDIA_GATE_DIR"
+    printf 'off\n' > "$MEDIA_GATE_DIR/jellyfin"
+    chmod 644 "$MEDIA_GATE_DIR/jellyfin" 2>/dev/null || true
+    if [ -x /usr/local/sbin/redoubt-svc ]; then
+      /usr/local/sbin/redoubt-svc refresh >> "$LOG" 2>&1 || true
+    else
+      rm -f "$STACKDIR/caddy-services/jellyfin.caddy" 2>/dev/null || true
+    fi
+    return 0
+  }
+  # the gate is decided before anything starts, so a first activation
+  # never renders a site for an unverified firewall story: the saved
+  # story plus the rules that are really loaded decide, never the
+  # app-door list alone
+  local gate
+  gate=$(ha_gate_eval "$door")
+  mkdir -p "$MEDIA_GATE_DIR"
+  printf '%s\n' "$gate" > "$MEDIA_GATE_DIR/jellyfin"
+  chmod 644 "$MEDIA_GATE_DIR/jellyfin" 2>/dev/null || true
+  # the project lives outside the stack recovery wildcards: its own
+  # compose file in its own directory, so the stack's profile-wide
+  # up and down never sees it
+  if [ ! -f "$MEDIA_JELLYFIN_SVC_DIR/meta" ]; then
+    if [ -x /usr/local/sbin/redoubt-svc ]; then
+      # first activation: the builder builds from the recipe under its
+      # lock, honors the gate above, and rolls the whole thing back on
+      # any failure
+      if /usr/local/sbin/redoubt-svc activate jellyfin --door "$door" >> "$LOG" 2>&1; then
+        dbg "OK: Jellyfin built from the approved recipe"
+      else
+        dbg "WARNING: Jellyfin activation failed (see the log): rolled back, the door stays closed"
+        return 0
+      fi
+    else
+      dbg "WARNING: no service builder on this box: Jellyfin stays off"
+      return 0
+    fi
+  elif [ -f "$MEDIA_CATALOG/jellyfin/recipe.sha256" ] && [ -f "$MEDIA_JELLYFIN_SVC_DIR/recipe.sha256" ] \
+       && [ "$(cat "$MEDIA_CATALOG/jellyfin/recipe.sha256" 2>/dev/null)" != "$(cat "$MEDIA_JELLYFIN_SVC_DIR/recipe.sha256" 2>/dev/null)" ]; then
+    # the recipe pin moved (a new reviewed release, a moved library or
+    # a hardware acceleration change): rebuild from the new recipe on
+    # the same door (the /config volume survives)
+    dbg "media recipe pin moved: rebuilding Jellyfin from the reviewed release"
+    docker compose -f "$MEDIA_JELLYFIN_SVC_DIR/compose.yml" down >/dev/null 2>&1 || true
+    rm -rf "${MEDIA_JELLYFIN_SVC_DIR:?}"
+    if /usr/local/sbin/redoubt-svc activate jellyfin --door "$door" >> "$LOG" 2>&1; then
+      dbg "OK: Jellyfin rebuilt on the new pin"
+    else
+      dbg "WARNING: Jellyfin rebuild failed (see the log): rolled back, the door stays closed"
+      return 0
+    fi
+  fi
+  # the builder may have re-picked a door when the reservation was
+  # taken: its meta is the truth, the env and the gate follow it
+  _mj_act_door=$(sed -n 's/^DOOR=//p' "$MEDIA_JELLYFIN_SVC_DIR/meta" 2>/dev/null || true)
+  if [ -n "$_mj_act_door" ] && [ "$_mj_act_door" != "$door" ]; then
+    sed -i '/^MEDIA_JELLYFIN_DOOR=/d' "$_ENV_TMP"
+    echo "MEDIA_JELLYFIN_DOOR=$_mj_act_door" >> "$_ENV_TMP"
+    kit_env_commit
+    door="$_mj_act_door"
+    gate=$(ha_gate_eval "$door")
+    printf '%s\n' "$gate" > "$MEDIA_GATE_DIR/jellyfin"
+  fi
+  if [ -x /usr/local/sbin/redoubt-svc ]; then
+    /usr/local/sbin/redoubt-svc refresh >> "$LOG" 2>&1 \
+      || dbg "WARNING: Jellyfin site refresh failed"
+  else
+    rm -f "$STACKDIR/caddy-services/jellyfin.caddy" 2>/dev/null || true
+  fi
+  case "$gate" in
+    on) ;;
+    *)
+      if [ "$FW_ACTIVE" = "1" ]; then
+        case "${FW_DECISION:-}" in
+          on|on-nas) dbg "Jellyfin door $door stays closed: the saved story says ${FW_DECISION}, but the loaded rules do not show the door (both families)" ;;
+          on-nodoors) dbg "Jellyfin door $door stays closed: the saved firewall story is on-nodoors (no service exposure)" ;;
+          off) dbg "Jellyfin door $door stays closed: the saved firewall story is off" ;;
+          *) dbg "Jellyfin door $door stays closed: no saved firewall story yet (answer the firewall questions, or keep it box-only)" ;;
+        esac
+      else
+        dbg "Jellyfin door $door stays closed: no active firewall story was verified"
+      fi
+      return 0
+      ;;
+  esac
+  # the door may open, so prove the build again first: compose, site
+  # and the running digest must all byte-match their pins
+  if [ -x /usr/local/sbin/redoubt-svc ]; then
+    if ! /usr/local/sbin/redoubt-svc verify jellyfin >> "$LOG" 2>&1; then
+      dbg "WARNING: Jellyfin failed verification: the door stays closed"
+      printf 'off\n' > "$MEDIA_GATE_DIR/jellyfin"
+      /usr/local/sbin/redoubt-svc refresh >> "$LOG" 2>&1 || true
+      return 0
+    fi
+  fi
+  # proxy trust: Jellyfin reads client addresses from forwarded headers
+  # only when the sender is in its KnownProxies. Three states: a fresh
+  # config volume gets the kit's minimal network.xml, the factory
+  # default (first boot wrote it before this pass could) gets the
+  # empty KnownProxies element filled, and an owner-edited file is
+  # never rewritten. No trust is the safe state either way: without
+  # KnownProxies every client address reads as the edge itself. The
+  # write is followed by a restart: the network config is read at
+  # startup, never hot-reloaded.
+  local mj_edge_ip mj_cfg_owner mj_host mj_code i _MJ_HTTPS=0
+  mj_edge_ip=$(docker inspect -f '{{(index .NetworkSettings.Networks "redoubt_default").IPAddress}}' redoubt-edge-local-1 2>/dev/null || true)
+  if [ -z "$mj_edge_ip" ]; then
+    dbg "WARNING: the edge proxy address is unknown: Jellyfin trust config not written, the door stays closed"
+    printf 'off\n' > "$MEDIA_GATE_DIR/jellyfin"
+    return 0
+  fi
+  mj_cfg_owner=$(docker exec svc-jellyfin sh -c 'stat -c %u:%g /config 2>/dev/null' 2>/dev/null || true)
+  [ -n "$mj_cfg_owner" ] || mj_cfg_owner="0:0"
+  if docker exec svc-jellyfin sh -c '[ -s /config/config/network.xml ]' >/dev/null 2>&1; then
+    if docker exec svc-jellyfin sh -c 'grep -q "<KnownProxies[ >]" /config/config/network.xml && ! grep -q "<string>" /config/config/network.xml' >/dev/null 2>&1; then
+      # the factory default: keep a byte copy so a failed edit can
+      # restore, fill the empty element, then prove it landed
+      docker exec svc-jellyfin sh -c 'cp -f /config/config/network.xml /config/config/network.xml.redoubt-bak' >/dev/null 2>&1
+      docker exec svc-jellyfin sh -c "sed -i 's|<KnownProxies />|<KnownProxies><string>${mj_edge_ip}</string></KnownProxies>|; s|<KnownProxies></KnownProxies>|<KnownProxies><string>${mj_edge_ip}</string></KnownProxies>|' /config/config/network.xml" >/dev/null 2>&1
+      if docker exec svc-jellyfin sh -c "grep -q \"<string>${mj_edge_ip}</string>\" /config/config/network.xml" >/dev/null 2>&1; then
+        docker exec svc-jellyfin sh -c "chown \"$mj_cfg_owner\" /config/config/network.xml && rm -f /config/config/network.xml.redoubt-bak" >/dev/null 2>&1 || true
+        dbg "OK: Jellyfin proxy trust pinned to the edge (the factory KnownProxies element filled)"
+      else
+        docker exec svc-jellyfin sh -c 'mv -f /config/config/network.xml.redoubt-bak /config/config/network.xml' >/dev/null 2>&1 || true
+        dbg "WARNING: Jellyfin trust config did not land: the door stays closed"
+        printf 'off\n' > "$MEDIA_GATE_DIR/jellyfin"
+        return 0
+      fi
+    else
+      dbg "OK: Jellyfin network config exists (owner-owned: the kit leaves it alone)"
+    fi
+  else
+    # fresh volume: the kit's minimal network.xml, the edge is the
+    # only proxy Jellyfin ever trusts
+    docker exec -i svc-jellyfin sh -c 'cat > /config/config/network.xml' <<MJXML
+<?xml version="1.0" encoding="utf-8"?>
+<NetworkConfiguration xmlns:xsd="http://www.w3.org/2001/XMLSchema" xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance">
+  <KnownProxies>
+    <string>${mj_edge_ip}</string>
+  </KnownProxies>
+</NetworkConfiguration>
+MJXML
+    docker exec svc-jellyfin sh -c "chown \"$mj_cfg_owner\" /config/config/network.xml" >/dev/null 2>&1 || true
+    docker exec svc-jellyfin grep -q "<string>${mj_edge_ip}</string>" /config/config/network.xml 2>/dev/null \
+      && dbg "OK: Jellyfin proxy trust pinned to the edge (fresh minimal config)" \
+      || { dbg "WARNING: Jellyfin trust config did not land: the door stays closed"; printf 'off\n' > "$MEDIA_GATE_DIR/jellyfin"; return 0; }
+  fi
+  # the kit redacts request urls from Jellyfin's own logs: with the
+  # factory logging config the minimum level is Information, so the
+  # debug request lines that can carry an api key in the url are never
+  # written. When the owner has no logging.json yet (factory state),
+  # the kit pins that level with its own fixed file. An owner-owned
+  # logging.json is left alone, and the kit's own checks never put a
+  # key in a url.
+  if docker exec svc-jellyfin sh -c '[ -s /config/config/logging.default.json ] && [ ! -e /config/config/logging.json ]' >/dev/null 2>&1; then
+    docker exec -i svc-jellyfin sh -c 'cat > /config/config/logging.json' <<MJLOG
+{
+  "Serilog": {
+    "MinimumLevel": {
+      "Default": "Information",
+      "Override": {
+        "Microsoft": "Warning",
+        "System": "Warning"
+      }
+    },
+    "WriteTo": [
+      { "Name": "Console", "Args": { "outputTemplate": "[{Timestamp:HH:mm:ss.fff}] [{Level:u3}] [{ThreadId}] {SourceContext}: {Message:lj}{NewLine}{Exception}" } }
+    ]
+  }
+}
+MJLOG
+    docker exec svc-jellyfin sh -c "chown \"$mj_cfg_owner\" /config/config/logging.json" >/dev/null 2>&1 || true
+    docker exec svc-jellyfin grep -q '"Information"' /config/config/logging.json 2>/dev/null \
+      && dbg "OK: Jellyfin log level pinned at Information (request urls stay out of the log)" \
+      || { dbg "WARNING: Jellyfin log pin did not land: the door stays closed"; printf 'off\n' > "$MEDIA_GATE_DIR/jellyfin"; return 0; }
+  fi
+  # the trust config and the log pin are read at startup: restart so
+  # this pass verifies the state it actually runs
+  docker restart svc-jellyfin >/dev/null 2>&1 || true
+  # before reporting success: the real https route answers (a door
+  # answer alone proves the proxy; the public api proves Jellyfin)
+  mj_host=$(awk -v p=":$PORT_EDGE4" 'index($0,"https://")==1 && index($0,p) && /[{][[:space:]]*$/ {print; exit}' "$STACKDIR/local-caddy.Caddyfile" 2>/dev/null \
+    | grep -o 'https://[^:, ]*' | head -1 | sed 's|https://||')
+  if [ -n "$mj_host" ]; then
+    for i in $(seq 1 20); do
+      mj_code=$(curl -s -o /dev/null -w '%{http_code}' -m 5 --cacert /var/lib/redoubt/caddy-local/cert-share/root-ca.crt \
+        --resolve "$mj_host:$door:127.0.0.1" "https://$mj_host:$door/System/Info/Public" 2>/dev/null || true)
+      case "$mj_code" in [1-4]??) _MJ_HTTPS=1; break ;; esac
+      sleep 3
+    done
+  fi
+  if [ "$_MJ_HTTPS" != "1" ]; then
+    dbg "WARNING: Jellyfin did not answer through the door: the door stays closed"
+    printf 'off\n' > "$MEDIA_GATE_DIR/jellyfin"
+    if [ -x /usr/local/sbin/redoubt-svc ]; then
+      /usr/local/sbin/redoubt-svc refresh >> "$LOG" 2>&1 || true
+    else
+      rm -f "$STACKDIR/caddy-services/jellyfin.caddy" 2>/dev/null || true
+    fi
+    return 0
+  fi
+  # real login and playback through the real route before the tier
+  # counts as live
+  if ! media_login_check "$door" "$mj_host"; then
+    dbg "WARNING: the Jellyfin login check did not pass: the door stays closed"
+    printf 'off\n' > "$MEDIA_GATE_DIR/jellyfin"
+    if [ -x /usr/local/sbin/redoubt-svc ]; then
+      /usr/local/sbin/redoubt-svc refresh >> "$LOG" 2>&1 || true
+    fi
+    return 0
+  fi
+  if ! media_playback_check "$door" "$mj_host"; then
+    dbg "WARNING: the Jellyfin playback check did not pass: the door stays closed"
+    printf 'off\n' > "$MEDIA_GATE_DIR/jellyfin"
+    if [ -x /usr/local/sbin/redoubt-svc ]; then
+      /usr/local/sbin/redoubt-svc refresh >> "$LOG" 2>&1 || true
+    fi
+    return 0
+  fi
+  # the hardware transcode check, only when the owner opted in
+  if [ "${REDOUBT_MEDIA_HWACC:-0}" = "1" ]; then
+    if [ "$MEDIA_JELLYFIN_HWACC_DOC" != "1" ]; then
+      dbg "media tier: hardware transcode check: stage pending (the release review pins the documented transcode proof for the pinned release first)"
+    else
+      dbg "media tier: hardware transcode check: stage pending (the documented proof call lands with the review)"
+    fi
+  fi
+  # the boot gate keeps the door honest across reboots: it can only
+  # ever close it, a kit pass re-opens after re-verification
+  media_gate_install
+  dbg "OK: media tier: Jellyfin live on door $door (https, login and playback verified through the real route; the tier is partial on purpose: Reiverr stays pending until a specific release is selected and tested)"
+  if [ -t 3 ]; then
+    echo "Jellyfin is live: https://${SEED_HOST:-$LAN_IP}:${door}" >&3 2>/dev/null || true
+    echo "  Media tier is partial on purpose: Reiverr stays pending ($MEDIA_REIVERR_REASON)." >&3 2>/dev/null || true
+    echo "  Add your libraries through the Jellyfin dashboard (the kit mounts" >&3 2>/dev/null || true
+    echo "  $MEDIA_PATH read-only at /media inside the container)." >&3 2>/dev/null || true
+  fi
+}
+media_reconcile
+
 # the assistant wiring only proves homarr migrated its own db; the seed
 # writes the board serverSetting, so its absence means the panel was
 # never seeded. sqlite3 is optional on the host: no new dependency.
@@ -8923,7 +12686,7 @@ fi
 if [ -n "${REDOUBT_BOOTSTRAP_URL:-}" ] && [ -f /etc/redoubt/.node-key ]; then
   HB_URL="${REDOUBT_BOOTSTRAP_URL%/api/v1/bootstrap*}/api/v1/node/heartbeat"
   mkdir -p /etc/redoubt
-  printf '#!/bin/sh\ncurl -s --max-time 10 -X POST "%s" -H "Authorization: Bearer $(cat /etc/redoubt/.node-key)" -d "{\\"version\\":\\"%s\\",\\"uptime\\":\\"$(uptime -p | cut -c4-)\\"}" >/dev/null 2>&1\n' "$HB_URL" "${REDOUBT_KIT_VERSION:-v1}" > /etc/redoubt/heartbeat.sh
+  printf '#!/bin/sh\nprintf "Authorization: Bearer $(cat /etc/redoubt/.node-key)" "$(cat /etc/redoubt/.node-key)" | curl -s --max-time 10 -X POST "%s" -H @- -d "{\\"version\\":\\"%s\\",\\"uptime\\":\\"$(uptime -p | cut -c4-)\\"}" >/dev/null 2>&1\n' "$HB_URL" "${REDOUBT_KIT_VERSION:-v1}" > /etc/redoubt/heartbeat.sh
   chmod 700 /etc/redoubt/heartbeat.sh
   printf '[Unit]\nDescription=Redoubt heartbeat (opt-in)\n[Service]\nType=oneshot\nExecStart=/etc/redoubt/heartbeat.sh\n' > /etc/systemd/system/redoubt-heartbeat.service
   printf '[Unit]\nDescription=Redoubt heartbeat every 6h\n[Timer]\nOnBootSec=10min\nOnUnitActiveSec=6h\n[Install]\nWantedBy=timers.target\n' > /etc/systemd/system/redoubt-heartbeat.timer
@@ -9017,9 +12780,16 @@ if [ "$LOCAL" != "$REMOTE" ]; then
   # extract the kit, hash it against the signed value, and only then run it.
   # A tampered edge can never push root code here.
   curl -fsSL --max-time 120 -o "$UPD_TMP/kit.tar.gz" "$UPD_EDGE/install/redoubt-kit-latest.tar.gz" 2>/dev/null || { echo "redoubt: download failed, try again later"; exit 1; }
-  tar -xzf "$UPD_TMP/kit.tar.gz" -C "$UPD_TMP" redoubt.sh 2>/dev/null \
-        || { echo "redoubt: the bundle arrived broken"; exit 1; }
   KIT_FILE="$UPD_TMP/redoubt.sh"
+  KIT_T=$(tar -tvzf "$UPD_TMP/kit.tar.gz" 2>/dev/null \
+    | awk '$NF=="redoubt.sh"||$NF=="./redoubt.sh"{print substr($1,1,1); exit}')
+  [ "$KIT_T" = "-" ] || { echo "redoubt: the bundle has no plain installer, dropped"; exit 1; }
+  ( umask 077; set -C
+    timeout 120 tar -xzOf "$UPD_TMP/kit.tar.gz" redoubt.sh 2>/dev/null \
+      | head -c 8388608 > "$KIT_FILE" ) \
+    || { echo "redoubt: the bundle arrived broken"; exit 1; }
+  [ -f "$KIT_FILE" ] && [ ! -L "$KIT_FILE" ] && [ -s "$KIT_FILE" ] \
+    || { echo "redoubt: the installer is not a regular file"; exit 1; }
   [ "$(sha256sum "$KIT_FILE" | cut -d' ' -f1)" = "$REMOTE" ] || { echo "redoubt: hash mismatch, the update was dropped"; exit 1; }
   # never downgrade: the build counter inside the verified kit is
   # monotonic. An older but validly signed kit cannot roll this
@@ -9401,7 +13171,7 @@ elif [ -d "$HOME/Documents/.My Redoubt.cipher" ] && ! mountpoint -q "$HOME/Docum
         QRP=$(mktemp -p /tmp redoubt-qr.XXXXXX) 2>/dev/null || QRP="/tmp/redoubt-qr-$$"
         chmod 600 "$QRP" 2>/dev/null || true
         { command -v openvt >/dev/null 2>&1 && command -v chvt >/dev/null 2>&1; } || apt-get install -y -qq kbd >/dev/null 2>&1 || true
-        if [ -e /dev/fb0 ] && command -v fbi >/dev/null 2>&1 && command -v openvt >/dev/null 2>&1 && command -v chvt >/dev/null 2>&1 && qrencode -o "$QRP" -s 8 -m 4 --foreground=34D399 --background=D4D4D8 "$URL" 2>/dev/null; then
+        if [ -e /dev/fb0 ] && command -v fbi >/dev/null 2>&1 && command -v openvt >/dev/null 2>&1 && command -v chvt >/dev/null 2>&1 && printf '%s' "$URL" | qrencode -o "$QRP" -s 8 -m 4 --foreground=34D399 --background=D4D4D8 2>/dev/null; then
           echo "scan the code, it closes on its own"
           openvt -s -- fbi -a --noverbose "$QRP" >/dev/null 2>&1 || true
           sleep 30
@@ -9411,12 +13181,12 @@ elif [ -d "$HOME/Documents/.My Redoubt.cipher" ] && ! mountpoint -q "$HOME/Docum
         else
           # no framebuffer painter on this box: the colored matrix
           # still scans from the text console (same style as the SSO)
-          qrencode -t ANSI256 -s 2 -m 1 "$URL"
+          printf '%s' "$URL" | qrencode -t ANSI256 -s 2 -m 1 -o -
           echo "$URL"
         fi
       else
         echo "== $NAME =="
-        qrencode -t ANSI256 -s 2 -m 1 "$URL"
+        printf '%s' "$URL" | qrencode -t ANSI256 -s 2 -m 1 -o -
         echo "$URL"
         echo ""
       fi
@@ -9648,8 +13418,8 @@ fi
 # folder reads empty
 _VAULT_UID=$(stat -c %u "${OWNER_HOME:-$HOME}" 2>/dev/null || echo 0)
 if [ "$_VAULT_UID" != "0" ]; then
-  [ -n "${MYREDOUBT:-}" ] && chown "$_VAULT_UID" "$MYREDOUBT" 2>/dev/null || true
-  [ -n "${VAULT_CONF:-}" ] && chown -R "$_VAULT_UID" "$(dirname "$VAULT_CONF")" 2>/dev/null || true
+  [ -n "${MYREDOUBT:-}" ] && safe_owner_path "$MYREDOUBT" && chown -h "$_VAULT_UID" "$MYREDOUBT" 2>/dev/null || true
+  [ -n "${VAULT_CONF:-}" ] && safe_owner_path "$(dirname "$VAULT_CONF")" && chown -hR "$_VAULT_UID" "$(dirname "$VAULT_CONF")" 2>/dev/null || true
 fi
 # hand the vault back to the owner right away: the fresh files show
 # the moment the pass ends, not after the next login. The launcher
