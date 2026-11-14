@@ -309,17 +309,22 @@ tar_member() {
   [ -f "$d" ] && [ ! -L "$d" ] && [ -s "$d" ]
 }
 
-# photos_guard on|off: fence the photos edge port in DOCKER-USER until
-# the first Immich admin exists. Fail closed on the message, not the pass.
+# photos_guard [PORT] on|off: fence a published tcp port in DOCKER-USER
+# until its first-run provisioning is proven done (default: the photos
+# edge). Traffic from this box over loopback still passes, so the
+# installer keeps its own provisioning channel while strangers stay
+# out. Fail closed on the message, not the pass.
 photos_guard() {
   command -v iptables >/dev/null 2>&1 \
-    || { dbg "WARNING: no iptables, photos port not fenced"; return 0; }
+    || { dbg "WARNING: no iptables, published port not fenced"; return 0; }
+  local port="$PORT_EDGE1"
+  case "${1:-}" in on|off) : ;; *) port="$1"; shift ;; esac
   iptables -N DOCKER-USER 2>/dev/null || true
-  local r=(-p tcp -m conntrack --ctorigdstport "$PORT_EDGE1" -j DROP)
+  local r=(-p tcp -m conntrack --ctorigdstport "$port" -j DROP)
   if [ "$1" = "on" ]; then
     iptables -C DOCKER-USER "${r[@]}" 2>/dev/null \
       || iptables -I DOCKER-USER 1 "${r[@]}" 2>/dev/null \
-      || dbg "WARNING: could not fence the photos port"
+      || dbg "WARNING: could not fence port $port"
   else
     while iptables -D DOCKER-USER "${r[@]}" 2>/dev/null; do :; done
   fi
@@ -3452,6 +3457,8 @@ case "$MESH_MODE" in
     docker compose --profile selfhost rm -sf netbird dashboard mesh-router mesh-wait >> "$LOG" 2>&1 || true
     COMP_OUT=$(mktemp /tmp/redoubt-compose-out.XXXXXX) || { fail_line "no private temp file"; exit 1; }
     photos_guard on
+    # the panel edge stays fenced until the seed proves the admin exists
+    photos_guard "$PORT_EDGE4" on
     [ "$GUAC_PROF" ] && guac_setup
     stack_up "$GUAC_PROF"
     ;;
@@ -3461,6 +3468,10 @@ case "$MESH_MODE" in
     pull_stack
     COMP_OUT=$(mktemp /tmp/redoubt-compose-out.XXXXXX) || { fail_line "no private temp file"; exit 1; }
     photos_guard on
+    # the panel edge and the coordinator management port stay fenced
+    # until their first-run ownership is proven below
+    photos_guard "$PORT_EDGE4" on
+    photos_guard "$PORT_NETBIRD" on
     [ "$GUAC_PROF" ] && guac_setup
     stack_up "--profile selfhost$GUAC_PROF"
     ;;
@@ -3631,6 +3642,9 @@ else
         printf '%s\n' "$PAT" > "$STACKDIR/mesh-pat.txt"
         chmod 600 "$STACKDIR/mesh-pat.txt"
         dbg "OK: coordinator bootstrapped"
+        # ownership is ours: open the management port again. A missing
+        # PAT (a third party claimed setup) keeps the fence up.
+        photos_guard "$PORT_NETBIRD" off
       fi
     fi
     if [ -n "$PAT" ]; then
@@ -4950,6 +4964,13 @@ vault_derive() {
   fi
   chown -h "$_VAULT_UID:$_VAULT_GID" "$VAULT_KEYFILE" 2>/dev/null || { dbg "WARNING: vault key chown to $OWNER_SYS_USER failed"; return 1; }
   chmod 600 "$VAULT_KEYFILE" 2>/dev/null || true
+  # 700 owner on the key dir stops other accounts from even listing the
+  # key name. The key stays owner-readable, not root-only: the login
+  # hook runs as the owner and must open the vault unattended. Residual:
+  # the daily key sits beside the ciphertext on the same storage, so the
+  # vault's protection against a stolen disk rests on the recovery
+  # phrase and any independent full-disk encryption.
+  chmod 700 "$(dirname "$VAULT_KEYFILE")" 2>/dev/null || true
   # the root copy is retired only once the home copy is proven identical
   if [ -f "$_VAULT_OLDKEY" ]; then
     if cmp -s "$_VAULT_OLDKEY" "$VAULT_KEYFILE"; then
@@ -5136,6 +5157,13 @@ vault_crypt_fscrypt() {
     chmod 600 "$VAULT_KEYFILE"
     [ "$_FUID" != "0" ] && chown -h "$_FUID" "$(dirname "$VAULT_KEYFILE")" "$VAULT_KEYFILE" 2>/dev/null || true
   fi
+  # 700 owner on the key dir stops even a directory listing by other
+  # accounts. The raw key stays owner-readable: the desktop helper runs
+  # fscrypt unlock as the owner, and a root-only file would break the
+  # unattended login unlock. Residual: key and ciphertext share the same
+  # storage, so a stolen unencrypted disk defeats both; the recovery
+  # phrase remains the offline protection.
+  chmod 700 "$(dirname "$VAULT_KEYFILE")" 2>/dev/null || true
   if fscrypt status "$MYREDOUBT" >/dev/null 2>&1; then
     # re-runs: the policy exists, just unlock and keep writing into it
     fscrypt unlock --key="$VAULT_KEYFILE" "$MYREDOUBT" 2>/dev/null || true
@@ -5476,9 +5504,17 @@ for _i in $(seq 1 90); do
   sleep 10
 done
 if docker compose -f "$STACKDIR/docker-compose.yml" exec -T homarr sh -c 'test -f /appdata/db/db.sqlite' >/dev/null 2>&1; then
-  # the vault path resolves for real in section 8; the seed asks first
-  # on headless passes, so pin a default here or set -u trips
-  [ -z "${MYREDOUBT:-}" ] && MYREDOUBT="${OWNER_HOME:-/home/owner}/Documents/My Redoubt"
+  # the vault path resolves for real in section 8, so a default is
+  # pinned here for headless passes (or set -u trips). The Linux owner
+  # is resolved before the recovery read, never after: Access.txt may
+  # only come from that owner's own mounted vault, so a fallback home
+  # can never hand a stranger's password to the seed
+  _SEED_HOME="${OWNER_HOME:-}"
+  [ -z "$_SEED_HOME" ] && [ -n "${SUDO_USER:-}" ] && [ "$SUDO_USER" != "root" ] && _SEED_HOME=$(getent passwd "$SUDO_USER" 2>/dev/null | cut -d: -f6)
+  [ -z "$_SEED_HOME" ] && _SEED_HOME=$(getent passwd | awk -F: '$3>=1000 && $3<65534 {print $6; exit}' 2>/dev/null)
+  # MYREDOUBT follows the resolved owner's home, never a literal
+  # /home/owner guess, so the mount and uid checks below agree with it
+  [ -z "${MYREDOUBT:-}" ] && MYREDOUBT="${_SEED_HOME:-${OWNER_HOME:-/home/owner}}/Documents/My Redoubt"
   # the vault (Access.txt) is the truth the owner types. A re-run can
   # hold a divergent pass in the env (the panel user then drifts from
   # the vault), so the seed always hashes the vault pass. The read
@@ -5486,9 +5522,6 @@ if docker compose -f "$STACKDIR/docker-compose.yml" exec -T homarr sh -c 'test -
   # dir holds no truth and must not override the env pass.
   _SEED_PASS="$OWNER_PASS"
   _VAULT_PASS=""
-  _SEED_HOME="${OWNER_HOME:-}"
-  [ -z "$_SEED_HOME" ] && [ -n "${SUDO_USER:-}" ] && _SEED_HOME=$(getent passwd "$SUDO_USER" 2>/dev/null | cut -d: -f6)
-  [ -z "$_SEED_HOME" ] && _SEED_HOME=$(getent passwd | awk -F: '$3>=1000 && $3<65534 {print $6; exit}' 2>/dev/null)
   if [ -n "$_SEED_HOME" ] && mountpoint -q "$MYREDOUBT" 2>/dev/null \
      && safe_owner_path "$MYREDOUBT/Access.txt" "$_SEED_HOME" \
      && [ -f "$MYREDOUBT/Access.txt" ] \
@@ -5855,6 +5888,9 @@ SEEDJS
     homarr sh -c 'cat > /appdata/seed.in && sed -n "/^__SEED_JS__\$/q;p" /appdata/seed.in > /appdata/seed.env && sed -n "/^__SEED_JS__\$/,\$p" /appdata/seed.in | tail -n +2 > /appdata/seed.js && set -a && . /appdata/seed.env && set +a && node /appdata/seed.js; rc=$?; rm -f /appdata/seed.js /appdata/seed.env /appdata/seed.in; exit $rc' )
   if printf '%s' "$SEED_OUT" | grep -qE "homarr seed: done"; then
     dbg "OK: panel seeded (admin, tiles, branding)"
+    # the admin exists now: first-run onboarding can no longer be
+    # claimed by a stranger, so the panel edge opens
+    photos_guard "$PORT_EDGE4" off
     # a freshly minted MCP key moves out of the panel volume into a
     # root-only file on the host, the single source the guardian wiring
     # reads. The volume copy goes in the same exec: if the host write then
@@ -6684,11 +6720,18 @@ DESKSHRT
       # The profile may live in .mozilla or .config/mozilla (Mint and
       # some XDG setups use the latter). Scan both, so the padlock never
       # depends on where the browser keeps its profile.
-      for PROF in "$OWNER_HOME"/.mozilla/firefox/* "$OWNER_HOME"/.config/mozilla/firefox/*; do
-        [ -d "$PROF" ] && [ -f "$PROF/cert9.db" ] || continue
-        certutil -A -n "Redoubt Local CA" -t "C,," -i "$CA_CRT" -d "sql:$PROF" >/dev/null 2>&1 \
-          && echo "OK: local CA into firefox profile (clean padlock, zero clicks)" && break
-      done
+      # NSS reads the profile's pkcs11 module config when it opens the
+      # database: certutil runs as the profile owner, never as root, so
+      # a user-selected shared library cannot load into the installer
+      _FX_OWN=$(stat -c '%U' "$OWNER_HOME" 2>/dev/null || true)
+      case "$_FX_OWN" in ""|root|UNKNOWN*) : ;; *)
+        for PROF in "$OWNER_HOME"/.mozilla/firefox/* "$OWNER_HOME"/.config/mozilla/firefox/*; do
+          [ -d "$PROF" ] && [ ! -L "$PROF" ] && [ -f "$PROF/cert9.db" ] || continue
+          runuser -u "$_FX_OWN" -- certutil -A -n "Redoubt Local CA" -t "C,," -i "$CA_CRT" -d "sql:$PROF" >/dev/null 2>&1 \
+            && echo "OK: local CA into firefox profile (clean padlock, zero clicks)" && break
+        done
+        ;;
+      esac
     fi
     # The iPhone profile: same CA, in the format iOS installs with one
     # tap from the Files app.
@@ -7500,8 +7543,13 @@ NCPHP
     # container when the owner row already exists, or the customer
     # logs in again after every update
     DOCKGE_HAS=$(docker exec redoubt-dockge-1 node -e 'require("@louislam/sqlite3"); const d=new (require("@louislam/sqlite3").verbose()).Database("/app/data/dockge.db"); d.get("SELECT COUNT(*) AS c FROM user WHERE username = ? AND active = 1", ["owner"], function (e, r) { console.log(r && r.c ? r.c : 0); d.close(); });' 2>/dev/null)
-    if [ "$DOCKGE_HAS" = "1" ]; then
-      dbg "OK: dockge owner already set (session kept)"
+    # an active owner row only counts when its stored hash opens with the
+    # installer password: a local first-run claimant keeps a foreign
+    # password, its row fails the compare, and the upsert below takes
+    # the account back (the restart then drops its sessions)
+    DOCKGE_MATCH=$(printf '%s\n' "$DOCKGE_PASS" | docker exec -i redoubt-dockge-1 sh -c 'IFS= read -r DP; export DP; exec node -e "$1"' sh 'require("@louislam/sqlite3"); const bcrypt=require("bcryptjs"); const d=new (require("@louislam/sqlite3").verbose()).Database("/app/data/dockge.db"); d.get("SELECT password AS p FROM user WHERE username = ? AND active = 1", ["owner"], function (e, r) { console.log(r && bcrypt.compareSync(process.env.DP, r.p) ? "match" : "mismatch"); d.close(); });' 2>/dev/null)
+    if [ "$DOCKGE_HAS" = "1" ] && [ "$DOCKGE_MATCH" = "match" ]; then
+      dbg "OK: dockge owner verified (session kept)"
     else
       DOCKGE_OK=0
       for i in $(seq 1 30); do
